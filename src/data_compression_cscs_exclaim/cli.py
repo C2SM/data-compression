@@ -6,6 +6,7 @@
 # Please, refer to the LICENSE file in the root directory.
 # SPDX-License-Identifier: BSD-3-Clause
 
+import os
 import inspect
 import click
 from tqdm import tqdm
@@ -21,6 +22,7 @@ from numcodecs_wasm_sz3 import Sz3
 from numcodecs_wasm_zfp import Zfp
 from numcodecs_wasm_zlib import Zlib
 from zarr_any_numcodecs import AnyNumcodecsArrayArrayCodec, AnyNumcodecsArrayBytesCodec, AnyNumcodecsBytesBytesCodec
+from ebcc.zarr_filter import EBCCZarrFilter
 
 import warnings
 warnings.filterwarnings(
@@ -29,6 +31,8 @@ warnings.filterwarnings(
     category=UserWarning,
     module="numcodecs.zarr3"
 )
+
+os.environ["EBCC_LOG_LEVEL"] = "4"  # ERROR (suppress WARN and below)
 
 
 @click.group()
@@ -165,10 +169,13 @@ def summarize_compression(netcdf_file: str, field_to_compress: str):
         total=num_loops,
         desc="Executing compression combinations",
     ):
-        compression_ratio, errors, dwt_dist = utils.compress_with_zarr(da, netcdf_file, field_to_compress,
-            filters=[filter,],
+        compression_ratio, errors, dwt_dist = utils.compress_with_zarr(
+            da if not isinstance(serializer, EBCCZarrFilter) else da.squeeze().astype("float32"),
+            netcdf_file,
+            field_to_compress,
+            filters=None if isinstance(serializer, EBCCZarrFilter) else [filter,],  # TODO: fix filter stacking with EBCC
             compressors=[compressor,],
-            serializer=serializer,
+            serializer=serializer if not isinstance(serializer, EBCCZarrFilter) else AnyNumcodecsArrayBytesCodec(serializer),
             verbose=False
         )
         total_error = 0.5 * errors["Relative_Error_L2"] + 0.25 * errors["Relative_Error_L1"] + 0.25 * errors["Relative_Error_Linf"]
