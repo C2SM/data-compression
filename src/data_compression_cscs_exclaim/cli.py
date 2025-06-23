@@ -110,11 +110,36 @@ def sz3_eb_compressors(netcdf_file: str, field_to_compress: str, parameters_file
     )
 
 
+@cli.command("ebcc")
+@click.argument("netcdf_file", type=click.Path(exists=True, dir_okay=False))
+@click.argument("field_to_compress")
+def ebcc(netcdf_file: str, field_to_compress: str):
+    from ebcc.filter_wrapper import EBCC_Filter
+    from ebcc.zarr_filter import EBCCZarrFilter
+    
+    ds = utils.open_netcdf(netcdf_file, field_to_compress)
+    da = ds[field_to_compress].squeeze().astype("float32")
+
+    atol = 1e-2
+    ebcc_filter = EBCC_Filter(
+            base_cr=2, 
+            height=da.shape[0],
+            width=da.shape[1],
+            residual_opt=("max_error_target", atol)
+        )
+    zarr_filter = EBCCZarrFilter(ebcc_filter.hdf_filter_opts)
+
+    utils.compress_with_zarr(da, netcdf_file, field_to_compress,
+        filters=None,
+        compressors=None,
+        serializer=AnyNumcodecsArrayBytesCodec(zarr_filter),
+    )
+
+
 @cli.command("summarize_compression")
 @click.argument("netcdf_file", type=click.Path(exists=True, dir_okay=False))
 @click.argument("field_to_compress")
-@click.argument("parameters_file", type=click.Path(exists=True, dir_okay=False))
-def summarize_compression(netcdf_file: str, field_to_compress: str, parameters_file: str):
+def summarize_compression(netcdf_file: str, field_to_compress: str):
     ## https://numcodecs.readthedocs.io/en/stable/zarr3.html#zarr-3-codecs
     
     ds = utils.open_netcdf(netcdf_file, field_to_compress)
@@ -144,7 +169,7 @@ def summarize_compression(netcdf_file: str, field_to_compress: str, parameters_f
             filters=[filter,],
             compressors=[compressor,],
             serializer=serializer,
-            echo=False
+            verbose=False
         )
         total_error = 0.5 * errors["Relative_Error_L2"] + 0.25 * errors["Relative_Error_L1"] + 0.25 * errors["Relative_Error_Linf"]
         raw_values.append((compression_ratio, total_error, dwt_dist))

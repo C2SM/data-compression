@@ -46,7 +46,7 @@ def open_zarr_zipstore(zarr_zipstore_file: str):
     return zarr.open_group(store, mode='r')
 
 
-def compress_with_zarr(data, netcdf_file, field_to_compress, filters, compressors, serializer='auto', echo=True):
+def compress_with_zarr(data, netcdf_file, field_to_compress, filters, compressors, serializer='auto', verbose=True):
     store = zarr.storage.ZipStore(f"{netcdf_file}.zarr.zip", mode='w')
     z = zarr.create_array(
         store=store,
@@ -60,17 +60,17 @@ def compress_with_zarr(data, netcdf_file, field_to_compress, filters, compressor
     
     info_array = z.info_complete()
     compression_ratio = info_array._count_bytes / info_array._count_bytes_stored
-    click.echo(80* "-") if echo else None
-    click.echo(info_array) if echo else None
+    click.echo(80* "-") if verbose else None
+    click.echo(info_array) if verbose else None
     
     pprint_, errors = compute_relative_errors(z[:], data)
-    click.echo(80* "-") if echo else None
-    click.echo(pprint_) if echo else None
-    click.echo(80* "-") if echo else None
+    click.echo(80* "-") if verbose else None
+    click.echo(pprint_) if verbose else None
+    click.echo(80* "-") if verbose else None
 
     dwt_dist = calc_dwt_dist(z[:], data)
-    click.echo("DWT Distance: ", dwt_dist) if echo else None
-    click.echo(80* "-") if echo else None
+    click.echo(f"DWT Distance: {dwt_dist}") if verbose else None
+    click.echo(80* "-") if verbose else None
 
     store.close()
 

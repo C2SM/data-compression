@@ -5,11 +5,10 @@ TODO
 ## Installation
 
 ```commandline
-git clone -b data_compression https://github.com/C2SM/icon4py.git
-cd ./icon4py/tools/src/icon4py/tools/data_compression/prototyping
+git clone git@github.com:C2SM/data-compression.git
 python -m venv venv
 source venv/bin/activate
-pip install -e .
+./install_data_compression.sh
 ```
 
 ## Usage
