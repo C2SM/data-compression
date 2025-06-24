@@ -18,10 +18,12 @@ import xarray as xr
 import yaml
 import pywt
 import zarr
-import dask as da
+from zarr_any_numcodecs import AnyNumcodecsArrayBytesCodec
 import numcodecs
 import numcodecs.zarr3
 import zfpy
+from ebcc.filter_wrapper import EBCC_Filter
+from ebcc.zarr_filter import EBCCZarrFilter
 
 
 def open_netcdf(netcdf_file: str, field_to_compress: str):
@@ -208,7 +210,7 @@ def serializer_space(da):
     # TODO: take care of integer data types
     serializer_space = []
     
-    _SERIALIZERS = [numcodecs.zarr3.PCodec, numcodecs.zarr3.ZFPY]
+    _SERIALIZERS = [numcodecs.zarr3.PCodec, numcodecs.zarr3.ZFPY, EBCCZarrFilter]
     for serializer in _SERIALIZERS:
         if serializer == numcodecs.zarr3.PCodec:
             for level in inclusive_range(0, 12, 4):  # where 12 take the longest and compresses the most
@@ -240,6 +242,18 @@ def serializer_space(da):
                         serializer_space.append(numcodecs.zarr3.ZFPY(
                             mode=mode, rate=compute_fixed_rate_param(compress_param_num)
                         ))
+        elif serializer == EBCCZarrFilter:
+            # TODO: add more options in residual_opt
+            data = da.squeeze()
+            for atol in [1e-2, 1e-3, 1e-6, 1e-9]:
+                ebcc_filter = EBCC_Filter(
+                        base_cr=2, 
+                        height=data.shape[0],
+                        width=data.shape[1],
+                        residual_opt=("max_error_target", atol)
+                    )
+                zarr_filter = EBCCZarrFilter(ebcc_filter.hdf_filter_opts)
+                serializer_space.append(zarr_filter)
 
     return serializer_space
 
