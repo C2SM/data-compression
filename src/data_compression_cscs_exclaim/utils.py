@@ -49,7 +49,7 @@ def open_zarr_zipstore(zarr_zipstore_file: str):
 
 
 def compress_with_zarr(data, netcdf_file, field_to_compress, filters, compressors, serializer='auto', verbose=True):
-    store = zarr.storage.ZipStore(f"{netcdf_file}.zarr.zip", mode='w')
+    store = zarr.storage.ZipStore(f"{netcdf_file}.=.{field_to_compress}.zarr.zip", mode='w')
     z = zarr.create_array(
         store=store,
         name=field_to_compress,
