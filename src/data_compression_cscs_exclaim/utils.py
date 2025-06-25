@@ -125,8 +125,8 @@ def compute_relative_errors(da_compressed, da):
         "Relative_Error_L2": relative_error_L2,
         "Relative_Error_Linf": relative_error_Linf,
     }
-    errors_ = {k: f"{v:.3e}" for k, v in errors.items()}
 
+    errors_ = {k: f"{v:.3e}" for k, v in errors.items()}
     return "\n".join(f"{k:20s}: {v}" for k, v in errors_.items()), errors
 
 
@@ -243,6 +243,7 @@ def serializer_space(da):
                             mode=mode, rate=compute_fixed_rate_param(compress_param_num)
                         ))
         elif serializer == EBCCZarrFilter:
+            # https://github.com/spcl/ebcc
             # TODO: add more options in residual_opt
             data = da.squeeze()
             for atol in [1e-2, 1e-3, 1e-6, 1e-9]:
@@ -301,142 +302,3 @@ def inclusive_range(start, end, step=1):
             values.append(end)
 
     return values
-
-
-def normalize(val, min_val, max_val):
-    if max_val == min_val:
-        return 0.0  # avoid division by zero
-    return (val - min_val) / (max_val - min_val)
-
-
-def format_compression_metrics(
-    codecs: Sequence["numcodecs.abc.Codec"],
-    *,
-    nbytes: "numcodecs_observers.bytesize.BytesizeObserver",
-    instructions: "None | numcodecs_wasm.WasmCodecInstructionCounterObserver" = None,
-    timings: "None | numcodecs_observers.walltime.WalltimeObserver" = None,
-):
-    import pandas as pd
-    from numcodecs_observers.hash import HashableCodec
-
-    codecs = tuple(codecs)
-
-    encoded_bytes = {c: sum(e.post for e in es) for c, es in nbytes.encode_sizes.items()}
-    decoded_bytes = {c: sum(d.post for d in ds) for c, ds in nbytes.decode_sizes.items()}
-
-    table = pd.DataFrame(
-        {
-            "Codec": [str(c) for c in codecs] + ["Summary"],
-            "compression ratio [raw B / enc B]": [
-                round(decoded_bytes[HashableCodec(c)] / encoded_bytes[HashableCodec(c)], 2)
-                for c in codecs
-            ]
-            + (
-                [
-                    round(
-                        decoded_bytes[HashableCodec(codecs[0])]
-                        / encoded_bytes[HashableCodec(codecs[-1])],
-                        2,
-                    )
-                ]
-                if len(codecs) > 0
-                else [1.0]
-            ),
-        }
-    ).set_index(["Codec"])
-
-    if instructions is not None:
-        table["encode instructions [#/B]"] = [
-            (
-                round(
-                    sum(instructions.encode_instructions[HashableCodec(c)])
-                    / decoded_bytes[HashableCodec(c)],
-                    1,
-                )
-                if HashableCodec(c) in instructions.encode_instructions
-                else "<unknown>"
-            )
-            for c in codecs
-        ] + (
-            [
-                round(
-                    sum(sum(instructions.encode_instructions[HashableCodec(c)]) for c in codecs)
-                    / decoded_bytes[HashableCodec(codecs[0])],
-                    1,
-                )
-                if all(HashableCodec(c) in instructions.encode_instructions for c in codecs)
-                else "<unknown>"
-            ]
-            if len(codecs) > 0
-            else [0.0]
-        )
-
-        table["decode instructions [#/B]"] = [
-            (
-                round(
-                    sum(instructions.decode_instructions[HashableCodec(c)])
-                    / decoded_bytes[HashableCodec(c)],
-                    1,
-                )
-                if HashableCodec(c) in instructions.decode_instructions
-                else "<unknown>"
-            )
-            for c in codecs
-        ] + (
-            [
-                round(
-                    sum(sum(instructions.decode_instructions[HashableCodec(c)]) for c in codecs)
-                    / decoded_bytes[HashableCodec(codecs[0])],
-                    1,
-                )
-                if all(HashableCodec(c) in instructions.decode_instructions for c in codecs)
-                else "<unknown>"
-            ]
-            if len(codecs) > 0
-            else [0.0]
-        )
-
-    if timings is not None:
-        table["encode throughout [raw GB/s]"] = [
-            round(
-                1e-9
-                * decoded_bytes[HashableCodec(c)]
-                / sum(timings.encode_times[HashableCodec(c)]),
-                2,
-            )
-            for c in codecs
-        ] + (
-            [
-                round(
-                    1e-9
-                    * decoded_bytes[HashableCodec(codecs[0])]
-                    / sum(sum(timings.encode_times[HashableCodec(c)]) for c in codecs),
-                    2,
-                )
-            ]
-            if len(codecs) > 0
-            else [0.0]
-        )
-
-        table["decode throughout [raw GB/s]"] = [
-            round(
-                1e-9
-                * decoded_bytes[HashableCodec(c)]
-                / sum(timings.decode_times[HashableCodec(c)]),
-                2,
-            )
-            for c in codecs
-        ] + (
-            [
-                round(
-                    1e-9
-                    * decoded_bytes[HashableCodec(codecs[0])]
-                    / sum(sum(timings.decode_times[HashableCodec(c)]) for c in codecs),
-                    2,
-                )
-            ]
-            if len(codecs) > 0
-            else [0.0]
-        )
-
-    return table

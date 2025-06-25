@@ -150,15 +150,9 @@ def ebcc(netcdf_file: str, field_to_compress: str):
 @click.argument("field_to_compress")
 def summarize_compression(netcdf_file: str, field_to_compress: str):
     ## https://numcodecs.readthedocs.io/en/stable/zarr3.html#zarr-3-codecs
-    
+
     ds = utils.open_netcdf(netcdf_file, field_to_compress)
     da = ds[field_to_compress]
-    
-    results = []
-
-    # First gather all raw values to normalize later
-    raw_values = []
-    raw_values_explicit = []
 
     compressors = utils.compressor_space(da)
     filters = utils.filter_space(da)
@@ -169,7 +163,15 @@ def summarize_compression(netcdf_file: str, field_to_compress: str):
     num_serializers = len(serializers)
     num_loops = num_compressors * num_filters * num_serializers
     click.echo(f"Number of loops: {num_loops} ({num_compressors} compressors, {num_filters} filters, {num_serializers} serializers)")
-    
+
+    # Lookup table for valid theresholds
+    # https://docs.google.com/spreadsheets/d/1lHcX-HE2WpVCOeKyDvM4iFqjlWvkd14lJlA-CUoCxMM/edit?gid=0#gid=0
+    sheet_id = "1lHcX-HE2WpVCOeKyDvM4iFqjlWvkd14lJlA-CUoCxMM"
+    sheet_url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv"
+    thersholds = pd.read_csv(sheet_url)
+
+    results = []
+    raw_values_explicit = []
     for compressor, filter, serializer in tqdm(
         itertools.product(compressors, filters, serializers),
         total=num_loops,
@@ -184,43 +186,27 @@ def summarize_compression(netcdf_file: str, field_to_compress: str):
             serializer=serializer if not isinstance(serializer, EBCCZarrFilter) else AnyNumcodecsArrayBytesCodec(serializer),
             verbose=False
         )
-        total_error = 0.5 * errors["Relative_Error_L2"] + 0.25 * errors["Relative_Error_L1"] + 0.25 * errors["Relative_Error_Linf"]
-        l1_error = errors["Relative_Error_L1"]
-        l2_error = errors["Relative_Error_L2"]
-        linf_error = errors["Relative_Error_Linf"]
-        raw_values.append((compression_ratio, total_error, dwt_dist))
-        raw_values_explicit.append((compression_ratio, l1_error, l2_error, linf_error, dwt_dist))
-        results.append(((compressor, filter, serializer), compression_ratio, total_error, dwt_dist))
 
-    # Normalize and score
-    ratios, errors, dwts = zip(*raw_values)
-    min_ratio, max_ratio = min(ratios), max(ratios)
-    min_error, max_error = min(errors), max(errors)
-    min_dwt, max_dwt = min(dwts), max(dwts)
+        l1_error_rel = errors["Relative_Error_L1"]
+        l2_error_rel = errors["Relative_Error_L2"]
+        linf_error_rel = errors["Relative_Error_Linf"]
+        raw_values_explicit.append((compression_ratio, l1_error_rel, l2_error_rel, linf_error_rel, dwt_dist))
 
-    scored_results = []
-
-    for (cfg, ratio, error, dwt) in results:
-        norm_ratio = utils.normalize(ratio, min_ratio, max_ratio)
-        norm_error = utils.normalize(error, min_error, max_error)
-        norm_dwt = utils.normalize(dwt, min_dwt, max_dwt)
-
-        score = (
-            0.5 * norm_ratio -  # maximize
-            0.25 * norm_error -  # minimize
-            0.25 * norm_dwt      # minimize
-        )
-
-        scored_results.append((score, cfg, ratio, error, dwt))
-
-    # Sort and display best
-    scored_results.sort(key=lambda x: x[0], reverse=True)
-
-    click.echo("Top 5 configurations:")
-    for score, cfg, ratio, error, dwt in scored_results[:5]:
-        click.echo(f"Score: {score:.3f} | Ratio: {ratio:.3f} | Error: {error:.3e} | DWT: {dwt:.3e} | {cfg}")
-
+        # TODO: refine criteria based on the thersholds table
+        if l1_error_rel <= 1e-2:
+            results.append(((compressor, filter, serializer), compression_ratio, l1_error_rel, dwt_dist))
+    
+    # Needed for clustering
     np.save('scored_results_raw.npy', np.asarray(pd.DataFrame(raw_values_explicit)))
+
+    max_compression_ratio = 0
+    for (cfg, ratio, error, dwt) in results:
+        if ratio > max_compression_ratio:
+            max_compression_ratio = ratio
+            best_combo = (cfg, ratio, error, dwt)
+
+    click.echo("Best combo (valid threshold & max CR):")
+    click.echo(f"\ {best_combo[0]} \ --> Ratio: {best_combo[1]:.3f} | Error: {best_combo[2]:.3e} | DWT: {best_combo[3]:.3e}")
 
 
 @cli.command("perform_clustering")

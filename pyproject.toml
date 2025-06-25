@@ -35,6 +35,7 @@ dependencies = [
     "zfpy",
     "pcodec",
     "tqdm",
+    "matplotlib",
 ]
 description = 'Data compression tool for Weather and Climate data'
 name = 'data_compression_cscs_exclaim'
