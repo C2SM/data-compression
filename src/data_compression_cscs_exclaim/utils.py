@@ -18,12 +18,31 @@ import xarray as xr
 import yaml
 import pywt
 import zarr
-from zarr_any_numcodecs import AnyNumcodecsArrayBytesCodec
+from zarr_any_numcodecs import AnyNumcodecsArrayArrayCodec, AnyNumcodecsArrayBytesCodec, AnyNumcodecsBytesBytesCodec
 import numcodecs
 import numcodecs.zarr3
 import zfpy
 from ebcc.filter_wrapper import EBCC_Filter
 from ebcc.zarr_filter import EBCCZarrFilter
+
+# numcodecs-wasm filters
+from numcodecs_wasm_asinh import Asinh
+from numcodecs_wasm_bit_round import BitRound
+from numcodecs_wasm_fixed_offset_scale import FixedOffsetScale
+from numcodecs_wasm_identity import Identity
+from numcodecs_wasm_linear_quantize import LinearQuantize
+from numcodecs_wasm_log import Log
+from numcodecs_wasm_round import Round
+from numcodecs_wasm_swizzle_reshape import SwizzleReshape
+from numcodecs_wasm_uniform_noise import UniformNoise
+# numcodecs-wasm compressors
+from numcodecs_wasm_zlib import Zlib
+from numcodecs_wasm_zstd import Zstd
+# numcodecs-wasm serializers
+from numcodecs_wasm_pco import Pco
+from numcodecs_wasm_sperr import Sperr
+from numcodecs_wasm_sz3 import Sz3
+from numcodecs_wasm_zfp import Zfp
 
 
 def open_netcdf(netcdf_file: str, field_to_compress: str):
@@ -144,7 +163,7 @@ def compressor_space(da):
     # TODO: take care of integer data types
     compressor_space = []
     
-    _COMPRESSORS = [numcodecs.zarr3.Blosc, numcodecs.zarr3.LZ4, numcodecs.zarr3.Zstd, numcodecs.zarr3.Zlib, numcodecs.zarr3.GZip, numcodecs.zarr3.BZ2, numcodecs.zarr3.LZMA]
+    _COMPRESSORS = [numcodecs.zarr3.Blosc, numcodecs.zarr3.LZ4, numcodecs.zarr3.Zstd, numcodecs.zarr3.Zlib, numcodecs.zarr3.GZip, numcodecs.zarr3.BZ2, numcodecs.zarr3.LZMA, Zlib, Zstd]
     for compressor in _COMPRESSORS:
         if compressor == numcodecs.zarr3.Blosc:
             for cname in numcodecs.blosc.list_compressors():
@@ -171,6 +190,14 @@ def compressor_space(da):
             # https://docs.python.org/3/library/lzma.html
             for preset in inclusive_range(1,9,4):
                 compressor_space.append(numcodecs.zarr3.LZMA(preset=preset))
+        elif compressor == Zlib:
+            # TODO: should we keep both versions, i.e. numcodecs & wasm?
+            for level in inclusive_range(1,9,4):
+                compressor_space.append(AnyNumcodecsBytesBytesCodec(Zlib(level=level)))
+        elif compressor == Zstd:
+            # TODO: should we keep both versions, i.e. numcodecs & wasm?
+            for level in inclusive_range(-7, 22, 10):
+                compressor_space.append(AnyNumcodecsBytesBytesCodec(Zstd(level=level)))
 
     return compressor_space
 
@@ -181,7 +208,7 @@ def filter_space(da):
     # TODO: take care of integer data types
     filter_space = []
     
-    _FILTERS = [numcodecs.zarr3.Delta, numcodecs.zarr3.BitRound, numcodecs.zarr3.FixedScaleOffset, numcodecs.zarr3.Quantize]
+    _FILTERS = [numcodecs.zarr3.Delta, numcodecs.zarr3.BitRound, numcodecs.zarr3.FixedScaleOffset, numcodecs.zarr3.Quantize, Asinh, BitRound, FixedOffsetScale, Identity, LinearQuantize, Log, Round, SwizzleReshape, UniformNoise]
     for filter in _FILTERS:
         if filter == numcodecs.zarr3.Delta:
             filter_space.append(numcodecs.zarr3.Delta(dtype=str(da.dtype)))
@@ -194,12 +221,48 @@ def filter_space(da):
             # Setting o=mean(x) and s=std(x) normalizes that data
             filter_space.append(numcodecs.zarr3.FixedScaleOffset(offset=da.mean(skipna=True).compute().item(), scale=da.std(skipna=True).compute().item(), dtype=str(da.dtype)))
             # Setting o=min(x) and s=max(x)−min(x)standardizes the data
-            filter_space.append(
-                numcodecs.zarr3.FixedScaleOffset(offset=da.min(skipna=True).compute().item(), scale=da.max(skipna=True).compute().item()-da.min(skipna=True).compute().item(), dtype=str(da.dtype)))
+            filter_space.append(numcodecs.zarr3.FixedScaleOffset(offset=da.min(skipna=True).compute().item(), scale=da.max(skipna=True).compute().item()-da.min(skipna=True).compute().item(), dtype=str(da.dtype)))
         elif filter == numcodecs.zarr3.Quantize:
             # Same as BitRound
             for digits in valid_keepbits_for_bitround(da, step=9):
                 filter_space.append(numcodecs.zarr3.Quantize(digits=digits, dtype=str(da.dtype)))
+        elif filter == Asinh:
+            # TODO: Does linear_width makes sense?
+            for linear_width in inclusive_range(1, 100, 10):
+                filter_space.append(AnyNumcodecsArrayArrayCodec(Asinh(linear_width=linear_width)))
+        elif filter == BitRound:
+            # TODO: should we keep both versions of BitRound, i.e. numcodecs & wasm?
+            for keepbits in valid_keepbits_for_bitround(da, step=9):
+                filter_space.append(AnyNumcodecsArrayArrayCodec((BitRound(keepbits=keepbits))))
+        elif filter == FixedOffsetScale:
+            # TODO: should we keep both versions, i.e. numcodecs & wasm?
+            # Setting o=mean(x) and s=std(x) normalizes that data
+            filter_space.append(AnyNumcodecsArrayArrayCodec(FixedOffsetScale(offset=da.mean(skipna=True).compute().item( ), scale=da.std(skipna=True).compute().item())))
+            # Setting o=min(x) and s=max(x)−min(x)standardizes the data
+            filter_space.append(AnyNumcodecsArrayArrayCodec(FixedOffsetScale(offset=da.min(skipna=True).compute().item(), scale=da.max(skipna=True).compute().item()-da.min(skipna=True).compute().item())))
+        elif filter == Identity:
+            filter_space.append(AnyNumcodecsArrayArrayCodec(Identity()))
+        elif filter == LinearQuantize:
+            continue
+            # TODO: The data is quantized to unsigned integers -> Some codecs do not support this. Fix this?
+            for bits in [8, 16, 32, 64]:
+                filter_space.append(AnyNumcodecsArrayArrayCodec(LinearQuantize(bits=bits, dtype=str(da.dtype))))
+        elif filter == Log:
+            # TODO: The codec only supports finite positive floating point numbers.
+            filter_space.append(AnyNumcodecsArrayArrayCodec(Log()))
+        elif filter == Round:
+            # TODO: precision is OK?
+            for precision in valid_keepbits_for_bitround(da, step=9):
+                filter_space.append(AnyNumcodecsArrayArrayCodec(Round(precision=precision)))
+        elif filter == SwizzleReshape:
+            # TODO: define more permutations
+            for axes in [[[0], {}], [[0], [{}]]]:
+                filter_space.append(AnyNumcodecsArrayArrayCodec(SwizzleReshape(axes=axes)))
+        elif filter == UniformNoise:
+            base_scale = 10 ** np.floor(np.log10(np.abs(da).max().compute().item()))
+            for seed in [0]:
+                for scale in [base_scale/100, base_scale/10, base_scale, base_scale*10, base_scale*100]:
+                    filter_space.append(AnyNumcodecsArrayArrayCodec(UniformNoise(scale=scale, seed=seed)))
 
     return filter_space
 
@@ -210,7 +273,7 @@ def serializer_space(da):
     # TODO: take care of integer data types
     serializer_space = []
     
-    _SERIALIZERS = [numcodecs.zarr3.PCodec, numcodecs.zarr3.ZFPY, EBCCZarrFilter]
+    _SERIALIZERS = [numcodecs.zarr3.PCodec, numcodecs.zarr3.ZFPY, EBCCZarrFilter, Pco, Sperr, Sz3, Zfp]
     for serializer in _SERIALIZERS:
         if serializer == numcodecs.zarr3.PCodec:
             for level in inclusive_range(0, 12, 4):  # where 12 take the longest and compresses the most
@@ -254,8 +317,62 @@ def serializer_space(da):
                         residual_opt=("max_error_target", atol)
                     )
                 zarr_filter = EBCCZarrFilter(ebcc_filter.hdf_filter_opts)
-                serializer_space.append(zarr_filter)
-
+                serializer_space.append(AnyNumcodecsArrayBytesCodec(zarr_filter))
+        elif serializer == Pco:
+            for delta in ["none", "auto", "try-consecutive", "try-lookback"]:
+                for mode in ["classic", "auto", "try-float-mult", "try-float-quant"]: # TODO: how about integers? -> try-int-mult
+                    for level in inclusive_range(0, 12, 4):
+                        pco_config = {"delta": delta, 
+                                    "mode": mode,
+                                    "level": level,
+                                    "paging": "equal-pages-up-to",
+                                    "equal_pages_up_to": 1000,
+                                    "float_mult_base": 42.0 if mode == "try-float-mult" else None,
+                                    "float_quant_bits": 12 if mode == "try-float-quant" else None,
+                                    "delta_encoding_order": 0 if delta in ["try-consecutive", "auto"] else None,
+                                    }
+                        serializer_space.append(AnyNumcodecsArrayBytesCodec(Pco(**pco_config)))
+        elif serializer == Sperr:
+            for mode in ["bpp", "psnr", "pwe"]:
+                serializer_space.append(AnyNumcodecsArrayBytesCodec(Sperr(mode=mode, bpp=1.0, psnr=42.0, pwe=0.1)))
+        elif serializer == Sz3:
+            abs_err = [1.0, 1e-1, 1e-2]
+            rel_err = [1.0, 1e-1, 1e-2]
+            l2      = [1.0, 1e-1]
+            for eb_mode in ["abs-and-rel", "abs-or-rel", "abs", "rel", "psnr", "l2"]:
+                for predictor in ["cubic-interpolation-lorenzo", "linear-interpolation", "lorenzo-regression"]:
+                    if eb_mode in ["abs-and-rel", "abs-or-rel"]:
+                        for eb_abs in abs_err:
+                            for eb_rel in rel_err:
+                                serializer_space.append(AnyNumcodecsArrayBytesCodec(Sz3(eb_mode=eb_mode, eb_abs=eb_abs, eb_rel=eb_rel, predictor=predictor)))
+                    elif eb_mode == "abs":
+                        for eb_abs in abs_err:
+                            serializer_space.append(AnyNumcodecsArrayBytesCodec(Sz3(eb_mode=eb_mode, eb_abs=eb_abs, predictor=predictor)))
+                    elif eb_mode == "rel":
+                        for eb_rel in rel_err:
+                            serializer_space.append(AnyNumcodecsArrayBytesCodec(Sz3(eb_mode=eb_mode, eb_rel=eb_rel, predictor=predictor)))
+                    elif eb_mode == "psnr":
+                        serializer_space.append(AnyNumcodecsArrayBytesCodec(Sz3(eb_mode=eb_mode, eb_psnr=1.0, predictor=predictor)))
+                    elif eb_mode == "l2":
+                        for eb_l2 in l2:
+                            serializer_space.append(AnyNumcodecsArrayBytesCodec(Sz3(eb_mode=eb_mode, eb_l2=eb_l2, predictor=predictor)))
+        elif serializer == Zfp:
+            # https://github.com/juntyr/numcodecs-rs/blob/main/codecs/zfp/tests/config.rs
+            for mode in ["fixed-rate", "fixed-precision", "fixed-accuracy", "reversible"]:
+                if mode == "fixed-rate":
+                    for rate in inclusive_range(1, 4, 1):
+                        zfp_config = {"mode": "fixed-rate", "rate": rate}
+                        serializer_space.append(AnyNumcodecsArrayBytesCodec(Zfp(**zfp_config)))
+                elif mode == "fixed-precision":
+                    for precision in inclusive_range(1, 4, 1):
+                        zfp_config = {"mode": "fixed-precision", "precision": precision}
+                        serializer_space.append(AnyNumcodecsArrayBytesCodec(Zfp(**zfp_config)))
+                elif mode == "fixed-accuracy":
+                    for tolerance in [1.0, 1e-1, 1e-2]:
+                        zfp_config = {"mode": "fixed-accuracy", "tolerance": tolerance}
+                        serializer_space.append(AnyNumcodecsArrayBytesCodec(Zfp(**zfp_config)))
+                elif mode == "reversible":
+                    serializer_space.append(AnyNumcodecsArrayBytesCodec(Zfp(mode="reversible")))
     return serializer_space
 
 
