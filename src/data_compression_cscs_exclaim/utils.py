@@ -159,8 +159,7 @@ def calc_dwt_dist(input_1, input_2, n_levels=4, wavelet="haar"):
 
 def compressor_space(da):
     # https://numcodecs.readthedocs.io/en/stable/zarr3.html#compressors-bytes-to-bytes-codecs
-    # https://numcodecs-wasm.readthedocs.io/en/latest/
-    
+
     # TODO: take care of integer data types
     compressor_space = []
     
@@ -203,6 +202,7 @@ def filter_space(da):
     filter_space = []
     
     _FILTERS = [numcodecs.zarr3.Delta, numcodecs.zarr3.BitRound, numcodecs.zarr3.Quantize, Asinh, FixedOffsetScale, Log, UniformNoise]
+    base_scale = 10 ** np.floor(np.log10(np.abs(da).max().compute().item()))
     for filter in _FILTERS:
         if filter == numcodecs.zarr3.Delta:
             filter_space.append(numcodecs.zarr3.Delta(dtype=str(da.dtype)))
@@ -211,12 +211,10 @@ def filter_space(da):
             for keepbits in valid_keepbits_for_bitround(da, step=9):
                 filter_space.append(numcodecs.zarr3.BitRound(keepbits=keepbits))
         elif filter == numcodecs.zarr3.Quantize:
-            # Same as BitRound
             for digits in valid_keepbits_for_bitround(da, step=9):
                 filter_space.append(numcodecs.zarr3.Quantize(digits=digits, dtype=str(da.dtype)))
         elif filter == Asinh:
-            # TODO: Does linear_width makes sense?
-            for linear_width in inclusive_range(1, 100, 10):
+            for linear_width in [base_scale/10, base_scale, base_scale*10]:
                 filter_space.append(AnyNumcodecsArrayArrayCodec(Asinh(linear_width=linear_width)))
         elif filter == FixedOffsetScale:
             # Setting o=mean(x) and s=std(x) normalizes that data
@@ -227,7 +225,6 @@ def filter_space(da):
             if bool((da > 0).all()):
                 filter_space.append(AnyNumcodecsArrayArrayCodec(Log()))
         elif filter == UniformNoise:
-            base_scale = 10 ** np.floor(np.log10(np.abs(da).max().compute().item()))
             for seed in [0]:
                 for scale in [base_scale/10, base_scale, base_scale*10]:
                     filter_space.append(AnyNumcodecsArrayArrayCodec(UniformNoise(scale=scale, seed=seed)))
@@ -245,6 +242,8 @@ def serializer_space(da):
     _SERIALIZERS = [numcodecs.zarr3.PCodec, numcodecs.zarr3.ZFPY, EBCCZarrFilter, Sperr, Sz3]
     for serializer in _SERIALIZERS:
         if serializer == numcodecs.zarr3.PCodec:
+            # https://github.com/pcodec/pcodec
+            # PCodec supports only the following numerical dtypes: uint16, uint32, uint64, int16, int32, int64, float16, float32, and float64.
             for level in inclusive_range(0, 12, 4):  # where 12 take the longest and compresses the most
                 for mode_spec in ["auto", "classic"]:
                     for delta_spec in ["auto", "none", "try_consecutive", "try_lookback"]:
@@ -257,10 +256,11 @@ def serializer_space(da):
                                 )
                             )
         elif serializer == numcodecs.zarr3.ZFPY:
-            # https://github.com/zarr-developers/numcodecs/blob/main/numcodecs/zfpy.py
+            # https://github.com/LLNL/zfp/tree/develop/python
+            # https://github.com/LLNL/zfp/blob/develop/tests/python/test_numpy.py
             for mode in [zfpy.mode_fixed_accuracy,
-                         zfpy.mode_fixed_rate,
-                         zfpy.mode_fixed_precision]:                
+                         zfpy.mode_fixed_precision,
+                         zfpy.mode_fixed_rate,]:
                 for compress_param_num in range(3):
                     if mode == zfpy.mode_fixed_accuracy:
                         serializer_space.append(numcodecs.zarr3.ZFPY(
@@ -276,21 +276,21 @@ def serializer_space(da):
                         ))
         elif serializer == EBCCZarrFilter:
             # https://github.com/spcl/ebcc
-            # TODO: add more options in residual_opt
-            data = da.squeeze()
             for atol in [1e-2, 1e-3, 1e-6, 1e-9]:
                 ebcc_filter = EBCC_Filter(
                         base_cr=2, 
-                        height=data.shape[0],
-                        width=data.shape[1],
+                        height=da.shape[0],
+                        width=da.shape[1],
                         residual_opt=("max_error_target", atol)
                     )
                 zarr_filter = EBCCZarrFilter(ebcc_filter.hdf_filter_opts)
                 serializer_space.append(AnyNumcodecsArrayBytesCodec(zarr_filter))
         elif serializer == Sperr:
+            # https://github.com/juntyr/numcodecs-rs/blob/main/codecs/sperr/tests/config.rs
             for mode in ["bpp", "psnr", "pwe"]:
                 serializer_space.append(AnyNumcodecsArrayBytesCodec(Sperr(mode=mode, bpp=1.0, psnr=42.0, pwe=0.1)))
         elif serializer == Sz3:
+            # https://github.com/juntyr/numcodecs-rs/blob/main/codecs/sz3/tests/config.rs
             abs_err = [1.0, 1e-1, 1e-2]
             rel_err = [1.0, 1e-1, 1e-2]
             l2      = [1.0, 1e-1]
