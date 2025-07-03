@@ -159,6 +159,7 @@ def calc_dwt_dist(input_1, input_2, n_levels=4, wavelet="haar"):
 
 def compressor_space(da):
     # https://numcodecs.readthedocs.io/en/stable/zarr3.html#compressors-bytes-to-bytes-codecs
+    # https://numcodecs-wasm.readthedocs.io/en/latest/
     
     # TODO: take care of integer data types
     compressor_space = []
@@ -204,6 +205,7 @@ def compressor_space(da):
 
 def filter_space(da):
     # https://numcodecs.readthedocs.io/en/stable/zarr3.html#filters-array-to-array-codecs
+    # https://numcodecs-wasm.readthedocs.io/en/latest/
     
     # TODO: take care of integer data types
     filter_space = []
@@ -269,6 +271,7 @@ def filter_space(da):
 
 def serializer_space(da):
     # https://numcodecs.readthedocs.io/en/stable/zarr3.html#serializers-array-to-bytes-codecs
+    # https://numcodecs-wasm.readthedocs.io/en/latest/
     
     # TODO: take care of integer data types
     serializer_space = []
