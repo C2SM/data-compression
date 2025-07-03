@@ -276,11 +276,12 @@ def serializer_space(da):
                         ))
         elif serializer == EBCCZarrFilter:
             # https://github.com/spcl/ebcc
+            data = da.squeeze()  # TODO: add more checks on the shape of the data
             for atol in [1e-2, 1e-3, 1e-6, 1e-9]:
                 ebcc_filter = EBCC_Filter(
                         base_cr=2, 
-                        height=da.shape[0],
-                        width=da.shape[1],
+                        height=data.shape[0],
+                        width=data.shape[1],
                         residual_opt=("max_error_target", atol)
                     )
                 zarr_filter = EBCCZarrFilter(ebcc_filter.hdf_filter_opts)
