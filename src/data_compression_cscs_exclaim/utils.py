@@ -46,7 +46,7 @@ from numcodecs_wasm_zfp import Zfp
 
 
 def open_netcdf(netcdf_file: str, field_to_compress: str):
-    ds = xr.open_dataset(netcdf_file, chunks={})
+    ds = xr.open_dataset(netcdf_file, chunks="auto")
 
     if field_to_compress not in ds.data_vars:
         click.echo(f"Field {field_to_compress} not found in NetCDF file.")
@@ -218,7 +218,7 @@ def filter_space(da):
                 filter_space.append(AnyNumcodecsArrayArrayCodec(Asinh(linear_width=linear_width)))
         elif filter == FixedOffsetScale:
             # Setting o=mean(x) and s=std(x) normalizes that data
-            filter_space.append(AnyNumcodecsArrayArrayCodec(FixedOffsetScale(offset=da.mean(skipna=True).compute().item( ), scale=da.std(skipna=True).compute().item())))
+            filter_space.append(AnyNumcodecsArrayArrayCodec(FixedOffsetScale(offset=da.mean(skipna=True).compute().item(), scale=da.std(skipna=True).compute().item())))
             # Setting o=min(x) and s=max(x)−min(x)standardizes the data
             filter_space.append(AnyNumcodecsArrayArrayCodec(FixedOffsetScale(offset=da.min(skipna=True).compute().item(), scale=da.max(skipna=True).compute().item()-da.min(skipna=True).compute().item())))
         elif filter == Log:
