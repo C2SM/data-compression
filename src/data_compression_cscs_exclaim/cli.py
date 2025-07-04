@@ -198,19 +198,19 @@ def summarize_compression(netcdf_file: str, field_to_compress: str):
                 serializer=serializer,
                 verbose=False
             )
+
+            l1_error_rel = errors["Relative_Error_L1"]
+            l2_error_rel = errors["Relative_Error_L2"]
+            linf_error_rel = errors["Relative_Error_Linf"]
+            raw_values_explicit.append((compression_ratio, l1_error_rel, l2_error_rel, linf_error_rel, dwt_dist))
+
+            # TODO: refine criteria based on the thersholds table
+            if l1_error_rel <= 1e-2:
+                results.append(((compressor, filter, serializer), compression_ratio, l1_error_rel, dwt_dist))
         except:
             click.echo(f"Failed to compress with {compressor}, {filter}, {serializer}. Skipping...")
             # traceback.print_exc(file=sys.stderr)
             # exit()
-
-        l1_error_rel = errors["Relative_Error_L1"]
-        l2_error_rel = errors["Relative_Error_L2"]
-        linf_error_rel = errors["Relative_Error_Linf"]
-        raw_values_explicit.append((compression_ratio, l1_error_rel, l2_error_rel, linf_error_rel, dwt_dist))
-
-        # TODO: refine criteria based on the thersholds table
-        if l1_error_rel <= 1e-2:
-            results.append(((compressor, filter, serializer), compression_ratio, l1_error_rel, dwt_dist))
     
     # Needed for clustering
     np.save('scored_results_raw.npy', np.asarray(pd.DataFrame(raw_values_explicit)))
