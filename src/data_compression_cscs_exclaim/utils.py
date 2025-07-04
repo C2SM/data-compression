@@ -46,7 +46,7 @@ from numcodecs_wasm_zfp import Zfp
 
 
 def open_netcdf(netcdf_file: str, field_to_compress: str):
-    ds = xr.open_dataset(netcdf_file)
+    ds = xr.open_dataset(netcdf_file, chunks={})
 
     if field_to_compress not in ds.data_vars:
         click.echo(f"Field {field_to_compress} not found in NetCDF file.")
