@@ -18,16 +18,35 @@ import xarray as xr
 import yaml
 import pywt
 import zarr
-from zarr_any_numcodecs import AnyNumcodecsArrayBytesCodec
+from zarr_any_numcodecs import AnyNumcodecsArrayArrayCodec, AnyNumcodecsArrayBytesCodec, AnyNumcodecsBytesBytesCodec
 import numcodecs
 import numcodecs.zarr3
 import zfpy
 from ebcc.filter_wrapper import EBCC_Filter
 from ebcc.zarr_filter import EBCCZarrFilter
 
+# numcodecs-wasm filters
+from numcodecs_wasm_asinh import Asinh
+from numcodecs_wasm_bit_round import BitRound
+from numcodecs_wasm_fixed_offset_scale import FixedOffsetScale
+from numcodecs_wasm_identity import Identity
+from numcodecs_wasm_linear_quantize import LinearQuantize
+from numcodecs_wasm_log import Log
+from numcodecs_wasm_round import Round
+from numcodecs_wasm_swizzle_reshape import SwizzleReshape
+from numcodecs_wasm_uniform_noise import UniformNoise
+# numcodecs-wasm compressors
+from numcodecs_wasm_zlib import Zlib
+from numcodecs_wasm_zstd import Zstd
+# numcodecs-wasm serializers
+from numcodecs_wasm_pco import Pco
+from numcodecs_wasm_sperr import Sperr
+from numcodecs_wasm_sz3 import Sz3
+from numcodecs_wasm_zfp import Zfp
+
 
 def open_netcdf(netcdf_file: str, field_to_compress: str):
-    ds = xr.open_dataset(netcdf_file)
+    ds = xr.open_dataset(netcdf_file, chunks="auto")
 
     if field_to_compress not in ds.data_vars:
         click.echo(f"Field {field_to_compress} not found in NetCDF file.")
@@ -140,7 +159,7 @@ def calc_dwt_dist(input_1, input_2, n_levels=4, wavelet="haar"):
 
 def compressor_space(da):
     # https://numcodecs.readthedocs.io/en/stable/zarr3.html#compressors-bytes-to-bytes-codecs
-    
+
     # TODO: take care of integer data types
     compressor_space = []
     
@@ -177,11 +196,13 @@ def compressor_space(da):
 
 def filter_space(da):
     # https://numcodecs.readthedocs.io/en/stable/zarr3.html#filters-array-to-array-codecs
+    # https://numcodecs-wasm.readthedocs.io/en/latest/
     
     # TODO: take care of integer data types
     filter_space = []
     
-    _FILTERS = [numcodecs.zarr3.Delta, numcodecs.zarr3.BitRound, numcodecs.zarr3.FixedScaleOffset, numcodecs.zarr3.Quantize]
+    _FILTERS = [numcodecs.zarr3.Delta, numcodecs.zarr3.BitRound, numcodecs.zarr3.Quantize, Asinh, FixedOffsetScale, Log, UniformNoise]
+    base_scale = 10 ** np.floor(np.log10(np.abs(da).max().compute().item()))
     for filter in _FILTERS:
         if filter == numcodecs.zarr3.Delta:
             filter_space.append(numcodecs.zarr3.Delta(dtype=str(da.dtype)))
@@ -189,30 +210,40 @@ def filter_space(da):
             # If keepbits is equal to the maximum allowed for the data type, this is equivalent to no transform.
             for keepbits in valid_keepbits_for_bitround(da, step=9):
                 filter_space.append(numcodecs.zarr3.BitRound(keepbits=keepbits))
-        elif filter == numcodecs.zarr3.FixedScaleOffset:
-            # TODO: scale should be 1/current_scale (check for division by zero)
-            # Setting o=mean(x) and s=std(x) normalizes that data
-            filter_space.append(numcodecs.zarr3.FixedScaleOffset(offset=da.mean(skipna=True).compute().item(), scale=da.std(skipna=True).compute().item(), dtype=str(da.dtype)))
-            # Setting o=min(x) and s=max(x)−min(x)standardizes the data
-            filter_space.append(
-                numcodecs.zarr3.FixedScaleOffset(offset=da.min(skipna=True).compute().item(), scale=da.max(skipna=True).compute().item()-da.min(skipna=True).compute().item(), dtype=str(da.dtype)))
         elif filter == numcodecs.zarr3.Quantize:
-            # Same as BitRound
             for digits in valid_keepbits_for_bitround(da, step=9):
                 filter_space.append(numcodecs.zarr3.Quantize(digits=digits, dtype=str(da.dtype)))
+        elif filter == Asinh:
+            for linear_width in [base_scale/10, base_scale, base_scale*10]:
+                filter_space.append(AnyNumcodecsArrayArrayCodec(Asinh(linear_width=linear_width)))
+        elif filter == FixedOffsetScale:
+            # Setting o=mean(x) and s=std(x) normalizes that data
+            filter_space.append(AnyNumcodecsArrayArrayCodec(FixedOffsetScale(offset=da.mean(skipna=True).compute().item(), scale=da.std(skipna=True).compute().item())))
+            # Setting o=min(x) and s=max(x)−min(x)standardizes the data
+            filter_space.append(AnyNumcodecsArrayArrayCodec(FixedOffsetScale(offset=da.min(skipna=True).compute().item(), scale=da.max(skipna=True).compute().item()-da.min(skipna=True).compute().item())))
+        elif filter == Log:
+            if bool((da > 0).all()):
+                filter_space.append(AnyNumcodecsArrayArrayCodec(Log()))
+        elif filter == UniformNoise:
+            for seed in [0]:
+                for scale in [base_scale/10, base_scale, base_scale*10]:
+                    filter_space.append(AnyNumcodecsArrayArrayCodec(UniformNoise(scale=scale, seed=seed)))
 
     return filter_space
 
 
 def serializer_space(da):
     # https://numcodecs.readthedocs.io/en/stable/zarr3.html#serializers-array-to-bytes-codecs
+    # https://numcodecs-wasm.readthedocs.io/en/latest/
     
     # TODO: take care of integer data types
     serializer_space = []
     
-    _SERIALIZERS = [numcodecs.zarr3.PCodec, numcodecs.zarr3.ZFPY, EBCCZarrFilter]
+    _SERIALIZERS = [numcodecs.zarr3.PCodec, numcodecs.zarr3.ZFPY, EBCCZarrFilter, Sperr, Sz3]
     for serializer in _SERIALIZERS:
         if serializer == numcodecs.zarr3.PCodec:
+            # https://github.com/pcodec/pcodec
+            # PCodec supports only the following numerical dtypes: uint16, uint32, uint64, int16, int32, int64, float16, float32, and float64.
             for level in inclusive_range(0, 12, 4):  # where 12 take the longest and compresses the most
                 for mode_spec in ["auto", "classic"]:
                     for delta_spec in ["auto", "none", "try_consecutive", "try_lookback"]:
@@ -225,10 +256,11 @@ def serializer_space(da):
                                 )
                             )
         elif serializer == numcodecs.zarr3.ZFPY:
-            # https://github.com/zarr-developers/numcodecs/blob/main/numcodecs/zfpy.py
+            # https://github.com/LLNL/zfp/tree/develop/python
+            # https://github.com/LLNL/zfp/blob/develop/tests/python/test_numpy.py
             for mode in [zfpy.mode_fixed_accuracy,
-                         zfpy.mode_fixed_rate,
-                         zfpy.mode_fixed_precision]:                
+                         zfpy.mode_fixed_precision,
+                         zfpy.mode_fixed_rate,]:
                 for compress_param_num in range(3):
                     if mode == zfpy.mode_fixed_accuracy:
                         serializer_space.append(numcodecs.zarr3.ZFPY(
@@ -244,8 +276,7 @@ def serializer_space(da):
                         ))
         elif serializer == EBCCZarrFilter:
             # https://github.com/spcl/ebcc
-            # TODO: add more options in residual_opt
-            data = da.squeeze()
+            data = da.squeeze()  # TODO: add more checks on the shape of the data
             for atol in [1e-2, 1e-3, 1e-6, 1e-9]:
                 ebcc_filter = EBCC_Filter(
                         base_cr=2, 
@@ -254,7 +285,33 @@ def serializer_space(da):
                         residual_opt=("max_error_target", atol)
                     )
                 zarr_filter = EBCCZarrFilter(ebcc_filter.hdf_filter_opts)
-                serializer_space.append(zarr_filter)
+                serializer_space.append(AnyNumcodecsArrayBytesCodec(zarr_filter))
+        elif serializer == Sperr:
+            # https://github.com/juntyr/numcodecs-rs/blob/main/codecs/sperr/tests/config.rs
+            for mode in ["bpp", "psnr", "pwe"]:
+                serializer_space.append(AnyNumcodecsArrayBytesCodec(Sperr(mode=mode, bpp=1.0, psnr=42.0, pwe=0.1)))
+        elif serializer == Sz3:
+            # https://github.com/juntyr/numcodecs-rs/blob/main/codecs/sz3/tests/config.rs
+            abs_err = [1.0, 1e-1, 1e-2]
+            rel_err = [1.0, 1e-1, 1e-2]
+            l2      = [1.0, 1e-1]
+            for eb_mode in ["abs-and-rel", "abs-or-rel", "abs", "rel", "psnr", "l2"]:
+                for predictor in ["cubic-interpolation-lorenzo", "linear-interpolation", "lorenzo-regression"]:
+                    if eb_mode in ["abs-and-rel", "abs-or-rel"]:
+                        for eb_abs in abs_err:
+                            for eb_rel in rel_err:
+                                serializer_space.append(AnyNumcodecsArrayBytesCodec(Sz3(eb_mode=eb_mode, eb_abs=eb_abs, eb_rel=eb_rel, predictor=predictor)))
+                    elif eb_mode == "abs":
+                        for eb_abs in abs_err:
+                            serializer_space.append(AnyNumcodecsArrayBytesCodec(Sz3(eb_mode=eb_mode, eb_abs=eb_abs, predictor=predictor)))
+                    elif eb_mode == "rel":
+                        for eb_rel in rel_err:
+                            serializer_space.append(AnyNumcodecsArrayBytesCodec(Sz3(eb_mode=eb_mode, eb_rel=eb_rel, predictor=predictor)))
+                    elif eb_mode == "psnr":
+                        serializer_space.append(AnyNumcodecsArrayBytesCodec(Sz3(eb_mode=eb_mode, eb_psnr=1.0, predictor=predictor)))
+                    elif eb_mode == "l2":
+                        for eb_l2 in l2:
+                            serializer_space.append(AnyNumcodecsArrayBytesCodec(Sz3(eb_mode=eb_mode, eb_l2=eb_l2, predictor=predictor)))
 
     return serializer_space
 

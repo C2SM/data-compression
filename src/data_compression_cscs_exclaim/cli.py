@@ -18,8 +18,6 @@ from numcodecs_combinators.stack import CodecStack
 from numcodecs_wasm_asinh import Asinh
 from numcodecs_wasm_bit_round import BitRound
 from numcodecs_wasm_linear_quantize import LinearQuantize
-from numcodecs_wasm_sz3 import Sz3
-from numcodecs_wasm_zfp import Zfp
 from numcodecs_wasm_zlib import Zlib
 from zarr_any_numcodecs import AnyNumcodecsArrayArrayCodec, AnyNumcodecsArrayBytesCodec, AnyNumcodecsBytesBytesCodec
 from ebcc.zarr_filter import EBCCZarrFilter
@@ -28,6 +26,12 @@ import numpy as np
 import matplotlib.pyplot as plt
 from sklearn.cluster import KMeans
 from sklearn.metrics import silhouette_score
+from numcodecs_wasm_pco import Pco
+from numcodecs_wasm_sperr import Sperr
+from numcodecs_wasm_sz3 import Sz3
+from numcodecs_wasm_zfp import Zfp
+import traceback
+import sys
 from sklearn.preprocessing import StandardScaler
 import plotly.io as pio
 import plotly.express as px
@@ -187,25 +191,38 @@ def summarize_compression(netcdf_file: str, field_to_compress: str):
         total=num_loops,
         desc="Executing compression combinations",
     ):
-        compression_ratio, errors, dwt_dist = utils.compress_with_zarr(
-            da if not isinstance(serializer, EBCCZarrFilter) else da.squeeze().astype("float32"),
-            netcdf_file,
-            field_to_compress,
-            filters=None if isinstance(serializer, EBCCZarrFilter) else [filter,],  # TODO: fix filter stacking with EBCC
-            compressors=[compressor,],
-            serializer=serializer if not isinstance(serializer, EBCCZarrFilter) else AnyNumcodecsArrayBytesCodec(serializer),
-            verbose=False
-        )
+        data_to_compress = da
+        if isinstance(serializer, AnyNumcodecsArrayBytesCodec):
+            if isinstance(serializer.codec, (Pco, Sperr, Sz3, Zfp)):
+                data_to_compress = da.stack(flat_dim=da.dims)
+            elif isinstance(serializer.codec, EBCCZarrFilter):
+                data_to_compress = da.squeeze().astype("float32")
 
-        l1_error_rel = errors["Relative_Error_L1"]
-        l2_error_rel = errors["Relative_Error_L2"]
-        linf_error_rel = errors["Relative_Error_Linf"]
-        raw_values_explicit.append((compression_ratio, l1_error_rel, l2_error_rel, linf_error_rel, dwt_dist))
-        # TODO: refine criteria based on the thersholds table
-        if l1_error_rel <= 1e-2:
-            results.append(((compressor, filter, serializer), compression_ratio, l1_error_rel, dwt_dist))
-            raw_values_explicit_with_names.append((compression_ratio, l1_error_rel, l2_error_rel, linf_error_rel, dwt_dist, str(compressor.codec_name), str(filter.codec_name), str(serializer.codec_name)))
-    
+        try:
+            compression_ratio, errors, dwt_dist = utils.compress_with_zarr(
+                data_to_compress,
+                netcdf_file,
+                field_to_compress,
+                filters=None if isinstance(serializer, AnyNumcodecsArrayBytesCodec) else [filter,],  # TODO: fix (?) filter stacking with EBCC & numcodecs-wasm serializers
+                compressors=[compressor,],
+                serializer=serializer,
+                verbose=False
+            )
+
+            l1_error_rel = errors["Relative_Error_L1"]
+            l2_error_rel = errors["Relative_Error_L2"]
+            linf_error_rel = errors["Relative_Error_Linf"]
+            raw_values_explicit.append((compression_ratio, l1_error_rel, l2_error_rel, linf_error_rel, dwt_dist))
+
+            # TODO: refine criteria based on the thersholds table
+            if l1_error_rel <= 1e-2:
+                results.append(((compressor, filter, serializer), compression_ratio, l1_error_rel, dwt_dist))
+                raw_values_explicit_with_names.append((compression_ratio, l1_error_rel, l2_error_rel, linf_error_rel, dwt_dist, str(compressor.codec_name), str(filter.codec_name), str(serializer.codec_name)))
+
+        except:
+            click.echo(f"Failed to compress with {compressor}, {filter}, {serializer}. Skipping...")
+            # traceback.print_exc(file=sys.stderr)
+            # exit()
     # Needed for clustering
     np.save('scored_results_raw.npy', np.asarray(pd.DataFrame(raw_values_explicit)))
     np.save('scored_results_with_names.npy', np.asarray(pd.DataFrame(raw_values_explicit_with_names)))
@@ -217,7 +234,7 @@ def summarize_compression(netcdf_file: str, field_to_compress: str):
             best_combo = (cfg, ratio, error, dwt)
 
     click.echo("Best combo (valid threshold & max CR):")
-    click.echo(f"\ {best_combo[0]} \ --> Ratio: {best_combo[1]:.3f} | Error: {best_combo[2]:.3e} | DWT: {best_combo[3]:.3e}")
+    click.echo(f" | {best_combo[0]} | --> Ratio: {best_combo[1]:.3f} | Error: {best_combo[2]:.3e} | DWT: {best_combo[3]:.3e}")
 
 @cli.command("perform_clustering")
 @click.argument("npy_file", type=click.Path(exists=True, dir_okay=False))
