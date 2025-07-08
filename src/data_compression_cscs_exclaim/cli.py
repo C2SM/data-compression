@@ -173,6 +173,7 @@ def summarize_compression(netcdf_file: str, field_to_compress: str):
     ds = utils.open_netcdf(netcdf_file, field_to_compress, rank=rank)
     da = ds[field_to_compress]
 
+    # TODO: add it as command line argument
     #extract 20% of dataset
     # slices = {dim: slice(0, int(size * 0.8)) for dim, size in da.sizes.items()}
     # da = da.isel(**slices)
@@ -186,7 +187,7 @@ def summarize_compression(netcdf_file: str, field_to_compress: str):
     num_serializers = len(serializers)
     num_loops = num_compressors * num_filters * num_serializers
     if rank == 0:
-        click.echo(f"Number of loops: {num_loops} ({num_compressors} compressors, {num_filters} filters, {num_serializers} serializers)")
+        click.echo(f"Number of loops: {num_loops} ({num_compressors} compressors, {num_filters} filters, {num_serializers} serializers) -divided across multiple processes-")
 
     config_space = list(itertools.product(compressors, filters, serializers))
     configs_for_rank = config_space[rank::size]
