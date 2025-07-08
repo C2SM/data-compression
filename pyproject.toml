@@ -47,6 +47,7 @@ dependencies = [
     "numcodecs_wasm_sperr",
     "numcodecs_wasm_sz3",
     "numcodecs_wasm_zfp",
+    "plotly"
 ]
 description = 'Data compression tool for Weather and Climate data'
 name = 'data_compression_cscs_exclaim'
