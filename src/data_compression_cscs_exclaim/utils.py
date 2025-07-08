@@ -24,6 +24,7 @@ import numcodecs.zarr3
 import zfpy
 from ebcc.filter_wrapper import EBCC_Filter
 from ebcc.zarr_filter import EBCCZarrFilter
+from mpi4py import MPI
 
 # numcodecs-wasm filters
 from numcodecs_wasm_asinh import Asinh
@@ -45,19 +46,23 @@ from numcodecs_wasm_sz3 import Sz3
 from numcodecs_wasm_zfp import Zfp
 
 
-def open_netcdf(netcdf_file: str, field_to_compress: str):
+def open_netcdf(netcdf_file: str, field_to_compress: str, rank: int = 0):
+    comm = MPI.COMM_WORLD
+
     ds = xr.open_dataset(netcdf_file, chunks="auto")
 
     if field_to_compress not in ds.data_vars:
-        click.echo(f"Field {field_to_compress} not found in NetCDF file.")
-        click.echo(f"Available fields in the dataset: {list(ds.data_vars.keys())}.")
-        click.echo("Aborting...")
-        sys.exit(1)
+        if rank == 0:
+            click.echo(f"Field {field_to_compress} not found in NetCDF file.")
+            click.echo(f"Available fields in the dataset: {list(ds.data_vars.keys())}.")
+            click.echo("Aborting...")
+        comm.Abort(1)
 
-    click.echo(f"netcdf_file.nbytes = {humanize.naturalsize(ds.nbytes, binary=True)}")
-    click.echo(
-        f"field_to_compress.nbytes = {humanize.naturalsize(ds[field_to_compress].nbytes, binary=True)}"
-    )
+    if rank == 0:
+        click.echo(f"netcdf_file.nbytes = {humanize.naturalsize(ds.nbytes, binary=True)}")
+        click.echo(
+            f"field_to_compress.nbytes = {humanize.naturalsize(ds[field_to_compress].nbytes, binary=True)}"
+        )
 
     return ds
 
@@ -67,8 +72,8 @@ def open_zarr_zipstore(zarr_zipstore_file: str):
     return zarr.open_group(store, mode='r')
 
 
-def compress_with_zarr(data, netcdf_file, field_to_compress, filters, compressors, serializer='auto', verbose=True):
-    store = zarr.storage.ZipStore(f"{netcdf_file}.=.{field_to_compress}.zarr.zip", mode='w')
+def compress_with_zarr(data, netcdf_file, field_to_compress, filters, compressors, serializer='auto', verbose=True, rank=0):
+    store = zarr.storage.ZipStore(f"{netcdf_file}.=.{field_to_compress}.rank{rank}.zarr.zip", mode='w')
     z = zarr.create_array(
         store=store,
         name=field_to_compress,
@@ -81,17 +86,20 @@ def compress_with_zarr(data, netcdf_file, field_to_compress, filters, compressor
     
     info_array = z.info_complete()
     compression_ratio = info_array._count_bytes / info_array._count_bytes_stored
-    click.echo(80* "-") if verbose else None
-    click.echo(info_array) if verbose else None
+    if verbose and rank == 0:
+        click.echo(80* "-")
+        click.echo(info_array)
     
     pprint_, errors = compute_relative_errors(z[:], data)
-    click.echo(80* "-") if verbose else None
-    click.echo(pprint_) if verbose else None
-    click.echo(80* "-") if verbose else None
+    if verbose and rank == 0:
+        click.echo(80* "-")
+        click.echo(pprint_)
+        click.echo(80* "-")
 
     dwt_dist = calc_dwt_dist(z[:], data)
-    click.echo(f"DWT Distance: {dwt_dist}") if verbose else None
-    click.echo(80* "-") if verbose else None
+    if verbose and rank == 0:
+        click.echo(f"DWT Distance: {dwt_dist}")
+        click.echo(80* "-")
 
     store.close()
 

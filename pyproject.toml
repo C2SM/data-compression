@@ -29,6 +29,8 @@ dependencies = [
     "matplotlib",
     "netCDF4",
     "h5netcdf",
+    "mpi4py",
+    "plotly",
     "numcodecs_wasm",
     "numcodecs_combinators",
     "numcodecs_observers",
@@ -47,7 +49,6 @@ dependencies = [
     "numcodecs_wasm_sperr",
     "numcodecs_wasm_sz3",
     "numcodecs_wasm_zfp",
-    "plotly"
 ]
 description = 'Data compression tool for Weather and Climate data'
 name = 'data_compression_cscs_exclaim'
