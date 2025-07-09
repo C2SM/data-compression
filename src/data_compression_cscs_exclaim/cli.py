@@ -157,6 +157,43 @@ def ebcc(netcdf_file: str, field_to_compress: str):
     )
 
 
+@cli.command("compress_with_optimal")
+@click.argument("netcdf_file", type=click.Path(exists=True, dir_okay=False))
+@click.argument("field_to_compress")
+@click.argument("comp_idx", type=int)
+@click.argument("filt_idx", type=int)
+@click.argument("ser_idx", type=int)
+def compress_with_optimal(netcdf_file, field_to_compress, comp_idx, filt_idx, ser_idx):
+    ds = utils.open_netcdf(netcdf_file, field_to_compress)
+    da = ds[field_to_compress]
+
+    compressors = utils.compressor_space(da)
+    filters = utils.filter_space(da)
+    serializers = utils.serializer_space(da)
+    
+    optimal_compressor = compressors[comp_idx][1]
+    optimal_filter = filters[filt_idx][1]
+    optimal_serializer = serializers[ser_idx][1]
+    
+    if isinstance(optimal_serializer, AnyNumcodecsArrayBytesCodec):
+        if isinstance(optimal_serializer.codec, (Pco, Sperr, Sz3, Zfp)):
+            da = da.stack(flat_dim=da.dims)
+        elif isinstance(optimal_serializer.codec, EBCCZarrFilter):
+            da = da.squeeze().astype("float32")
+
+    compression_ratio, errors, dwt_dist = utils.compress_with_zarr(
+        da,
+        netcdf_file,
+        field_to_compress,
+        filters=None if isinstance(optimal_serializer, AnyNumcodecsArrayBytesCodec) else [optimal_filter,],  # TODO: fix (?) filter stacking with EBCC & numcodecs-wasm serializers
+        compressors=[optimal_compressor,],
+        serializer=optimal_serializer,
+        verbose=False,
+    )
+    
+    click.echo(f" | {(optimal_compressor, optimal_filter, optimal_serializer)} | --> Ratio: {compression_ratio:.3f} | Error: {errors['Relative_Error_L1']:.3e} | DWT: {dwt_dist:.3e}")
+
+
 @cli.command("summarize_compression")
 @click.argument("netcdf_file", type=click.Path(exists=True, dir_okay=False))
 @click.argument("field_to_compress")
@@ -201,7 +238,7 @@ def summarize_compression(netcdf_file: str, field_to_compress: str):
     results = []
     raw_values_explicit = []
     raw_values_explicit_with_names = []
-    for compressor, filter, serializer in tqdm(
+    for (comp_idx, compressor), (filt_idx, filter), (ser_idx, serializer) in tqdm(
         configs_for_rank,
         desc=f"Rank {rank}",
         position=rank,
@@ -232,7 +269,7 @@ def summarize_compression(netcdf_file: str, field_to_compress: str):
 
             # TODO: refine criteria based on the thersholds table
             if l1_error_rel <= 1e-2:
-                results.append(((str(compressor), str(filter), str(serializer)), compression_ratio, l1_error_rel, dwt_dist))
+                results.append(((str(compressor), str(filter), str(serializer), comp_idx, filt_idx, ser_idx), compression_ratio, l1_error_rel, dwt_dist))
                 raw_values_explicit_with_names.append((compression_ratio, l1_error_rel, l2_error_rel, linf_error_rel, dwt_dist, str(compressor), str(filter), str(serializer)))
 
         except:

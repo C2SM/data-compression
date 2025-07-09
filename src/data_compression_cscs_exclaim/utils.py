@@ -199,7 +199,7 @@ def compressor_space(da):
             for preset in inclusive_range(1,9,4):
                 compressor_space.append(numcodecs.zarr3.LZMA(preset=preset))
 
-    return compressor_space
+    return list(zip(range(len(compressor_space)), compressor_space))
 
 
 def filter_space(da):
@@ -237,7 +237,7 @@ def filter_space(da):
                 for scale in [base_scale/10, base_scale, base_scale*10]:
                     filter_space.append(AnyNumcodecsArrayArrayCodec(UniformNoise(scale=scale, seed=seed)))
 
-    return filter_space
+    return list(zip(range(len(filter_space)), filter_space))
 
 
 def serializer_space(da):
@@ -321,7 +321,7 @@ def serializer_space(da):
                         for eb_l2 in l2:
                             serializer_space.append(AnyNumcodecsArrayBytesCodec(Sz3(eb_mode=eb_mode, eb_l2=eb_l2, predictor=predictor)))
 
-    return serializer_space
+    return list(zip(range(len(serializer_space)), serializer_space))
 
 
 def valid_keepbits_for_bitround(xr_dataarray, step=1):
