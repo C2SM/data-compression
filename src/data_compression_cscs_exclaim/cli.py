@@ -30,8 +30,6 @@ from numcodecs_wasm_pco import Pco
 from numcodecs_wasm_sperr import Sperr
 from numcodecs_wasm_sz3 import Sz3
 from numcodecs_wasm_zfp import Zfp
-import traceback
-import sys
 from sklearn.preprocessing import StandardScaler
 from mpi4py import MPI
 import dask

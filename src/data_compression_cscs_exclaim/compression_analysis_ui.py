@@ -11,25 +11,30 @@ import re
 import subprocess
 import tempfile
 import streamlit as st
-from data_compression_cscs_exclaim import utils
-from ebcc.zarr_filter import EBCCZarrFilter
+# from data_compression_cscs_exclaim import utils
+# from ebcc.zarr_filter import EBCCZarrFilter
 import pandas as pd
 import numpy as np
 from sklearn.cluster import KMeans
-from sklearn.metrics import silhouette_score
-from numcodecs_wasm_sperr import Sperr
-from sklearn.preprocessing import StandardScaler
+# from sklearn.metrics import silhouette_score
+# from numcodecs_wasm_sperr import Sperr
+# from sklearn.preprocessing import StandardScaler
 import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import xarray
 from io import BytesIO
+import base64
 
 
-# Page title
 st.title("Upload a file and evaluate compressors")
 
 uploaded_file = st.file_uploader("Choose a netcdf file")
+
+@st.cache_data
+def load_scored_results():
+    return np.load("scored_results_with_names.npy", allow_pickle=True)
+
 
 @st.cache_resource
 def create_cluster_plots(clean_arr_l1, clean_arr_l2, clean_arr_linf, clean_arr_dwt):
@@ -45,15 +50,12 @@ def create_cluster_plots(clean_arr_l1, clean_arr_l2, clean_arr_linf, clean_arr_d
     clean_arr_l1_filtered = np.column_stack((clean_arr_l1[:, 0].astype(float), clean_arr_l1[:, 1].astype(float)))
     y_kmeans = kmeans.fit_predict(clean_arr_l1_filtered)
     df_l1 = pd.DataFrame(clean_arr_l1_filtered, columns=["Ratio", "L1"])
-    df_l1["cluster"] = y_kmeans.astype(str)
     df_l1["compressor"] = clean_arr_l1[:, 2]
     df_l1["filter"] = clean_arr_l1[:, 3]
     df_l1["serializer"] = clean_arr_l1[:, 4]
 
-
-    fig_l1 = px.scatter(df_l1, x="Ratio", y="L1", color="cluster",
-                        title="L1 VS Ratio KMeans Clustering",
-                        hover_data=["compressor", "filter", "serializer"])
+    fig_l1 = px.scatter(df_l1, x="Ratio", y="L1", color=y_kmeans,
+                        title="L1 VS Ratio KMeans Clustering", hover_data=["compressor", "filter", "serializer"])
 
     fig.add_trace(
         go.Scatter(
@@ -68,6 +70,7 @@ def create_cluster_plots(clean_arr_l1, clean_arr_l2, clean_arr_linf, clean_arr_d
         row=1,
         col=1
     )
+
     for trace in fig_l1.data:
         fig.add_trace(trace, row=1, col=1)
 
@@ -75,14 +78,12 @@ def create_cluster_plots(clean_arr_l1, clean_arr_l2, clean_arr_linf, clean_arr_d
     clean_arr_l2_filtered = np.column_stack((clean_arr_l2[:, 0].astype(float), clean_arr_l2[:, 1].astype(float)))
     y_kmeans = kmeans.fit_predict(clean_arr_l2_filtered)
     df_l2 = pd.DataFrame(clean_arr_l2_filtered, columns=["Ratio", "L2"])
-    df_l2["cluster"] = y_kmeans.astype(str)
     df_l2["compressor"] = clean_arr_l2[:, 2]
     df_l2["filter"] = clean_arr_l2[:, 3]
     df_l2["serializer"] = clean_arr_l2[:, 4]
 
-    fig_l2 = px.scatter(df_l2, x="Ratio", y="L2", color="cluster",
-                        title="L2 VS Ratio KMeans Clustering",
-                        hover_data=["compressor", "filter", "serializer"])
+    fig_l2 = px.scatter(df_l2, x="Ratio", y="L2", color=y_kmeans,
+                        title="L2 VS Ratio KMeans Clustering", hover_data=["compressor", "filter", "serializer"])
 
     fig.add_trace(
         go.Scatter(
@@ -105,14 +106,12 @@ def create_cluster_plots(clean_arr_l1, clean_arr_l2, clean_arr_linf, clean_arr_d
         (clean_arr_linf[:, 0].astype(float), clean_arr_linf[:, 1].astype(float)))
     y_kmeans = kmeans.fit_predict(clean_arr_linf_filtered)
     df_linf = pd.DataFrame(clean_arr_linf_filtered, columns=["Ratio", "LInf"])
-    df_linf["cluster"] = y_kmeans.astype(str)
     df_linf["compressor"] = clean_arr_linf[:, 2]
     df_linf["filter"] = clean_arr_linf[:, 3]
     df_linf["serializer"] = clean_arr_linf[:, 4]
 
-    fig_linf = px.scatter(df_linf, x="Ratio", y="LInf", color="cluster",
-                          title="LInf VS Ratio KMeans Clustering",
-                          hover_data=["compressor", "filter", "serializer"])
+    fig_linf = px.scatter(df_linf, x="Ratio", y="LInf", color=y_kmeans,
+                          title="LInf VS Ratio KMeans Clustering", hover_data=["compressor", "filter", "serializer"])
 
     fig.add_trace(
         go.Scatter(
@@ -134,15 +133,12 @@ def create_cluster_plots(clean_arr_l1, clean_arr_l2, clean_arr_linf, clean_arr_d
     clean_arr_dwt_filtered = np.column_stack((clean_arr_dwt[:, 0].astype(float), clean_arr_dwt[:, 1].astype(float)))
     y_kmeans = kmeans.fit_predict(clean_arr_dwt_filtered)
     df_dwt = pd.DataFrame(clean_arr_dwt_filtered, columns=["Ratio", "DWT"])
-    df_dwt["cluster"] = y_kmeans.astype(str)
     df_dwt["compressor"] = clean_arr_dwt[:, 2]
     df_dwt["filter"] = clean_arr_dwt[:, 3]
     df_dwt["serializer"] = clean_arr_dwt[:, 4]
 
-
-    fig_dwt = px.scatter(df_dwt, x="Ratio", y="DWT", color="cluster",
-                         title="DWT VS Ratio KMeans Clustering",
-                         hover_data=["compressor", "filter", "serializer"])
+    fig_dwt = px.scatter(df_dwt, x="Ratio", y="DWT", color=y_kmeans,
+                         title="DWT VS Ratio KMeans Clustering", hover_data=["compressor", "filter", "serializer"])
 
     fig.add_trace(
         go.Scatter(
@@ -160,25 +156,36 @@ def create_cluster_plots(clean_arr_l1, clean_arr_l2, clean_arr_linf, clean_arr_d
     for trace in fig_dwt.data:
         fig.add_trace(trace, row=2, col=2)
 
+    fig.update_layout(
+        title="",
+        showlegend=False,
+        height=900,
+        hovermode="closest",
+        template="plotly_white"
+    )
     return fig
 
-if uploaded_file is not None and uploaded_file.name.endswith(".nc"):
-    netcdf_file = uploaded_file
-    netcdf_file_xr = xarray.open_dataset(netcdf_file)
-    if uploaded_file.size > 1e7:
-        percent_size = 1e7 / uploaded_file.size
 
-        bytes_io = BytesIO(uploaded_file.read())
-        bytes_io.seek(0)
-        ds = xarray.open_dataset(bytes_io)
+@st.cache_data
+def load_and_resize_netcdf(file_content, original_name, max_size_bytes=1e7):
+    bytes_io = BytesIO(file_content)
+    bytes_io.seek(0)
+    ds = xarray.open_dataset(bytes_io)
+    new_name = original_name
 
+    if len(file_content) > max_size_bytes:
+        percent_size = max_size_bytes / len(file_content)
         for coord in list(ds.coords):
             if len(ds[coord]) > 1:
                 ds = ds.isel({coord: slice(0, int(ds[coord].size * percent_size))})
+        new_name = original_name + "_reduced.nc"
 
-        netcdf_file_xr = ds
-        uploaded_file.name = uploaded_file.name + "_reduced.nc"
-        ds.to_netcdf(uploaded_file.name)
+    return ds, new_name
+
+
+if uploaded_file is not None and uploaded_file.name.endswith(".nc"):
+    file_content = uploaded_file.read()
+    netcdf_file_xr, display_file_name = load_and_resize_netcdf(file_content, uploaded_file.name)
 
     options = [var for var in netcdf_file_xr.data_vars]
     if "selected_column" not in st.session_state:
@@ -189,9 +196,15 @@ if uploaded_file is not None and uploaded_file.name.endswith(".nc"):
         index=options.index(st.session_state.selected_column),
         key="selected_column",
     )
+
     with tempfile.NamedTemporaryFile(suffix=".nc", delete=False) as tmp:
         path_to_modified_file = tmp.name
         netcdf_file_xr.to_netcdf(path_to_modified_file)
+
+    if 'analysis_data' not in st.session_state:
+        st.session_state.analysis_data = None
+        st.session_state.analysis_performed = False
+        st.session_state.temp_plot_file = None
 
     if st.button("Analyze compressors"):
         cmd_compress = [
@@ -225,14 +238,15 @@ if uploaded_file is not None and uploaded_file.name.endswith(".nc"):
                 match = re.search(r"Rank \d+:\s+.*?(\d+)/(\d+)", line)
                 if match:
                     current_max = max(current_max, int(match.group(1)))
-
-                    percent = int(100 * int(match.group(2)) / current_max)
+                    if current_max == 0:
+                        percent = 0
+                    else:
+                        percent = int(100 * current_max/int(match.group(2)))
                     progress_bar.progress(percent)
                     progress_text.text(f"{percent}%")
-                    progress_text_1.text(f"{total_steps}/{current_max}")
+                    progress_text_1.text(f"{current_max}/{total_steps}")
 
-
-        scored_results = np.load("scored_results_with_names.npy", allow_pickle=True)
+        scored_results = load_scored_results()
 
         scored_results_pd = pd.DataFrame(scored_results)
 
@@ -240,46 +254,54 @@ if uploaded_file is not None and uploaded_file.name.endswith(".nc"):
         mask = np.isfinite(scored_results_pd[numeric_cols]).all(axis=1)
         scored_results_pd = scored_results_pd[mask].dropna()
 
-        clean_arr_l1 = np.hstack((np.asarray(scored_results_pd[[0]]),
-                                  np.asarray(scored_results_pd[[1]]),
-                                  np.asarray(scored_results_pd[[5]]),
-                                  np.asarray(scored_results_pd[[6]]),
-                                  np.asarray(scored_results_pd[[7]]),
-                                  ))
+        clean_arr_l1 = np.hstack(
+            (np.asarray(scored_results_pd[[0]]), np.asarray(scored_results_pd[[1]]), np.asarray(scored_results_pd[[5]]),
+             np.asarray(scored_results_pd[[6]]), np.asarray(scored_results_pd[[7]])))
+        clean_arr_l2 = np.hstack(
+            (np.asarray(scored_results_pd[[0]]), np.asarray(scored_results_pd[[2]]), np.asarray(scored_results_pd[[5]]),
+             np.asarray(scored_results_pd[[6]]), np.asarray(scored_results_pd[[7]])))
+        clean_arr_linf = np.hstack(
+            (np.asarray(scored_results_pd[[0]]), np.asarray(scored_results_pd[[3]]), np.asarray(scored_results_pd[[5]]),
+             np.asarray(scored_results_pd[[6]]), np.asarray(scored_results_pd[[7]])))
+        clean_arr_dwt = np.hstack(
+            (np.asarray(scored_results_pd[[0]]), np.asarray(scored_results_pd[[4]]), np.asarray(scored_results_pd[[5]]),
+             np.asarray(scored_results_pd[[6]]), np.asarray(scored_results_pd[[7]])))
 
-        clean_arr_l2 = np.hstack((np.asarray(scored_results_pd[[0]]),
-                                  np.asarray(scored_results_pd[[2]]),
-                                  np.asarray(scored_results_pd[[5]]),
-                                  np.asarray(scored_results_pd[[6]]),
-                                  np.asarray(scored_results_pd[[7]]),
-                                  ))
+        st.session_state.analysis_data = {
+            "l1": clean_arr_l1,
+            "l2": clean_arr_l2,
+            "linf": clean_arr_linf,
+            "dwt": clean_arr_dwt,
+        }
 
-        clean_arr_linf = np.hstack((np.asarray(scored_results_pd[[0]]),
-                                    np.asarray(scored_results_pd[[3]]),
-                                    np.asarray(scored_results_pd[[5]]),
-                                    np.asarray(scored_results_pd[[6]]),
-                                    np.asarray(scored_results_pd[[7]]),
-                                    ))
+        fig_to_save = create_cluster_plots(
+            clean_arr_l1, clean_arr_l2, clean_arr_linf, clean_arr_dwt
+        )
 
-        clean_arr_dwt = np.hstack((np.asarray(scored_results_pd[[0]]),
-                                   np.asarray(scored_results_pd[[4]]),
-                                   np.asarray(scored_results_pd[[5]]),
-                                   np.asarray(scored_results_pd[[6]]),
-                                   np.asarray(scored_results_pd[[7]]),
-                                   ))
+        temp_dir = tempfile.gettempdir()
+        temp_html_path = os.path.join(temp_dir, f"cluster_plots_{os.getpid()}.html")
+        os.makedirs(os.path.dirname(temp_html_path), exist_ok=True)
+        fig_to_save.write_html(temp_html_path, full_html=True, include_plotlyjs='cdn')
 
-        # Plot Error and Similarity Metrics VS Ratio
-        fig = create_cluster_plots(clean_arr_l1, clean_arr_l2, clean_arr_linf, clean_arr_dwt)
-        fig.update_layout(title="", showlegend=False, width=500, height=1000)
-        st.plotly_chart(fig, use_container_width=True)
+        st.session_state.temp_plot_file = temp_html_path
+        st.session_state.analysis_performed = True
+
+        st.rerun()
+
+    if st.session_state.analysis_performed and st.session_state.temp_plot_file:
+        plot_file_path = st.session_state.temp_plot_file
+
+        with open(plot_file_path, "rb") as f:
+            st.download_button(
+                label="Download Plots as HTML",
+                data=f,
+                file_name="cluster_plots.html",
+                mime="text/html",
+            )
 
     comp_idx = st.number_input('comp_idx', min_value=0, max_value=65, value=10)
     filt_idx = st.number_input('filt_idx', min_value=0, max_value=24, value=10)
     ser_idx = st.number_input('ser_idx', min_value=0, max_value=193, value=10)
-
-    with tempfile.NamedTemporaryFile(delete=False) as tmp_file:
-        tmp_file.write(uploaded_file.read())
-        tmp_file_path = tmp_file.name
 
     if st.button("Compress file"):
         cmd_compress = [
@@ -289,20 +311,21 @@ if uploaded_file is not None and uploaded_file.name.endswith(".nc"):
             field_to_compress,
             str(comp_idx), str(filt_idx), str(ser_idx)
         ]
-        try:
-            temp_dir = os.path.dirname(path_to_modified_file)
-            before = set(os.listdir(temp_dir))
-            result = subprocess.run(cmd_compress, capture_output=True, text=True, check=True)
-            st.success("Compression completed successfully")
-            after = set(os.listdir(temp_dir))
-            generated_file_name = list(after - before)[0]
-            output_file_path = os.path.join(temp_dir, generated_file_name)
-            with open(output_file_path, "rb") as data_file:
-                st.download_button(
-                    label="Download Compressed File",
-                    data=data_file,
-                    file_name=os.path.basename(output_file_path),
-                )
-        except subprocess.CalledProcessError as e:
-            st.error("Compression failed")
-            st.code(e.stderr)
+        temp_dir = os.path.dirname(path_to_modified_file)
+        before = set(os.listdir(temp_dir))
+        st.info("Compressing file...")
+        result = subprocess.run(cmd_compress, capture_output=True, text=True, check=True)
+        st.success("Compression completed successfully")
+        after = set(os.listdir(temp_dir))
+        generated_files = list(after - before)
+        generated_file_name = generated_files[0]
+        output_file_path = os.path.join(temp_dir, generated_file_name)
+        with open(output_file_path, "rb") as data_file:
+            st.download_button(
+                label="Download Compressed File",
+                data=data_file,
+                file_name=os.path.basename(output_file_path),
+            )
+        os.remove(output_file_path)
+        if os.path.exists(path_to_modified_file):
+            os.remove(path_to_modified_file)
