@@ -14,6 +14,7 @@ from collections.abc import Sequence
 import click
 import humanize
 import numpy as np
+import pandas as pd
 import xarray as xr
 import yaml
 import pywt
@@ -367,3 +368,13 @@ def inclusive_range(start, end, step=1):
             values.append(end)
 
     return values
+
+def slice_array(arr: pd.array, indices_ls: list) -> np.ndarray:
+    arr_ls = []
+    for ind in indices_ls:
+        arr_ls.append(arr[[ind]])
+
+    sliced_arr = np.hstack(
+        tuple(arr_ls)
+    )
+    return sliced_arr

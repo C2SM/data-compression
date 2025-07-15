@@ -11,21 +11,16 @@ import re
 import subprocess
 import tempfile
 import streamlit as st
-# from data_compression_cscs_exclaim import utils
-# from ebcc.zarr_filter import EBCCZarrFilter
 import pandas as pd
 import numpy as np
 from sklearn.cluster import KMeans
-# from sklearn.metrics import silhouette_score
-# from numcodecs_wasm_sperr import Sperr
-# from sklearn.preprocessing import StandardScaler
 import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import xarray
 from io import BytesIO
-import base64
 
+from data_compression_cscs_exclaim import utils
 
 st.title("Upload a file and evaluate compressors")
 
@@ -254,18 +249,10 @@ if uploaded_file is not None and uploaded_file.name.endswith(".nc"):
         mask = np.isfinite(scored_results_pd[numeric_cols]).all(axis=1)
         scored_results_pd = scored_results_pd[mask].dropna()
 
-        clean_arr_l1 = np.hstack(
-            (np.asarray(scored_results_pd[[0]]), np.asarray(scored_results_pd[[1]]), np.asarray(scored_results_pd[[5]]),
-             np.asarray(scored_results_pd[[6]]), np.asarray(scored_results_pd[[7]])))
-        clean_arr_l2 = np.hstack(
-            (np.asarray(scored_results_pd[[0]]), np.asarray(scored_results_pd[[2]]), np.asarray(scored_results_pd[[5]]),
-             np.asarray(scored_results_pd[[6]]), np.asarray(scored_results_pd[[7]])))
-        clean_arr_linf = np.hstack(
-            (np.asarray(scored_results_pd[[0]]), np.asarray(scored_results_pd[[3]]), np.asarray(scored_results_pd[[5]]),
-             np.asarray(scored_results_pd[[6]]), np.asarray(scored_results_pd[[7]])))
-        clean_arr_dwt = np.hstack(
-            (np.asarray(scored_results_pd[[0]]), np.asarray(scored_results_pd[[4]]), np.asarray(scored_results_pd[[5]]),
-             np.asarray(scored_results_pd[[6]]), np.asarray(scored_results_pd[[7]])))
+        clean_arr_l1 = utils.slice_array(scored_results_pd, [0, 1, 5, 6, 7])
+        clean_arr_l2 = utils.slice_array(scored_results_pd, [0, 2, 5, 6, 7])
+        clean_arr_linf = utils.slice_array(scored_results_pd, [0, 3, 5, 6, 7])
+        clean_arr_dwt = utils.slice_array(scored_results_pd, [0, 4, 5, 6, 7])
 
         st.session_state.analysis_data = {
             "l1": clean_arr_l1,

@@ -344,33 +344,10 @@ def analyze_clustering(npy_file: str):
     mask = np.isfinite(scored_results_pd[numeric_cols]).all(axis=1)
     scored_results_pd = scored_results_pd[mask].dropna()
 
-    clean_arr_l1 = np.hstack((np.asarray(scored_results_pd[[0]]),
-                                      np.asarray(scored_results_pd[[1]]),
-                                      np.asarray(scored_results_pd[[5]]),
-                                      np.asarray(scored_results_pd[[6]]),
-                                      np.asarray(scored_results_pd[[7]]),
-                                      ))
-
-    clean_arr_l2 = np.hstack((np.asarray(scored_results_pd[[0]]),
-                                      np.asarray(scored_results_pd[[2]]),
-                                      np.asarray(scored_results_pd[[5]]),
-                                      np.asarray(scored_results_pd[[6]]),
-                                      np.asarray(scored_results_pd[[7]]),
-                                      ))
-
-    clean_arr_linf = np.hstack((np.asarray(scored_results_pd[[0]]),
-                                      np.asarray(scored_results_pd[[3]]),
-                                      np.asarray(scored_results_pd[[5]]),
-                                      np.asarray(scored_results_pd[[6]]),
-                                      np.asarray(scored_results_pd[[7]]),
-                                      ))
-
-    clean_arr_dwt = np.hstack((np.asarray(scored_results_pd[[0]]),
-                                      np.asarray(scored_results_pd[[4]]),
-                                      np.asarray(scored_results_pd[[5]]),
-                                      np.asarray(scored_results_pd[[6]]),
-                                      np.asarray(scored_results_pd[[7]]),
-                                      ))
+    clean_arr_l1 = utils.slice_array(scored_results_pd, [0, 1, 5, 6, 7])
+    clean_arr_l2 = utils.slice_array(scored_results_pd, [0, 2, 5, 6, 7])
+    clean_arr_linf = utils.slice_array(scored_results_pd, [0, 3, 5, 6, 7])
+    clean_arr_dwt = utils.slice_array(scored_results_pd, [0, 4, 5, 6, 7])
 
 
     # Plot Error and Similarity Metrics VS Ratio
@@ -386,11 +363,10 @@ def analyze_clustering(npy_file: str):
     clean_arr_l1_filtered = np.column_stack((clean_arr_l1[:, 0].astype(float), clean_arr_l1[:, 1].astype(float)))
     y_kmeans = kmeans.fit_predict(clean_arr_l1_filtered)
     df_l1 = pd.DataFrame(clean_arr_l1_filtered, columns=["Ratio", "L1"])
-    df_l1["cluster"] = y_kmeans.astype(str)
     df_l1["compressor"] = clean_arr_l1[:, 2]
     df_l1["filter"] = clean_arr_l1[:, 3]
     df_l1["serializer"] = clean_arr_l1[:, 4]
-    fig_l1 = px.scatter(df_l1, x="Ratio", y="L1", color="cluster",
+    fig_l1 = px.scatter(df_l1, x="Ratio", y="L1", color=y_kmeans,
                      title="L1 VS Ratio KMeans Clustering",
                      hover_data=["compressor", "filter", "serializer"])
 
@@ -414,11 +390,10 @@ def analyze_clustering(npy_file: str):
     clean_arr_l2_filtered = np.column_stack((clean_arr_l2[:, 0].astype(float), clean_arr_l2[:, 1].astype(float)))
     y_kmeans = kmeans.fit_predict(clean_arr_l2_filtered)
     df_l2 = pd.DataFrame(clean_arr_l2_filtered, columns=["Ratio", "L2"])
-    df_l2["cluster"] = y_kmeans.astype(str)
     df_l2["compressor"] = clean_arr_l2[:, 2]
     df_l2["filter"] = clean_arr_l2[:, 3]
     df_l2["serializer"] = clean_arr_l2[:, 4]
-    fig_l2 = px.scatter(df_l2, x="Ratio", y="L2", color="cluster",
+    fig_l2 = px.scatter(df_l2, x="Ratio", y="L2", color=y_kmeans,
                      title="L2 VS Ratio KMeans Clustering",
                      hover_data=["compressor", "filter", "serializer"])
 
@@ -443,11 +418,10 @@ def analyze_clustering(npy_file: str):
     clean_arr_linf_filtered = np.column_stack((clean_arr_linf[:, 0].astype(float), clean_arr_linf[:, 1].astype(float)))
     y_kmeans = kmeans.fit_predict(clean_arr_linf_filtered)
     df_linf = pd.DataFrame(clean_arr_linf_filtered, columns=["Ratio", "LInf"])
-    df_linf["cluster"] = y_kmeans.astype(str)
     df_linf["compressor"] = clean_arr_linf[:, 2]
     df_linf["filter"] = clean_arr_linf[:, 3]
     df_linf["serializer"] = clean_arr_linf[:, 4]
-    fig_linf = px.scatter(df_linf, x="Ratio", y="LInf", color="cluster",
+    fig_linf = px.scatter(df_linf, x="Ratio", y="LInf", color=y_kmeans,
                      title="LInf VS Ratio KMeans Clustering",
                      hover_data=["compressor", "filter", "serializer"])
 
@@ -472,11 +446,10 @@ def analyze_clustering(npy_file: str):
     clean_arr_dwt_filtered = np.column_stack((clean_arr_dwt[:, 0].astype(float), clean_arr_dwt[:, 1].astype(float)))
     y_kmeans = kmeans.fit_predict(clean_arr_dwt_filtered)
     df_dwt = pd.DataFrame(clean_arr_dwt_filtered, columns=["Ratio", "DWT"])
-    df_dwt["cluster"] = y_kmeans.astype(str)
     df_dwt["compressor"] = clean_arr_dwt[:, 2]
     df_dwt["filter"] = clean_arr_dwt[:, 3]
     df_dwt["serializer"] = clean_arr_dwt[:, 4]
-    fig_dwt = px.scatter(df_dwt, x="Ratio", y="DWT", color="cluster",
+    fig_dwt = px.scatter(df_dwt, x="Ratio", y="DWT", color=y_kmeans,
                      title="DWT VS Ratio KMeans Clustering",
                      hover_data=["compressor", "filter", "serializer"])
 
@@ -496,9 +469,14 @@ def analyze_clustering(npy_file: str):
     for trace in fig_dwt.data:
         fig.add_trace(trace, row=2, col=2)
 
-    fig.update_layout(title="", showlegend=False)
+    fig.update_layout(
+        title="",
+        showlegend=False,
+        height=900,
+        hovermode="closest",
+        template="plotly_white"
+    )
     pio.renderers.default = "browser"
-    pio.write_html(fig, file="./static/cluster_plots.html", full_html=True)
     fig.show()
 
 
