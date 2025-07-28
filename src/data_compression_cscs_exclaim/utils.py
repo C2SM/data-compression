@@ -47,12 +47,12 @@ from numcodecs_wasm_sz3 import Sz3
 from numcodecs_wasm_zfp import Zfp
 
 
-def open_netcdf(netcdf_file: str, field_to_compress: str, rank: int = 0):
+def open_netcdf(netcdf_file: str, field_to_compress: str | None = None, rank: int = 0):
     comm = MPI.COMM_WORLD
 
     ds = xr.open_dataset(netcdf_file, chunks="auto")
 
-    if field_to_compress not in ds.data_vars:
+    if field_to_compress is not None and field_to_compress not in ds.data_vars:
         if rank == 0:
             click.echo(f"Field {field_to_compress} not found in NetCDF file.")
             click.echo(f"Available fields in the dataset: {list(ds.data_vars.keys())}.")
@@ -61,9 +61,8 @@ def open_netcdf(netcdf_file: str, field_to_compress: str, rank: int = 0):
 
     if rank == 0:
         click.echo(f"netcdf_file.nbytes = {humanize.naturalsize(ds.nbytes, binary=True)}")
-        click.echo(
-            f"field_to_compress.nbytes = {humanize.naturalsize(ds[field_to_compress].nbytes, binary=True)}"
-        )
+        if field_to_compress is not None:
+            click.echo(f"field_to_compress.nbytes = {humanize.naturalsize(ds[field_to_compress].nbytes, binary=True)}")
 
     return ds
 
@@ -74,7 +73,7 @@ def open_zarr_zipstore(zarr_zipstore_file: str):
 
 
 def compress_with_zarr(data, netcdf_file, field_to_compress, filters, compressors, serializer='auto', verbose=True, rank=0):
-    store = zarr.storage.ZipStore(f"{netcdf_file}.=.{field_to_compress}.rank{rank}.zarr.zip", mode='w')
+    store = zarr.storage.ZipStore(f"{netcdf_file}.=.field_{field_to_compress}.=.rank_{rank}.zarr.zip", mode='w')
     z = zarr.create_array(
         store=store,
         name=field_to_compress,
@@ -368,6 +367,19 @@ def inclusive_range(start, end, step=1):
             values.append(end)
 
     return values
+
+
+def validate_percentage(ctx, param, value):
+    if value is None:
+        return None
+    try:
+        value = float(value)
+    except ValueError:
+        raise click.BadParameter("Percentage must be a number.")
+    if not (1 <= value <= 99):
+        raise click.BadParameter("Percentage must be between 1 and 99.")
+    return value
+
 
 def slice_array(arr: pd.array, indices_ls: list) -> np.ndarray:
     arr_ls = []
