@@ -414,7 +414,6 @@ def unzip_file(zip_path: str, extract_to: str = None):
 
 
 def copy_folder_contents(src_folder: str, dst_folder: str):
-    # Make sure destination folder exists
     os.makedirs(dst_folder, exist_ok=True)
 
     for item in os.listdir(src_folder):
@@ -422,8 +421,6 @@ def copy_folder_contents(src_folder: str, dst_folder: str):
         dst_path = os.path.join(dst_folder, item)
 
         if os.path.isdir(src_path):
-            # Copy directory recursively
             shutil.copytree(src_path, dst_path, dirs_exist_ok=True)
         else:
-            # Copy file
             shutil.copy2(src_path, dst_path)

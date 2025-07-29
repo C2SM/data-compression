@@ -207,26 +207,28 @@ def merge_compressed_fields(netcdf_file: str):
             click.echo("This command is not meant to be run in parallel. Please run it with a single process.")
         sys.exit(1)
 
-    merged_folder_name = f"{netcdf_file}.zarr"
-    os.makedirs(merged_folder_name)
+    # populate this folder with the compressed fields
+    merged_folder = f"{netcdf_file}.zarr"
+    if Path(merged_folder).exists():
+        shutil.rmtree(merged_folder)
+    os.makedirs(merged_folder)
 
     for var in utils.open_netcdf(netcdf_file).data_vars:
-        zipped = f"{netcdf_file}.=.field_{var}.=.rank_{rank}.zarr.zip"
-        file_path = Path(zipped)
-        if not file_path.exists():
+        compressed_field = f"{netcdf_file}.=.field_{var}.=.rank_{rank}.zarr.zip"
+        if not Path(compressed_field).exists():
             click.echo("All fields must be compressed first.")
             sys.exit(1)
-        extract_to = utils.unzip_file(zipped)
-        utils.copy_folder_contents(extract_to, merged_folder_name)
+        extract_to = utils.unzip_file(compressed_field)
+        utils.copy_folder_contents(extract_to, merged_folder)
         shutil.rmtree(extract_to)
 
-    zipped_merged_folder_name = merged_folder_name + ".zip"
-    if os.path.exists(zipped_merged_folder_name):
-        os.remove(zipped_merged_folder_name)
-    shutil.make_archive(merged_folder_name, 'zip', merged_folder_name)
+    zipped_merged_folder = merged_folder + ".zip"
+    if Path(zipped_merged_folder).exists():
+        os.remove(zipped_merged_folder)
+    shutil.make_archive(merged_folder, 'zip', merged_folder)
 
-    if os.path.exists(merged_folder_name):
-        shutil.rmtree(merged_folder_name)
+    if Path(merged_folder).exists():
+        shutil.rmtree(merged_folder)
 
 
 @cli.command("summarize_compression")
