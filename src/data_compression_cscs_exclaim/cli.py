@@ -7,9 +7,13 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 import os
+import sys
 import inspect
 import click
 from tqdm import tqdm
+from pathlib import Path
+import zarr
+import shutil
 import itertools
 import numcodecs
 import numcodecs.zarr3
@@ -192,13 +196,47 @@ def compress_with_optimal(netcdf_file, field_to_compress, comp_idx, filt_idx, se
     click.echo(f" | {(optimal_compressor, optimal_filter, optimal_serializer)} | --> Ratio: {compression_ratio:.3f} | Error: {errors['Relative_Error_L1']:.3e} | DWT: {dwt_dist:.3e}")
 
 
+@cli.command("merge_compressed_fields")
+@click.argument("netcdf_file", type=click.Path(exists=True, dir_okay=False))
+def merge_compressed_fields(netcdf_file: str):
+    comm = MPI.COMM_WORLD
+    rank = comm.Get_rank()
+    size = comm.Get_size()
+    if size > 1:
+        if rank == 0: 
+            click.echo("This command is not meant to be run in parallel. Please run it with a single process.")
+        sys.exit(1)
+
+    merged_folder_name = f"{netcdf_file}.zarr"
+    os.makedirs(merged_folder_name)
+
+    for var in utils.open_netcdf(netcdf_file).data_vars:
+        zipped = f"{netcdf_file}.=.field_{var}.=.rank_{rank}.zarr.zip"
+        file_path = Path(zipped)
+        if not file_path.exists():
+            click.echo("All fields must be compressed first.")
+            sys.exit(1)
+        extract_to = utils.unzip_file(zipped)
+        utils.copy_folder_contents(extract_to, merged_folder_name)
+        shutil.rmtree(extract_to)
+
+    zipped_merged_folder_name = merged_folder_name + ".zip"
+    if os.path.exists(zipped_merged_folder_name):
+        os.remove(zipped_merged_folder_name)
+    shutil.make_archive(merged_folder_name, 'zip', merged_folder_name)
+
+    if os.path.exists(merged_folder_name):
+        shutil.rmtree(merged_folder_name)
+
+
 @cli.command("summarize_compression")
 @click.argument("netcdf_file", type=click.Path(exists=True, dir_okay=False))
 @click.option("--field-to-compress", default=None, help="Field to compress [if not given, all fields will be compressed].")
-@click.option("--field-percentage", default=None, callback=utils.validate_percentage, help="Compress a percentage of the field [1-99 %]. If not given, the whole field will be compressed.")
+@click.option("--field-percentage", default=None, callback=utils.validate_percentage, help="Compress a percentage of the field [1-99%]. If not given, the whole field will be compressed.")
 def summarize_compression(netcdf_file: str, field_to_compress: str | None = None, field_percentage: str | None = None):
     ## https://numcodecs.readthedocs.io/en/stable/zarr3.html#zarr-3-codecs
     ## https://numcodecs-wasm.readthedocs.io/en/latest/
+    
     dask.config.set(scheduler="single-threaded")
     dask.config.set(array__chunk_size="512MiB")
     comm = MPI.COMM_WORLD

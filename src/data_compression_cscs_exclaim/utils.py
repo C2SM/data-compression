@@ -7,10 +7,13 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 import sys
+import os
+import shutil
 import math
 import traceback
 from collections import OrderedDict
 from collections.abc import Sequence
+import zipfile
 import click
 import humanize
 import numpy as np
@@ -83,13 +86,13 @@ def compress_with_zarr(data, netcdf_file, field_to_compress, filters, compressor
         compressors=compressors,
         serializer=serializer,
         )
-    
+
     info_array = z.info_complete()
     compression_ratio = info_array._count_bytes / info_array._count_bytes_stored
     if verbose and rank == 0:
         click.echo(80* "-")
         click.echo(info_array)
-    
+
     pprint_, errors = compute_relative_errors(z[:], data)
     if verbose and rank == 0:
         click.echo(80* "-")
@@ -390,3 +393,37 @@ def slice_array(arr: pd.array, indices_ls: list) -> np.ndarray:
         tuple(arr_ls)
     )
     return sliced_arr
+
+
+def unzip_file(zip_path: str, extract_to: str = None):
+    if extract_to is None:
+        extract_to = os.path.splitext(zip_path)[0]  # default: same name as zip
+
+    # Remove the extract_to path if it exists
+    if os.path.exists(extract_to):
+        if os.path.isfile(extract_to):
+            os.remove(extract_to)
+        else:
+            shutil.rmtree(extract_to)
+
+    # Extract zip file
+    with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+        zip_ref.extractall(extract_to)
+
+    return extract_to
+
+
+def copy_folder_contents(src_folder: str, dst_folder: str):
+    # Make sure destination folder exists
+    os.makedirs(dst_folder, exist_ok=True)
+
+    for item in os.listdir(src_folder):
+        src_path = os.path.join(src_folder, item)
+        dst_path = os.path.join(dst_folder, item)
+
+        if os.path.isdir(src_path):
+            # Copy directory recursively
+            shutil.copytree(src_path, dst_path, dirs_exist_ok=True)
+        else:
+            # Copy file
+            shutil.copy2(src_path, dst_path)
