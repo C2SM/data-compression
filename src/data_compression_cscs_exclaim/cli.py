@@ -8,6 +8,7 @@
 
 import os
 import sys
+import io
 import inspect
 import traceback
 import click
@@ -261,11 +262,28 @@ def summarize_compression(netcdf_file: str, field_to_compress: str | None = None
     rank = comm.Get_rank()
     size = comm.Get_size()
 
-    # Lookup table for valid thresholds
-    # https://docs.google.com/spreadsheets/d/1lHcX-HE2WpVCOeKyDvM4iFqjlWvkd14lJlA-CUoCxMM/edit?gid=0#gid=0
-    sheet_id = "1lHcX-HE2WpVCOeKyDvM4iFqjlWvkd14lJlA-CUoCxMM"
-    sheet_url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv"
-    thresholds = pd.read_csv(sheet_url)
+    if rank == 0:
+        try:
+            # Lookup table for valid thresholds
+            # https://docs.google.com/spreadsheets/d/1lHcX-HE2WpVCOeKyDvM4iFqjlWvkd14lJlA-CUoCxMM/edit?gid=0#gid=0
+            sheet_id = "1lHcX-HE2WpVCOeKyDvM4iFqjlWvkd14lJlA-CUoCxMM"
+            sheet_url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv"
+            thresholds = pd.read_csv(sheet_url)
+        except Exception as e:
+            print(f"[Rank 0] Failed to fetch thresholds: {e}")
+            sys.exit(1)
+        # Convert DataFrame to bytes for broadcasting
+        buffer = io.BytesIO()
+        thresholds.to_parquet(buffer, index=False)
+        data_bytes = buffer.getvalue()
+    else:
+        data_bytes = None
+
+    data_bytes = comm.bcast(data_bytes, root=0)
+
+    if rank != 0:
+        buffer = io.BytesIO(data_bytes)
+        thresholds = pd.read_parquet(buffer)
 
     # This is opened by all MPI processes
     ds = utils.open_netcdf(netcdf_file, field_to_compress, rank=rank)
@@ -344,7 +362,7 @@ def summarize_compression(netcdf_file: str, field_to_compress: str | None = None
             except:
                 if rank == 0:
                     click.echo(f"Failed to compress with {compressor}, {filter}, {serializer}.")
-                    # traceback.print_exc(file=sys.stderr)
+                    traceback.print_exc(file=sys.stderr)
                 sys.exit(1)
 
         results_gather = comm.gather(results, root=0)

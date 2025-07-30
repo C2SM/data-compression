@@ -1,0 +1,15 @@
+#!/bin/bash
+
+#SBATCH --account=csstaff
+#SBATCH --uenv=prgenv-gnu/25.06:rc5
+#SBATCH --view=default
+#SBATCH --partition=debug
+#SBATCH --ntasks=128
+#SBATCH --nodes=1
+#SBATCH --time=00:15:00
+#SBATCH --output=out-%j.out
+#SBATCH --error=out-%j.out
+
+source venv/bin/activate
+
+srun data_compression_cscs_exclaim summarize_compression netCDF_files/tigge_pl_t_q_dx=2_2024_08_02.nc --field-to-compress t

@@ -29,7 +29,6 @@ dependencies = [
     "matplotlib",
     "netCDF4",
     "h5netcdf",
-    "mpi4py",
     "plotly",
     "numcodecs_wasm",
     "numcodecs_combinators",
