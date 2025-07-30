@@ -30,6 +30,7 @@ dependencies = [
     "netCDF4",
     "h5netcdf",
     "plotly",
+    "pyqt6",
     "numcodecs_wasm",
     "numcodecs_combinators",
     "numcodecs_observers",

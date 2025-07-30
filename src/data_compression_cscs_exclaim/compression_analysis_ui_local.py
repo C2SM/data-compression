@@ -1,3 +1,17 @@
+
+import importlib.util
+import subprocess
+import sys
+
+# PyQt6 might encounter issues when installed from pyproject.toml
+if importlib.util.find_spec("PyQt6") is None:
+    print(f"{"PyQt6"} not found. Installing...")
+    subprocess.check_call([
+        sys.executable, "-m", "pip", "install", "PyQt6", "--only-binary", ":all:"
+    ])
+else:
+    print(f"{"PyQt6"} is already installed.")
+
 import sys
 import os
 import subprocess
