@@ -204,7 +204,7 @@ def merge_compressed_fields(netcdf_file: str):
     rank = comm.Get_rank()
     size = comm.Get_size()
     if size > 1:
-        if rank == 0: 
+        if rank == 0:
             click.echo("This command is not meant to be run in parallel. Please run it with a single process.")
         sys.exit(1)
 
@@ -236,9 +236,9 @@ def merge_compressed_fields(netcdf_file: str):
 @click.argument("zarr_file", type=click.Path(exists=True, dir_okay=False))
 def open_zarr_file_and_inspect(zarr_file: str):
     zarr_group = utils.open_zarr_zipstore(zarr_file)
-    
+
     click.echo(zarr_group.tree())
-    
+
     click.echo(80* "-")
     for array_name in zarr_group.array_keys():
         click.echo(f"Array: {array_name}")
@@ -254,7 +254,7 @@ def open_zarr_file_and_inspect(zarr_file: str):
 def summarize_compression(netcdf_file: str, field_to_compress: str | None = None, field_percentage: str | None = None):
     ## https://numcodecs.readthedocs.io/en/stable/zarr3.html#zarr-3-codecs
     ## https://numcodecs-wasm.readthedocs.io/en/latest/
-    
+
     dask.config.set(scheduler="single-threaded")
     dask.config.set(array__chunk_size="512MiB")
     comm = MPI.COMM_WORLD
@@ -269,7 +269,7 @@ def summarize_compression(netcdf_file: str, field_to_compress: str | None = None
 
     # This is opened by all MPI processes
     ds = utils.open_netcdf(netcdf_file, field_to_compress, rank=rank)
-    
+
     for var in ds.data_vars:
         if field_to_compress is not None and field_to_compress != var:
             continue
@@ -356,9 +356,9 @@ def summarize_compression(netcdf_file: str, field_to_compress: str | None = None
             raw_values_explicit_gather = list(itertools.chain.from_iterable(raw_values_explicit_gather))
             raw_values_explicit_with_names_gather = list(itertools.chain.from_iterable(raw_values_explicit_with_names_gather))
 
-            # Needed for clustering
-            np.save('scored_results_raw.npy', np.asarray(pd.DataFrame(raw_values_explicit_gather)))
-            np.save('scored_results_with_names.npy', np.asarray(pd.DataFrame(raw_values_explicit_with_names_gather)))
+        # Needed for clustering
+        np.save(os.path.basename(netcdf_file) + '_scored_results_raw.npy', np.asarray(pd.DataFrame(raw_values_explicit_gather)))
+        np.save(os.path.basename(netcdf_file) + '_scored_results_with_names.npy', np.asarray(pd.DataFrame(raw_values_explicit_with_names_gather)))
 
             best_combo = max(results_gather, key=lambda x: x[1])
             click.echo("Best combo (valid threshold & max CR):")

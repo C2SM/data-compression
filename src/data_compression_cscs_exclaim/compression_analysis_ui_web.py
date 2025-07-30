@@ -27,8 +27,8 @@ st.title("Upload a file and evaluate compressors")
 uploaded_file = st.file_uploader("Choose a netcdf file")
 
 @st.cache_data
-def load_scored_results():
-    return np.load("scored_results_with_names.npy", allow_pickle=True)
+def load_scored_results(uploaded_file_name: str):
+    return np.load(uploaded_file_name + "_scored_results_with_names.npy", allow_pickle=True)
 
 
 @st.cache_resource
@@ -241,7 +241,7 @@ if uploaded_file is not None and uploaded_file.name.endswith(".nc"):
                     progress_text.text(f"{percent}%")
                     progress_text_1.text(f"{current_max}/{total_steps}")
 
-        scored_results = load_scored_results()
+        scored_results = load_scored_results(os.path.basename(path_to_modified_file))
 
         scored_results_pd = pd.DataFrame(scored_results)
 

@@ -29,13 +29,20 @@ Options:
 --------------------------------------------------------------------------------
 ```
 
-## UI for compressor pre-eval
+## UI implementation
 
-model_predict_ui.py can be used to evaluate which compressor works best.
+Two User Interfaces have been implemented to make the file compression process more user-friendly.
+Both UIs provide functionlaities for compressors similarity metrics and file compression.
 
-It is possible to tweak compressor parameters on-the-fly.
+compression_analysis_ui_web.py is the web app.
+Outside of the mutual UI functionalities, this UI allows users to download similarity metrics plots and tweak parameters more dynamically, though it is a bit slower.
 
 ```
-prototyping % streamlit run ./src/data_compression_cscs_exclaim/model_predict_ui.py [OPTIONAL] --server.maxUploadSize=FILE_SIZE_MB --server.maxMessageSize=FILE_SIZE_MB
+streamlit run ./src/data_compression_cscs_exclaim/compression_analysis_ui_web.py [OPTIONAL] --server.maxUploadSize=FILE_SIZE_MB --server.maxMessageSize=FILE_SIZE_MB
 
 ```
+
+A local version is also available:
+````
+python ./src/data_compression_cscs_exclaim/compression_analysis_ui_local.py
+````
