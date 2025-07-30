@@ -342,8 +342,9 @@ def summarize_compression(netcdf_file: str, field_to_compress: str | None = None
                     raw_values_explicit_with_names.append((compression_ratio, l1_error_rel, l2_error_rel, linf_error_rel, dwt_dist, str(compressor), str(filter), str(serializer)))
 
             except:
-                click.echo(f"Failed to compress with {compressor}, {filter}, {serializer}.")
-                # traceback.print_exc(file=sys.stderr)
+                if rank == 0:
+                    click.echo(f"Failed to compress with {compressor}, {filter}, {serializer}.")
+                    # traceback.print_exc(file=sys.stderr)
                 sys.exit(1)
 
         results_gather = comm.gather(results, root=0)
@@ -360,9 +361,9 @@ def summarize_compression(netcdf_file: str, field_to_compress: str | None = None
         np.save(os.path.basename(netcdf_file) + '_scored_results_raw.npy', np.asarray(pd.DataFrame(raw_values_explicit_gather)))
         np.save(os.path.basename(netcdf_file) + '_scored_results_with_names.npy', np.asarray(pd.DataFrame(raw_values_explicit_with_names_gather)))
 
-            best_combo = max(results_gather, key=lambda x: x[1])
-            click.echo("Best combo (valid threshold & max CR):")
-            click.echo(f" | {best_combo[0]} | --> Ratio: {best_combo[1]:.3f} | Error: {best_combo[2]:.3e} | DWT: {best_combo[3]:.3e}")
+        best_combo = max(results_gather, key=lambda x: x[1])
+        click.echo("Best combo (valid threshold & max CR):")
+        click.echo(f" | {best_combo[0]} | --> Ratio: {best_combo[1]:.3f} | Error: {best_combo[2]:.3e} | DWT: {best_combo[3]:.3e}")
 
 
 @cli.command("perform_clustering")
