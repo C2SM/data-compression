@@ -210,7 +210,7 @@ def filter_space(da):
     # TODO: take care of integer data types
     filter_space = []
     
-    _FILTERS = [numcodecs.zarr3.Delta, numcodecs.zarr3.BitRound, numcodecs.zarr3.Quantize]
+    _FILTERS = [numcodecs.zarr3.Delta, numcodecs.zarr3.BitRound, numcodecs.zarr3.Quantize, Asinh, FixedOffsetScale, Log, UniformNoise]
     if da.dtype.kind == 'i':
         _FILTERS = [numcodecs.zarr3.Delta]
     base_scale = 10 ** np.floor(np.log10(np.abs(da).max().compute().item()))
@@ -250,7 +250,7 @@ def serializer_space(da):
     # TODO: take care of integer data types
     serializer_space = []
     
-    _SERIALIZERS = [numcodecs.zarr3.PCodec, numcodecs.zarr3.ZFPY]
+    _SERIALIZERS = [numcodecs.zarr3.PCodec, numcodecs.zarr3.ZFPY, EBCCZarrFilter, Sperr, Sz3]
     if da.dtype.kind == 'i':
         _SERIALIZERS = [numcodecs.zarr3.PCodec, numcodecs.zarr3.ZFPY, EBCCZarrFilter, Sz3]
     for serializer in _SERIALIZERS:
