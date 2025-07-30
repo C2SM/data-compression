@@ -3,3 +3,4 @@ __pycache__/
 *.zarr*
 EBCC/
 *.npy
+*.nc

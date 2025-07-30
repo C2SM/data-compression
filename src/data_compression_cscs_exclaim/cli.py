@@ -9,6 +9,7 @@
 import os
 import sys
 import inspect
+import traceback
 import click
 from tqdm import tqdm
 from pathlib import Path
@@ -231,6 +232,21 @@ def merge_compressed_fields(netcdf_file: str):
         shutil.rmtree(merged_folder)
 
 
+@cli.command("open_zarr_file_and_inspect")
+@click.argument("zarr_file", type=click.Path(exists=True, dir_okay=False))
+def open_zarr_file_and_inspect(zarr_file: str):
+    zarr_group = utils.open_zarr_zipstore(zarr_file)
+    
+    click.echo(zarr_group.tree())
+    
+    click.echo(80* "-")
+    for array_name in zarr_group.array_keys():
+        click.echo(f"Array: {array_name}")
+        click.echo(zarr_group[array_name].info_complete())
+        click.echo(zarr_group[array_name][:])
+        click.echo(80* "-")
+
+
 @cli.command("summarize_compression")
 @click.argument("netcdf_file", type=click.Path(exists=True, dir_okay=False))
 @click.option("--field-to-compress", default=None, help="Field to compress [if not given, all fields will be compressed].")
@@ -258,6 +274,11 @@ def summarize_compression(netcdf_file: str, field_to_compress: str | None = None
         if field_to_compress is not None and field_to_compress != var:
             continue
         da = ds[var]
+
+        threshold_row = thresholds[thresholds["Short Name"] == var]
+        matching_units = threshold_row.iloc[0]["Unit"] == da.attrs.get("units", None) if not threshold_row.empty else None
+        existing_l1_error = threshold_row.iloc[0]["Existing L1 error"] if not threshold_row.empty and matching_units else None
+        existing_l1_error = float(existing_l1_error.replace(",", ".")) if existing_l1_error else None
 
         if field_percentage is not None:
             field_percentage = float(field_percentage)
@@ -312,16 +333,18 @@ def summarize_compression(netcdf_file: str, field_to_compress: str | None = None
                 raw_values_explicit.append((compression_ratio, l1_error_rel, l2_error_rel, linf_error_rel, dwt_dist))
 
                 # TODO: refine criteria based on the thersholds table
-                if l1_error_rel <= 1e-2:
+                if existing_l1_error:
+                    if l1_error_rel <= existing_l1_error:
+                        results.append(((str(compressor), str(filter), str(serializer), comp_idx, filt_idx, ser_idx), compression_ratio, l1_error_rel, dwt_dist))
+                        raw_values_explicit_with_names.append((compression_ratio, l1_error_rel, l2_error_rel, linf_error_rel, dwt_dist, str(compressor), str(filter), str(serializer)))
+                else:
                     results.append(((str(compressor), str(filter), str(serializer), comp_idx, filt_idx, ser_idx), compression_ratio, l1_error_rel, dwt_dist))
                     raw_values_explicit_with_names.append((compression_ratio, l1_error_rel, l2_error_rel, linf_error_rel, dwt_dist, str(compressor), str(filter), str(serializer)))
 
             except:
-                click.echo(f"Failed to compress with {compressor}, {filter}, {serializer}. Skipping...")
-                # import sys
-                # import traceback
+                click.echo(f"Failed to compress with {compressor}, {filter}, {serializer}.")
                 # traceback.print_exc(file=sys.stderr)
-                # comm.Abort(1)
+                sys.exit(1)
 
         results_gather = comm.gather(results, root=0)
         raw_values_explicit_gather = comm.gather(raw_values_explicit, root=0)

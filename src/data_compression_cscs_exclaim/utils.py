@@ -51,8 +51,6 @@ from numcodecs_wasm_zfp import Zfp
 
 
 def open_netcdf(netcdf_file: str, field_to_compress: str | None = None, rank: int = 0):
-    comm = MPI.COMM_WORLD
-
     ds = xr.open_dataset(netcdf_file, chunks="auto")
 
     if field_to_compress is not None and field_to_compress not in ds.data_vars:
@@ -60,7 +58,7 @@ def open_netcdf(netcdf_file: str, field_to_compress: str | None = None, rank: in
             click.echo(f"Field {field_to_compress} not found in NetCDF file.")
             click.echo(f"Available fields in the dataset: {list(ds.data_vars.keys())}.")
             click.echo("Aborting...")
-        comm.Abort(1)
+        sys.exit(1)
 
     if rank == 0:
         click.echo(f"netcdf_file.nbytes = {humanize.naturalsize(ds.nbytes, binary=True)}")
@@ -173,7 +171,7 @@ def compressor_space(da):
 
     # TODO: take care of integer data types
     compressor_space = []
-    
+
     _COMPRESSORS = [numcodecs.zarr3.Blosc, numcodecs.zarr3.LZ4, numcodecs.zarr3.Zstd, numcodecs.zarr3.Zlib, numcodecs.zarr3.GZip, numcodecs.zarr3.BZ2, numcodecs.zarr3.LZMA]
     for compressor in _COMPRESSORS:
         if compressor == numcodecs.zarr3.Blosc:
@@ -213,6 +211,8 @@ def filter_space(da):
     filter_space = []
     
     _FILTERS = [numcodecs.zarr3.Delta, numcodecs.zarr3.BitRound, numcodecs.zarr3.Quantize, Asinh, FixedOffsetScale, Log, UniformNoise]
+    if da.dtype.kind == 'i':
+        _FILTERS = [numcodecs.zarr3.Delta]
     base_scale = 10 ** np.floor(np.log10(np.abs(da).max().compute().item()))
     for filter in _FILTERS:
         if filter == numcodecs.zarr3.Delta:
@@ -251,6 +251,8 @@ def serializer_space(da):
     serializer_space = []
     
     _SERIALIZERS = [numcodecs.zarr3.PCodec, numcodecs.zarr3.ZFPY, EBCCZarrFilter, Sperr, Sz3]
+    if da.dtype.kind == 'i':
+        _SERIALIZERS = [numcodecs.zarr3.PCodec, numcodecs.zarr3.ZFPY, EBCCZarrFilter, Sz3]
     for serializer in _SERIALIZERS:
         if serializer == numcodecs.zarr3.PCodec:
             # https://github.com/pcodec/pcodec
