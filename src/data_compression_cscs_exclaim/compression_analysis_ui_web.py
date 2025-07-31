@@ -195,6 +195,7 @@ if uploaded_file is not None and uploaded_file.name.endswith(".nc"):
     with tempfile.NamedTemporaryFile(suffix=".nc", delete=False) as tmp:
         path_to_modified_file = tmp.name
         netcdf_file_xr.to_netcdf(path_to_modified_file)
+        netcdf_file_xr.close()
 
     if 'analysis_data' not in st.session_state:
         st.session_state.analysis_data = None
@@ -209,34 +210,30 @@ if uploaded_file is not None and uploaded_file.name.endswith(".nc"):
             "data_compression_cscs_exclaim",
             "summarize_compression",
             path_to_modified_file,
-            field_to_compress
+            "--field-to-compress="+field_to_compress
         ]
 
         st.info("Analyzing compressors...")
         progress_bar = st.progress(0)
         progress_text = st.empty()
         progress_text_1 = st.empty()
-        log_box = st.empty()
 
         total_steps = 37635
         current_max = 0
-        full_log = ""
-
         with subprocess.Popen(
             cmd_compress,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
             bufsize=1
-        ) as process:
-            for line in process.stdout:
-                match = re.search(r"Rank \d+:\s+.*?(\d+)/(\d+)", line)
-                if match:
-                    current_max = max(current_max, int(match.group(1)))
-                    if current_max == 0:
-                        percent = 0
-                    else:
-                        percent = int(100 * current_max/int(match.group(2)))
+        ) as proc:
+            for line in proc.stdout:
+                m = re.search(r"Rank \d+:\s+.*?(\d+)/(\d+)", line)
+                if m:
+                    current = int(m.group(1))
+                    total = int(m.group(2))
+                    current_max = max(current_max, current)
+                    percent = int(100 * current_max / total) if total else 0
                     progress_bar.progress(percent)
                     progress_text.text(f"{percent}%")
                     progress_text_1.text(f"{current_max}/{total_steps}")
@@ -304,14 +301,15 @@ if uploaded_file is not None and uploaded_file.name.endswith(".nc"):
         result = subprocess.run(cmd_compress, capture_output=True, text=True, check=True)
         st.success("Compression completed successfully")
         after = set(os.listdir(temp_dir))
-        generated_files = list(after - before)
-        generated_file_name = generated_files[0]
-        output_file_path = os.path.join(temp_dir, generated_file_name)
+        output_file_path = os.path.join(temp_dir, list(after - before)[0])
+
+        split_tmp_name = os.path.basename(output_file_path).split(".=.", 1)
+        compressed_file_name = f"{uploaded_file.name}.=.{split_tmp_name[1]}"
         with open(output_file_path, "rb") as data_file:
             st.download_button(
                 label="Download Compressed File",
                 data=data_file,
-                file_name=os.path.basename(output_file_path),
+                file_name=compressed_file_name,
             )
         os.remove(output_file_path)
         if os.path.exists(path_to_modified_file):
