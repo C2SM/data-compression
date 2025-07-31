@@ -323,11 +323,8 @@ def summarize_compression(netcdf_file: str, field_to_compress: str | None = None
         results = []
         raw_values_explicit = []
         raw_values_explicit_with_names = []
-        for (comp_idx, compressor), (filt_idx, filter), (ser_idx, serializer) in tqdm(
-            configs_for_rank,
-            desc=f"Rank {rank}",
-            position=rank,
-        ):
+        total_configs = len(configs_for_rank)
+        for i, ((comp_idx, compressor), (filt_idx, filter), (ser_idx, serializer)) in enumerate(configs_for_rank):
             data_to_compress = da
             if isinstance(serializer, AnyNumcodecsArrayBytesCodec):
                 if isinstance(serializer.codec, (Pco, Sperr, Sz3, Zfp)):
@@ -366,6 +363,8 @@ def summarize_compression(netcdf_file: str, field_to_compress: str | None = None
                     click.echo(f"Failed to compress with {compressor}, {filter}, {serializer}.")
                     traceback.print_exc(file=sys.stderr)
                 sys.exit(1)
+
+            utils.progress_bar(rank, i, total_configs, print_every=100)
 
         results_gather = comm.gather(results, root=0)
         raw_values_explicit_gather = comm.gather(raw_values_explicit, root=0)
