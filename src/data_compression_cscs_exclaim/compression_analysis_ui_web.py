@@ -235,7 +235,8 @@ if uploaded_file is not None and uploaded_file.name.endswith(".nc"):
             for line in proc.stdout:
                 progress_text.text(f"{line}")
 
-        scored_results = load_scored_results(os.path.basename(path_to_modified_file))
+        file_name = cmd_compress[3] if "santis" in where_am_i.stdout.strip() else cmd_compress[5]
+        scored_results = load_scored_results(os.path.basename(file_name))
 
         scored_results_pd = pd.DataFrame(scored_results)
 
