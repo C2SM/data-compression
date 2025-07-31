@@ -4,6 +4,16 @@ TODO
 
 ## Installation
 
+In Santis@ALPS:
+
+ ```commandline
+export UENV_NAME="prgenv-gnu/25.06:rc5"
+uenv image pull $UENV_NAME
+uenv start --view=default $UENV_NAME
+```
+
+once the above is complete (just for Santis, locally it is not needed):
+
 ```commandline
 git clone git@github.com:C2SM/data-compression.git
 python -m venv venv

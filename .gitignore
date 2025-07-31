@@ -5,3 +5,4 @@ EBCC/
 *.npy
 *.nc
 venv/
+out-*
