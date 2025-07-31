@@ -12,4 +12,4 @@
 
 source venv/bin/activate
 
-srun data_compression_cscs_exclaim summarize_compression netCDF_files/tigge_pl_t_q_dx=2_2024_08_02.nc --field-to-compress t
+srun data_compression_cscs_exclaim summarize_compression netCDF_files/tigge_pl_t_q_dx=2_2024_08_02.nc --field-to-compress t 2>&1 | grep -v "wasmtime"
