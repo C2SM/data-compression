@@ -47,9 +47,12 @@ def create_cluster_plots(clean_arr_l1, clean_arr_l2, clean_arr_linf, clean_arr_d
     df_l1["compressor"] = clean_arr_l1[:, 2]
     df_l1["filter"] = clean_arr_l1[:, 3]
     df_l1["serializer"] = clean_arr_l1[:, 4]
+    df_l1["compressor_idx"] = np.arange(len(clean_arr_l1[:, 2]))
+    df_l1["filter_idx"] = np.arange(len(clean_arr_l1[:, 3]))
+    df_l1["serializer_idx"] = np.arange(len(clean_arr_l1[:, 4]))
 
     fig_l1 = px.scatter(df_l1, x="Ratio", y="L1", color=y_kmeans,
-                        title="L1 VS Ratio KMeans Clustering", hover_data=["compressor", "filter", "serializer"])
+                        title="L1 VS Ratio KMeans Clustering", hover_data=["compressor", "filter", "serializer", "compressor_idx", "filter_idx", "serializer_idx"])
 
     fig.add_trace(
         go.Scatter(
@@ -64,6 +67,8 @@ def create_cluster_plots(clean_arr_l1, clean_arr_l2, clean_arr_linf, clean_arr_d
         row=1,
         col=1
     )
+    fig.update_xaxes(title_text="Ratio", row=1, col=1)
+    fig.update_yaxes(title_text="L1", row=1, col=1)
 
     for trace in fig_l1.data:
         fig.add_trace(trace, row=1, col=1)
@@ -75,9 +80,12 @@ def create_cluster_plots(clean_arr_l1, clean_arr_l2, clean_arr_linf, clean_arr_d
     df_l2["compressor"] = clean_arr_l2[:, 2]
     df_l2["filter"] = clean_arr_l2[:, 3]
     df_l2["serializer"] = clean_arr_l2[:, 4]
+    df_l2["compressor_idx"] = np.arange(len(clean_arr_l2[:, 2]))
+    df_l2["filter_idx"] = np.arange(len(clean_arr_l2[:, 3]))
+    df_l2["serializer_idx"] = np.arange(len(clean_arr_l2[:, 4]))
 
     fig_l2 = px.scatter(df_l2, x="Ratio", y="L2", color=y_kmeans,
-                        title="L2 VS Ratio KMeans Clustering", hover_data=["compressor", "filter", "serializer"])
+                        title="L2 VS Ratio KMeans Clustering", hover_data=["compressor", "filter", "serializer", "compressor_idx", "filter_idx", "serializer_idx"])
 
     fig.add_trace(
         go.Scatter(
@@ -92,6 +100,8 @@ def create_cluster_plots(clean_arr_l1, clean_arr_l2, clean_arr_linf, clean_arr_d
         row=1,
         col=2
     )
+    fig.update_xaxes(title_text="Ratio", row=1, col=2)
+    fig.update_yaxes(title_text="L2", row=1, col=2)
     for trace in fig_l2.data:
         fig.add_trace(trace, row=1, col=2)
 
@@ -103,9 +113,12 @@ def create_cluster_plots(clean_arr_l1, clean_arr_l2, clean_arr_linf, clean_arr_d
     df_linf["compressor"] = clean_arr_linf[:, 2]
     df_linf["filter"] = clean_arr_linf[:, 3]
     df_linf["serializer"] = clean_arr_linf[:, 4]
+    df_linf["compressor_idx"] = np.arange(len(clean_arr_linf[:, 2]))
+    df_linf["filter_idx"] = np.arange(len(clean_arr_linf[:, 3]))
+    df_linf["serializer_idx"] = np.arange(len(clean_arr_linf[:, 4]))
 
     fig_linf = px.scatter(df_linf, x="Ratio", y="LInf", color=y_kmeans,
-                          title="LInf VS Ratio KMeans Clustering", hover_data=["compressor", "filter", "serializer"])
+                          title="LInf VS Ratio KMeans Clustering", hover_data=["compressor", "filter", "serializer", "compressor_idx", "filter_idx", "serializer_idx"])
 
     fig.add_trace(
         go.Scatter(
@@ -120,6 +133,8 @@ def create_cluster_plots(clean_arr_l1, clean_arr_l2, clean_arr_linf, clean_arr_d
         row=2,
         col=1
     )
+    fig.update_xaxes(title_text="Ratio", row=2, col=1)
+    fig.update_yaxes(title_text="LInf", row=2, col=1)
     for trace in fig_linf.data:
         fig.add_trace(trace, row=2, col=1)
 
@@ -130,9 +145,12 @@ def create_cluster_plots(clean_arr_l1, clean_arr_l2, clean_arr_linf, clean_arr_d
     df_dwt["compressor"] = clean_arr_dwt[:, 2]
     df_dwt["filter"] = clean_arr_dwt[:, 3]
     df_dwt["serializer"] = clean_arr_dwt[:, 4]
+    df_dwt["compressor_idx"] = np.arange(len(clean_arr_dwt[:, 2]))
+    df_dwt["filter_idx"] = np.arange(len(clean_arr_dwt[:, 3]))
+    df_dwt["serializer_idx"] = np.arange(len(clean_arr_dwt[:, 4]))
 
     fig_dwt = px.scatter(df_dwt, x="Ratio", y="DWT", color=y_kmeans,
-                         title="DWT VS Ratio KMeans Clustering", hover_data=["compressor", "filter", "serializer"])
+                         title="DWT VS Ratio KMeans Clustering", hover_data=["compressor", "filter", "serializer", "compressor_idx", "filter_idx", "serializer_idx"])
 
     fig.add_trace(
         go.Scatter(
@@ -147,6 +165,8 @@ def create_cluster_plots(clean_arr_l1, clean_arr_l2, clean_arr_linf, clean_arr_d
         row=2,
         col=2
     )
+    fig.update_xaxes(title_text="Ratio", row=2, col=2)
+    fig.update_yaxes(title_text="DWT", row=2, col=2)
     for trace in fig_dwt.data:
         fig.add_trace(trace, row=2, col=2)
 
@@ -235,8 +255,7 @@ if uploaded_file is not None and uploaded_file.name.endswith(".nc"):
             for line in proc.stdout:
                 progress_text.text(f"{line}")
 
-        file_name = cmd_compress[3] if "santis" in where_am_i.stdout.strip() else cmd_compress[5]
-        scored_results = load_scored_results(os.path.basename(file_name))
+        scored_results = load_scored_results(os.path.basename(path_to_modified_file))
 
         scored_results_pd = pd.DataFrame(scored_results)
 
