@@ -1,3 +1,15 @@
+
+import importlib.util
+import subprocess
+import sys
+
+# PyQt6 might encounter issues when installed from pyproject.toml
+if importlib.util.find_spec("PyQt6") is None:
+    print(f"{"PyQt6"} not found. Installing...")
+    subprocess.check_call([
+        sys.executable, "-m", "pip", "install", "PyQt6", "--only-binary", ":all:"
+    ])
+
 import sys
 import os
 import subprocess
@@ -193,8 +205,8 @@ class CompressorThread(QThread):
                     percent = int(100 * current_max / total) if total else 0
                     self.progress.emit(percent, current_max)
             proc.wait()
-        scored_results = np.load(os.path.basename(self.cmd[5] + "_scored_results_with_names.npy", allow_pickle=True))
 
+        scored_results = load_scored_results(os.path.basename(self.cmd[5]))
         scored_results_pd = pd.DataFrame(scored_results)
 
         numeric_cols = scored_results_pd.select_dtypes(include=[np.number]).columns
@@ -316,7 +328,7 @@ class CompressionAnalysisUI(QMainWindow):
             "data_compression_cscs_exclaim",
             "summarize_compression",
             self.modified_file_path,
-            selected_var
+            "--field-to-compress="+selected_var
         ]
 
         self.thread = CompressorThread(cmd)
