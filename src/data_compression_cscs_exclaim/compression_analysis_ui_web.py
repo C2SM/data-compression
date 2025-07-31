@@ -5,12 +5,9 @@
 #
 # Please, refer to the LICENSE file in the root directory.
 # SPDX-License-Identifier: BSD-3-Clause
-import glob
 import os
-import re
 import subprocess
 import tempfile
-import time
 
 import streamlit as st
 import pandas as pd
@@ -205,15 +202,25 @@ if uploaded_file is not None and uploaded_file.name.endswith(".nc"):
         st.session_state.temp_plot_file = None
 
     if st.button("Analyze compressors"):
-        cmd_compress = [
-            "mpirun",
-            "-n",
-            "8",
-            "data_compression_cscs_exclaim",
-            "summarize_compression",
-            path_to_modified_file,
-            "--field-to-compress="+field_to_compress
-        ]
+        where_am_i = subprocess.run(["uname", "-a"], capture_output=True, text=True)
+        if "santis" in where_am_i.stdout.strip():
+            cmd_compress = [
+                "srun",
+                "data_compression_cscs_exclaim",
+                "summarize_compression",
+                path_to_modified_file,
+                "--field-to-compress=" + field_to_compress
+            ]
+        else:
+            cmd_compress = [
+                "mpirun",
+                "-n",
+                "8",
+                "data_compression_cscs_exclaim",
+                "summarize_compression",
+                path_to_modified_file,
+                "--field-to-compress="+field_to_compress
+            ]
 
         st.info("Analyzing compressors...")
         progress_text = st.empty()
