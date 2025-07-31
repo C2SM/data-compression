@@ -203,14 +203,16 @@ def compressor_space(da):
     return list(zip(range(len(compressor_space)), compressor_space))
 
 
-def filter_space(da):
+def filter_space(da, with_numcodecs_wasm=False):
     # https://numcodecs.readthedocs.io/en/stable/zarr3.html#filters-array-to-array-codecs
     # https://numcodecs-wasm.readthedocs.io/en/latest/
     
     # TODO: take care of integer data types
     filter_space = []
     
-    _FILTERS = [numcodecs.zarr3.Delta, numcodecs.zarr3.BitRound, numcodecs.zarr3.Quantize, Asinh, FixedOffsetScale, Log, UniformNoise]
+    _FILTERS = [numcodecs.zarr3.Delta, numcodecs.zarr3.BitRound, numcodecs.zarr3.Quantize]
+    if with_numcodecs_wasm:
+        _FILTERS += [Asinh, FixedOffsetScale, Log, UniformNoise]
     if da.dtype.kind == 'i':
         _FILTERS = [numcodecs.zarr3.Delta]
     base_scale = 10 ** np.floor(np.log10(np.abs(da).max().compute().item()))
@@ -243,14 +245,18 @@ def filter_space(da):
     return list(zip(range(len(filter_space)), filter_space))
 
 
-def serializer_space(da):
+def serializer_space(da, with_ebcc=False, with_numcodecs_wasm=False):
     # https://numcodecs.readthedocs.io/en/stable/zarr3.html#serializers-array-to-bytes-codecs
     # https://numcodecs-wasm.readthedocs.io/en/latest/
     
     # TODO: take care of integer data types
     serializer_space = []
     
-    _SERIALIZERS = [numcodecs.zarr3.PCodec, numcodecs.zarr3.ZFPY, EBCCZarrFilter, Sperr, Sz3]
+    _SERIALIZERS = [numcodecs.zarr3.PCodec, numcodecs.zarr3.ZFPY]
+    if with_ebcc:
+        _SERIALIZERS += [EBCCZarrFilter]
+    if with_numcodecs_wasm:
+        _SERIALIZERS += [Sperr, Sz3]
     if da.dtype.kind == 'i':
         _SERIALIZERS = [numcodecs.zarr3.PCodec, numcodecs.zarr3.ZFPY, EBCCZarrFilter, Sz3]
     for serializer in _SERIALIZERS:
