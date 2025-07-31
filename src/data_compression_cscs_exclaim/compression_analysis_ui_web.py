@@ -226,7 +226,7 @@ if uploaded_file is not None and uploaded_file.name.endswith(".nc"):
             bufsize=1
         ) as proc:
             for line in proc.stdout:
-                progress_text.text(f"{line}%")
+                progress_text.text(f"{line}")
 
         scored_results = load_scored_results(os.path.basename(path_to_modified_file))
 

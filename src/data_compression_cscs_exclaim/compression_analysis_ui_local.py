@@ -177,14 +177,13 @@ def load_and_resize_netcdf(ds, file_path, max_size_bytes=1e7):
     return ds
 
 class CompressorThread(QThread):
-    progress = pyqtSignal(int, int)
+    progress = pyqtSignal(str)
     log = pyqtSignal(str)
     finished = pyqtSignal()
 
     def __init__(self, cmd):
         super().__init__()
         self.cmd = cmd
-        self.total_steps = 37635
 
     def run(self):
         current_max = 0
@@ -196,13 +195,7 @@ class CompressorThread(QThread):
             bufsize=1
         ) as proc:
             for line in proc.stdout:
-                m = re.search(r"Rank \d+:\s+.*?(\d+)/(\d+)", line)
-                if m:
-                    current = int(m.group(1))
-                    total = int(m.group(2))
-                    current_max = max(current_max, current)
-                    percent = int(100 * current_max / total) if total else 0
-                    self.progress.emit(percent, current_max)
+                self.progress.emit(line)
             proc.wait()
 
         scored_results = load_scored_results(os.path.basename(self.cmd[5]))
@@ -341,9 +334,8 @@ class CompressionAnalysisUI(QMainWindow):
         self.progress_bar.setValue(0)
         self.log.append("Initializing compressors anaylsis...")
 
-    def update_progress(self, pct, current):
-        self.progress_bar.setValue(pct)
-        self.log.append(f"Progress: {str(current)}/{str(37635)} ({pct}%)")
+    def update_progress(self, pct):
+        self.log.append(f"{pct}")
 
     def analysis_finished(self):
         self.log.append("Analysis finished.")
