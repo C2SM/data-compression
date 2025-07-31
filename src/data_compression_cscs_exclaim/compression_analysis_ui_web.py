@@ -10,6 +10,8 @@ import os
 import re
 import subprocess
 import tempfile
+import time
+
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -214,12 +216,8 @@ if uploaded_file is not None and uploaded_file.name.endswith(".nc"):
         ]
 
         st.info("Analyzing compressors...")
-        progress_bar = st.progress(0)
         progress_text = st.empty()
-        progress_text_1 = st.empty()
 
-        total_steps = 37635
-        current_max = 0
         with subprocess.Popen(
             cmd_compress,
             stdout=subprocess.PIPE,
@@ -228,15 +226,7 @@ if uploaded_file is not None and uploaded_file.name.endswith(".nc"):
             bufsize=1
         ) as proc:
             for line in proc.stdout:
-                m = re.search(r"Rank \d+:\s+.*?(\d+)/(\d+)", line)
-                if m:
-                    current = int(m.group(1))
-                    total = int(m.group(2))
-                    current_max = max(current_max, current)
-                    percent = int(100 * current_max / total) if total else 0
-                    progress_bar.progress(percent)
-                    progress_text.text(f"{percent}%")
-                    progress_text_1.text(f"{current_max}/{total_steps}")
+                progress_text.text(f"{line}%")
 
         scored_results = load_scored_results(os.path.basename(path_to_modified_file))
 
