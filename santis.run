@@ -1,6 +1,6 @@
 #!/bin/bash
 
-#SBATCH --account=csstaff
+#SBATCH --account=...
 #SBATCH --uenv=prgenv-gnu/25.06:rc5
 #SBATCH --view=default
 #SBATCH --partition=debug
