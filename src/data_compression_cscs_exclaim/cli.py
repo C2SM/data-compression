@@ -252,7 +252,9 @@ def open_zarr_file_and_inspect(zarr_file: str):
 @click.argument("netcdf_file", type=click.Path(exists=True, dir_okay=False))
 @click.option("--field-to-compress", default=None, help="Field to compress [if not given, all fields will be compressed].")
 @click.option("--field-percentage", default=None, callback=utils.validate_percentage, help="Compress a percentage of the field [1-99%]. If not given, the whole field will be compressed.")
-def summarize_compression(netcdf_file: str, field_to_compress: str | None = None, field_percentage: str | None = None):
+@click.option("--with-ebcc", default=False, is_flag=True, help="Use EBCC filter for compression.")
+@click.option("--with-numcodecs-wasm", default=False, is_flag=True, help="Use numcodecs-wasm for compression.")
+def summarize_compression(netcdf_file: str, field_to_compress: str | None = None, field_percentage: str | None = None, with_ebcc: bool = False, with_numcodecs_wasm: bool = False):
     ## https://numcodecs.readthedocs.io/en/stable/zarr3.html#zarr-3-codecs
     ## https://numcodecs-wasm.readthedocs.io/en/latest/
 
@@ -304,8 +306,8 @@ def summarize_compression(netcdf_file: str, field_to_compress: str | None = None
             da = da.isel(**slices)
 
         compressors = utils.compressor_space(da)
-        filters = utils.filter_space(da)
-        serializers = utils.serializer_space(da)
+        filters = utils.filter_space(da, with_numcodecs_wasm=with_numcodecs_wasm)
+        serializers = utils.serializer_space(da, with_ebcc=with_ebcc, with_numcodecs_wasm=with_numcodecs_wasm)
 
         num_compressors = len(compressors)
         num_filters = len(filters)
@@ -321,11 +323,8 @@ def summarize_compression(netcdf_file: str, field_to_compress: str | None = None
         results = []
         raw_values_explicit = []
         raw_values_explicit_with_names = []
-        for (comp_idx, compressor), (filt_idx, filter), (ser_idx, serializer) in tqdm(
-            configs_for_rank,
-            desc=f"Rank {rank}",
-            position=rank,
-        ):
+        total_configs = len(configs_for_rank)
+        for i, ((comp_idx, compressor), (filt_idx, filter), (ser_idx, serializer)) in enumerate(configs_for_rank):
             data_to_compress = da
             if isinstance(serializer, AnyNumcodecsArrayBytesCodec):
                 if isinstance(serializer.codec, (Pco, Sperr, Sz3, Zfp)):
@@ -364,6 +363,8 @@ def summarize_compression(netcdf_file: str, field_to_compress: str | None = None
                     click.echo(f"Failed to compress with {compressor}, {filter}, {serializer}.")
                     traceback.print_exc(file=sys.stderr)
                 sys.exit(1)
+
+            utils.progress_bar(rank, i, total_configs, print_every=100)
 
         results_gather = comm.gather(results, root=0)
         raw_values_explicit_gather = comm.gather(raw_values_explicit, root=0)
