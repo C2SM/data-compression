@@ -51,6 +51,10 @@ Outside of the mutual UI functionalities, this UI allows users to download simil
 streamlit run ./src/data_compression_cscs_exclaim/compression_analysis_ui_web.py [OPTIONAL] --server.maxUploadSize=FILE_SIZE_MB --server.maxMessageSize=FILE_SIZE_MB
 
 ```
+if lanuched from santis, make sure to ssh correctly:
+```
+ssh -L 8501:localhost:8501 santis
+```
 
 A local version is also available:
 ````
