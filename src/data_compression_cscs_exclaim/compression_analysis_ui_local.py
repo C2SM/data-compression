@@ -341,6 +341,13 @@ class CompressionAnalysisUI(QMainWindow):
         if "santis" in where_am_i.stdout.strip():
             cmd = [
                 "srun",
+                "-A", "d75",
+                "-t", "00:15:00",
+                "-N", "1",
+                "-n", "128",
+                "--uenv=prgenv-gnu/25.06:rc5",
+                "--view=default",
+                "--partition=debug",
                 "data_compression_cscs_exclaim",
                 "summarize_compression",
                 self.modified_file_path,

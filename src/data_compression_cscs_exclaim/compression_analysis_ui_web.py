@@ -226,6 +226,13 @@ if uploaded_file is not None and uploaded_file.name.endswith(".nc"):
         if "santis" in where_am_i.stdout.strip():
             cmd_compress = [
                 "srun",
+                "-A", "d75",
+                "-t", "00:15:00",
+                "-N", "1",
+                "-n", "128",
+                "--uenv=prgenv-gnu/25.06:rc5",
+                "--view=default",
+                "--partition=debug",
                 "data_compression_cscs_exclaim",
                 "summarize_compression",
                 path_to_modified_file,
