@@ -251,8 +251,8 @@ def open_zarr_file_and_inspect(zarr_file: str):
 @cli.command("summarize_compression")
 @click.argument("netcdf_file", type=click.Path(exists=True, dir_okay=False))
 @click.option("--field-to-compress", default=None, help="Field to compress [if not given, all fields will be compressed].")
-@click.option("--field-percentage", default=None, callback=utils.validate_percentage, help="Compress a percentage of the field [1-99%]. If not given, the whole field will be compressed.")
-def summarize_compression(netcdf_file: str, field_to_compress: str | None = None, field_percentage: str | None = None):
+@click.option("--field-percentage-to-compress", default=None, callback=utils.validate_percentage, help="Compress a percentage of the field [1-99%]. If not given, the whole field will be compressed.")
+def summarize_compression(netcdf_file: str, field_to_compress: str | None = None, field_percentage_to_compress: str | None = None):
     ## https://numcodecs.readthedocs.io/en/stable/zarr3.html#zarr-3-codecs
     ## https://numcodecs-wasm.readthedocs.io/en/latest/
 
@@ -298,9 +298,9 @@ def summarize_compression(netcdf_file: str, field_to_compress: str | None = None
         existing_l1_error = threshold_row.iloc[0]["Existing L1 error"] if not threshold_row.empty and matching_units else None
         existing_l1_error = float(existing_l1_error.replace(",", ".")) if existing_l1_error else None
 
-        if field_percentage is not None:
-            field_percentage = float(field_percentage)
-            slices = {dim: slice(0, max(1, int(size * (field_percentage / 100)))) for dim, size in da.sizes.items()}
+        if field_percentage_to_compress is not None:
+            field_percentage_to_compress = float(field_percentage_to_compress)
+            slices = {dim: slice(0, max(1, int(size * (field_percentage_to_compress / 100)))) for dim, size in da.sizes.items()}
             da = da.isel(**slices)
 
         compressors = utils.compressor_space(da)
