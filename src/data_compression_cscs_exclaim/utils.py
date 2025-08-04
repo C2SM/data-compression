@@ -53,6 +53,10 @@ from numcodecs_wasm_sz3 import Sz3
 from numcodecs_wasm_zfp import Zfp
 
 
+_WITH_NUMCODECS_WASM = True
+_WITH_EBCC = True
+
+
 class ChunkSpecWrapper:
     def __init__(self, original_spec):
         self._original = original_spec
@@ -271,7 +275,7 @@ def compressor_space(da):
     return list(zip(range(len(compressor_space)), compressor_space))
 
 
-def filter_space(da, with_numcodecs_wasm=False):
+def filter_space(da):
     # https://numcodecs.readthedocs.io/en/stable/zarr3.html#filters-array-to-array-codecs
     # https://numcodecs-wasm.readthedocs.io/en/latest/
     
@@ -279,7 +283,7 @@ def filter_space(da, with_numcodecs_wasm=False):
     filter_space = []
     
     _FILTERS = [numcodecs.zarr3.Delta, numcodecs.zarr3.BitRound, numcodecs.zarr3.Quantize]
-    if with_numcodecs_wasm:
+    if _WITH_NUMCODECS_WASM:
         _FILTERS += [Asinh, FixedOffsetScale, Log, UniformNoise]
     if da.dtype.kind == 'i':
         _FILTERS = [numcodecs.zarr3.Delta]
@@ -313,7 +317,7 @@ def filter_space(da, with_numcodecs_wasm=False):
     return list(zip(range(len(filter_space)), filter_space))
 
 
-def serializer_space(da, with_ebcc=False, with_numcodecs_wasm=False):
+def serializer_space(da):
     # https://numcodecs.readthedocs.io/en/stable/zarr3.html#serializers-array-to-bytes-codecs
     # https://numcodecs-wasm.readthedocs.io/en/latest/
     
@@ -321,9 +325,9 @@ def serializer_space(da, with_ebcc=False, with_numcodecs_wasm=False):
     serializer_space = []
     
     _SERIALIZERS = [numcodecs.zarr3.PCodec, numcodecs.zarr3.ZFPY]
-    if with_ebcc:
+    if _WITH_EBCC:
         _SERIALIZERS += [EBCCZarrFilter]
-    if with_numcodecs_wasm:
+    if _WITH_NUMCODECS_WASM:
         _SERIALIZERS += [Sperr, Sz3]
     if da.dtype.kind == 'i':
         _SERIALIZERS = [numcodecs.zarr3.PCodec, numcodecs.zarr3.ZFPY, EBCCZarrFilter, Sz3]
