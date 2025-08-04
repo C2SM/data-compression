@@ -167,13 +167,15 @@ def ebcc(netcdf_file: str, field_to_compress: str):
 @click.argument("comp_idx", type=int)
 @click.argument("filt_idx", type=int)
 @click.argument("ser_idx", type=int)
-def compress_with_optimal(netcdf_file, field_to_compress, comp_idx, filt_idx, ser_idx):
+@click.option("--with-ebcc", default=False, is_flag=True, help="Use EBCC filter for compression.")
+@click.option("--with-numcodecs-wasm", default=False, is_flag=True, help="Use numcodecs-wasm for compression.")
+def compress_with_optimal(netcdf_file, field_to_compress, comp_idx, filt_idx, ser_idx, with_ebcc: bool = False, with_numcodecs_wasm: bool = False):
     ds = utils.open_netcdf(netcdf_file, field_to_compress)
     da = ds[field_to_compress]
 
     compressors = utils.compressor_space(da)
-    filters = utils.filter_space(da)
-    serializers = utils.serializer_space(da)
+    filters = utils.filter_space(da, with_numcodecs_wasm=with_numcodecs_wasm)
+    serializers = utils.serializer_space(da, with_ebcc=with_ebcc, with_numcodecs_wasm=with_numcodecs_wasm)
 
     optimal_compressor = compressors[comp_idx][1]
     optimal_filter = filters[filt_idx][1]
@@ -360,7 +362,7 @@ def summarize_compression(netcdf_file: str, field_to_compress: str | None = None
 
             except:
                 if rank == 0:
-                    click.echo(f"Failed to compress with {compressor}, {filter}, {serializer}.")
+                    click.echo(f"Failed to compress with {compressor}, {filter}, {serializer} [Indices: {comp_idx}, {filt_idx}, {ser_idx}]")
                     traceback.print_exc(file=sys.stderr)
                 sys.exit(1)
 
