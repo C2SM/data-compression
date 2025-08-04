@@ -18,7 +18,7 @@ dependencies = [
     "PyWavelets",
     "dask[complete]",
     "h5py",
-    "zarr", 
+    "zarr >=3.0.10",
     "numcodecs",
     "zarr-any-numcodecs",
     "json5",

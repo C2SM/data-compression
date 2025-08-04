@@ -11,8 +11,11 @@ import os
 import shutil
 import math
 import traceback
+import asyncio
 from collections import OrderedDict
 from collections.abc import Sequence
+import functools
+import inspect
 import zipfile
 import click
 import humanize
@@ -48,6 +51,71 @@ from numcodecs_wasm_pco import Pco
 from numcodecs_wasm_sperr import Sperr
 from numcodecs_wasm_sz3 import Sz3
 from numcodecs_wasm_zfp import Zfp
+
+
+class ChunkSpecWrapper:
+    def __init__(self, original_spec):
+        self._original = original_spec
+        self._fixed_dtype = self.to_numpy_dtype(original_spec.dtype)
+
+    def __getattr__(self, name):
+        if name == "dtype":
+            return self._fixed_dtype
+        return getattr(self._original, name)
+
+    def __setattr__(self, name, value):
+        if name in {"_original", "_fixed_dtype"}:
+            super().__setattr__(name, value)
+        else:
+            setattr(self._original, name, value)
+
+    @staticmethod
+    def to_numpy_dtype(dtype) -> np.dtype:
+        if isinstance(dtype, np.dtype):
+            return dtype
+        try:
+            return np.dtype(str(dtype._zarr_v3_name))
+        except Exception as e:
+            raise TypeError(f"Cannot convert {dtype} to NumPy dtype") from e
+
+def fix_chunk_spec_dtype(method):
+    sig = inspect.signature(method)
+    is_async = asyncio.iscoroutinefunction(method)
+
+    def fix(self, *args, **kwargs):
+        bound = sig.bind(self, *args, **kwargs)
+        bound.apply_defaults()
+        if "chunk_spec" in bound.arguments:
+            bound.arguments["chunk_spec"] = ChunkSpecWrapper(bound.arguments["chunk_spec"])
+        return bound
+
+    @functools.wraps(method)
+    async def async_wrapper(self, *args, **kwargs):
+        bound = fix(self, *args, **kwargs)
+        return await method(*bound.args, **bound.kwargs)
+
+    @functools.wraps(method)
+    def sync_wrapper(self, *args, **kwargs):
+        bound = fix(self, *args, **kwargs)
+        return method(*bound.args, **bound.kwargs)
+
+    return async_wrapper if is_async else sync_wrapper
+
+
+def patch_methods(cls, method_map):
+    for name, wrapper in method_map.items():
+        setattr(cls, name, wrapper(getattr(cls, name)))
+
+patch_methods(AnyNumcodecsArrayBytesCodec, {
+    "_encode_single": fix_chunk_spec_dtype,
+    "_decode_single": fix_chunk_spec_dtype
+})
+
+patch_methods(AnyNumcodecsArrayArrayCodec, {
+    "resolve_metadata": fix_chunk_spec_dtype,
+    "_encode_single": fix_chunk_spec_dtype,
+    "_decode_single": fix_chunk_spec_dtype
+})
 
 
 def open_netcdf(netcdf_file: str, field_to_compress: str | None = None, rank: int = 0):
