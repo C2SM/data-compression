@@ -286,7 +286,7 @@ def summarize_compression(netcdf_file: str, field_to_compress: str | None = None
         thresholds = pd.read_parquet(buffer)
 
     # This is opened by all MPI processes
-    ds = utils.open_netcdf(netcdf_file, field_to_compress, rank=rank)
+    ds = utils.open_netcdf(netcdf_file, field_to_compress, field_percentage_to_compress, rank=rank)
 
     for var in ds.data_vars:
         if field_to_compress is not None and field_to_compress != var:

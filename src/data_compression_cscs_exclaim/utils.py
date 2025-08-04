@@ -20,6 +20,7 @@ import zipfile
 import click
 import humanize
 import numpy as np
+import dask
 import pandas as pd
 import xarray as xr
 import yaml
@@ -122,7 +123,7 @@ patch_methods(AnyNumcodecsArrayArrayCodec, {
 })
 
 
-def open_netcdf(netcdf_file: str, field_to_compress: str | None = None, rank: int = 0):
+def open_netcdf(netcdf_file: str, field_to_compress: str | None = None, field_percentage_to_compress: float | None = None, rank: int = 0):
     ds = xr.open_dataset(netcdf_file, chunks="auto")
 
     if field_to_compress is not None and field_to_compress not in ds.data_vars:
@@ -135,7 +136,8 @@ def open_netcdf(netcdf_file: str, field_to_compress: str | None = None, rank: in
     if rank == 0:
         click.echo(f"netcdf_file.nbytes = {humanize.naturalsize(ds.nbytes, binary=True)}")
         if field_to_compress is not None:
-            click.echo(f"field_to_compress.nbytes = {humanize.naturalsize(ds[field_to_compress].nbytes, binary=True)}")
+            nbytes = ds[field_to_compress].nbytes * (field_percentage_to_compress / 100) if field_percentage_to_compress else ds[field_to_compress].nbytes
+            click.echo(f"field_to_compress.nbytes = {humanize.naturalsize(nbytes, binary=True)}")
 
     return ds
 
@@ -146,6 +148,8 @@ def open_zarr_zipstore(zarr_zipstore_file: str):
 
 
 def compress_with_zarr(data, netcdf_file, field_to_compress, filters, compressors, serializer='auto', verbose=True, rank=0):
+    assert isinstance(data.data, dask.array.Array)
+    
     store = zarr.storage.ZipStore(f"{netcdf_file}.=.field_{field_to_compress}.=.rank_{rank}.zarr.zip", mode='w')
     z = zarr.create_array(
         store=store,
@@ -208,17 +212,37 @@ def get_filter_parameters(parameters_file: str, filter_name: str):
 def compute_relative_errors(da_compressed, da):
     da_error = da_compressed - da
 
-    norm_L1_error = np.abs(da_error).sum().values
-    norm_L2_error = np.sqrt((da_error**2).sum().values)
-    norm_Linf_error = np.abs(da_error).max().values
+    # These are still lazy Dask computations
+    norm_L1_error = np.abs(da_error).sum()
+    norm_L2_error = np.sqrt((da_error**2).sum())
+    norm_Linf_error = np.abs(da_error).max()
 
-    norm_L1_original = np.abs(da).sum().values
-    norm_L2_original = np.sqrt((da**2).sum().values)
-    norm_Linf_original = np.abs(da).max().values
+    norm_L1_original = np.abs(da).sum()
+    norm_L2_original = np.sqrt((da**2).sum())
+    norm_Linf_original = np.abs(da).max()
 
-    relative_error_L1 = norm_L1_error / norm_L1_original
-    relative_error_L2 = norm_L2_error / norm_L2_original
-    relative_error_Linf = norm_Linf_error / norm_Linf_original
+    # Group all into one call to compute for efficiency
+    computed = dask.compute(
+        norm_L1_error,
+        norm_L1_original,
+        norm_L2_error,
+        norm_L2_original,
+        norm_Linf_error,
+        norm_Linf_original,
+    )
+
+    (
+        norm_L1_error_val,
+        norm_L1_original_val,
+        norm_L2_error_val,
+        norm_L2_original_val,
+        norm_Linf_error_val,
+        norm_Linf_original_val,
+    ) = computed
+
+    relative_error_L1 = norm_L1_error_val / norm_L1_original_val
+    relative_error_L2 = norm_L2_error_val / norm_L2_original_val
+    relative_error_Linf = norm_Linf_error_val / norm_Linf_original_val
 
     errors = {
         "Relative_Error_L1": relative_error_L1,
