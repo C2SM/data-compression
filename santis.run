@@ -12,4 +12,13 @@
 
 source venv/bin/activate
 
-srun data_compression_cscs_exclaim summarize_compression netCDF_files/tigge_pl_t_q_dx=2_2024_08_02.nc --field-to-compress t 2>&1 | grep -v "wasmtime"
+# ("1", "true", "yes") -> any other value is treated as "false"
+export WITH_NUMCODECS_WASM=yes
+export WITH_EBCC=no
+
+srun data_compression_cscs_exclaim \
+     summarize_compression \
+     netCDF_files/tigge_pl_t_q_dx=2_2024_08_02.nc \
+     --field-to-compress t \
+     --field-percentage-to-compress 99 \
+     2>&1 | grep -v "wasmtime"

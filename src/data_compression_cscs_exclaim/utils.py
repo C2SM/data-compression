@@ -33,6 +33,9 @@ import zfpy
 from ebcc.filter_wrapper import EBCC_Filter
 from ebcc.zarr_filter import EBCCZarrFilter
 from mpi4py import MPI
+import time
+from collections import defaultdict
+import atexit
 
 # numcodecs-wasm filters
 from numcodecs_wasm_asinh import Asinh
@@ -54,73 +57,8 @@ from numcodecs_wasm_sz3 import Sz3
 from numcodecs_wasm_zfp import Zfp
 
 
-_WITH_NUMCODECS_WASM = True
-_WITH_EBCC = True
-
-
-class ChunkSpecWrapper:
-    def __init__(self, original_spec):
-        self._original = original_spec
-        self._fixed_dtype = self.to_numpy_dtype(original_spec.dtype)
-
-    def __getattr__(self, name):
-        if name == "dtype":
-            return self._fixed_dtype
-        return getattr(self._original, name)
-
-    def __setattr__(self, name, value):
-        if name in {"_original", "_fixed_dtype"}:
-            super().__setattr__(name, value)
-        else:
-            setattr(self._original, name, value)
-
-    @staticmethod
-    def to_numpy_dtype(dtype) -> np.dtype:
-        if isinstance(dtype, np.dtype):
-            return dtype
-        try:
-            return np.dtype(str(dtype._zarr_v3_name))
-        except Exception as e:
-            raise TypeError(f"Cannot convert {dtype} to NumPy dtype") from e
-
-def fix_chunk_spec_dtype(method):
-    sig = inspect.signature(method)
-    is_async = asyncio.iscoroutinefunction(method)
-
-    def fix(self, *args, **kwargs):
-        bound = sig.bind(self, *args, **kwargs)
-        bound.apply_defaults()
-        if "chunk_spec" in bound.arguments:
-            bound.arguments["chunk_spec"] = ChunkSpecWrapper(bound.arguments["chunk_spec"])
-        return bound
-
-    @functools.wraps(method)
-    async def async_wrapper(self, *args, **kwargs):
-        bound = fix(self, *args, **kwargs)
-        return await method(*bound.args, **bound.kwargs)
-
-    @functools.wraps(method)
-    def sync_wrapper(self, *args, **kwargs):
-        bound = fix(self, *args, **kwargs)
-        return method(*bound.args, **bound.kwargs)
-
-    return async_wrapper if is_async else sync_wrapper
-
-
-def patch_methods(cls, method_map):
-    for name, wrapper in method_map.items():
-        setattr(cls, name, wrapper(getattr(cls, name)))
-
-patch_methods(AnyNumcodecsArrayBytesCodec, {
-    "_encode_single": fix_chunk_spec_dtype,
-    "_decode_single": fix_chunk_spec_dtype
-})
-
-patch_methods(AnyNumcodecsArrayArrayCodec, {
-    "resolve_metadata": fix_chunk_spec_dtype,
-    "_encode_single": fix_chunk_spec_dtype,
-    "_decode_single": fix_chunk_spec_dtype
-})
+_WITH_NUMCODECS_WASM = os.getenv("WITH_NUMCODECS_WASM", "true").lower() in ("1", "true", "yes")
+_WITH_EBCC = os.getenv("WITH_EBCC", "true").lower() in ("1", "true", "yes")
 
 
 def open_netcdf(netcdf_file: str, field_to_compress: str | None = None, field_percentage_to_compress: float | None = None, rank: int = 0):
@@ -150,16 +88,17 @@ def open_zarr_zipstore(zarr_zipstore_file: str):
 def compress_with_zarr(data, netcdf_file, field_to_compress, filters, compressors, serializer='auto', verbose=True, rank=0):
     assert isinstance(data.data, dask.array.Array)
     
-    store = zarr.storage.ZipStore(f"{netcdf_file}.=.field_{field_to_compress}.=.rank_{rank}.zarr.zip", mode='w')
-    z = zarr.create_array(
-        store=store,
-        name=field_to_compress,
-        data=data,
-        chunks="auto",
-        filters=filters,
-        compressors=compressors,
-        serializer=serializer,
-        )
+    with Timer("zarr.create_array"):
+        store = zarr.storage.ZipStore(f"{netcdf_file}.=.field_{field_to_compress}.=.rank_{rank}.zarr.zip", mode='w')
+        z = zarr.create_array(
+            store=store,
+            name=field_to_compress,
+            data=data,
+            chunks="auto",
+            filters=filters,
+            compressors=compressors,
+            serializer=serializer,
+            )
 
     info_array = z.info_complete()
     compression_ratio = info_array._count_bytes / info_array._count_bytes_stored
@@ -167,13 +106,15 @@ def compress_with_zarr(data, netcdf_file, field_to_compress, filters, compressor
         click.echo(80* "-")
         click.echo(info_array)
 
-    pprint_, errors = compute_relative_errors(z[:], data)
+    with Timer("compute_relative_errors"):
+        pprint_, errors = compute_relative_errors(z[:], data)
     if verbose and rank == 0:
         click.echo(80* "-")
         click.echo(pprint_)
         click.echo(80* "-")
 
-    dwt_dist = calc_dwt_dist(z[:], data)
+    with Timer("calc_dwt_dist"):
+        dwt_dist = calc_dwt_dist(z[:], data)
     if verbose and rank == 0:
         click.echo(f"DWT Distance: {dwt_dist}")
         click.echo(80* "-")
@@ -538,3 +479,49 @@ def progress_bar(rank, i, total_configs, print_every=100, bar_width=40):
     bar = "*" * filled + "-" * (bar_width - filled)
     if int(i + 1) % print_every == 0 or (i + 1) == total_configs:
         click.echo(f"[Rank {rank}] Progress: |{bar}| {percent*100:6.2f}% ({i+1}/{total_configs})")
+
+
+# Global registry of all timings
+_TIMINGS = defaultdict(list)
+
+class Timer:
+    def __init__(self, label):
+        self.label = label
+
+    def __enter__(self):
+        self.start = time.perf_counter()
+        return self
+
+    def __exit__(self, *args):
+        duration = time.perf_counter() - self.start
+        _TIMINGS[self.label].append(duration)
+
+@atexit.register
+def print_profile_summary():
+    if not _TIMINGS:
+        return
+
+    comm = MPI.COMM_WORLD
+    rank = comm.Get_rank()
+    
+    if rank != 0:
+        return # Only the root process prints the summary
+
+    print("\n=== compress_with_zarr Timing Summary ===")
+
+    # Determine max label width for formatting
+    label_width = max(len(label) for label in _TIMINGS.keys())
+
+    header = (
+        f"{'Label':<{label_width}} | {'Calls':>5} | {'Avg (s)':>10} | {'Total (s)':>10}"
+    )
+    print(header)
+    print("-" * len(header))
+
+    for label, durations in sorted(_TIMINGS.items()):
+        total = sum(durations)
+        count = len(durations)
+        avg = total / count
+        print(f"{label:<{label_width}} | {count:>5} | {avg:>10.6f} | {total:>10.6f}")
+
+    print("=" * len(header))
