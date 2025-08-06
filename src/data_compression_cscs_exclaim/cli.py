@@ -250,9 +250,10 @@ def open_zarr_file_and_inspect(zarr_file: str):
 
 @cli.command("summarize_compression")
 @click.argument("netcdf_file", type=click.Path(exists=True, dir_okay=False))
+@click.argument("where_to_write", type=click.Path(exists=True, dir_okay=False))
 @click.option("--field-to-compress", default=None, help="Field to compress [if not given, all fields will be compressed].")
 @click.option("--field-percentage-to-compress", default=None, callback=utils.validate_percentage, help="Compress a percentage of the field [1-99%]. If not given, the whole field will be compressed.")
-def summarize_compression(netcdf_file: str, field_to_compress: str | None = None, field_percentage_to_compress: str | None = None):
+def summarize_compression(netcdf_file: str, where_to_write: str, field_to_compress: str | None = None, field_percentage_to_compress: str | None = None):
     ## https://numcodecs.readthedocs.io/en/stable/zarr3.html#zarr-3-codecs
     ## https://numcodecs-wasm.readthedocs.io/en/latest/
 
@@ -293,10 +294,18 @@ def summarize_compression(netcdf_file: str, field_to_compress: str | None = None
             continue
         da = ds[var]
 
-        threshold_row = thresholds[thresholds["Short Name"] == var]
+        # TODO: fix this hack
+        lookup = var
+        if var == "temp":
+            lookup = "t"
+
+        threshold_row = thresholds[thresholds["Short Name"] == lookup]
         matching_units = threshold_row.iloc[0]["Unit"] == da.attrs.get("units", None) if not threshold_row.empty else None
         existing_l1_error = threshold_row.iloc[0]["Existing L1 error"] if not threshold_row.empty and matching_units else None
         existing_l1_error = float(existing_l1_error.replace(",", ".")) if existing_l1_error else None
+
+        if rank == 0:
+            click.echo(f"Processing variable: {var} (Units: {da.attrs.get('units', 'N/A')}, Existing L1 Error: {existing_l1_error})")
 
         if field_percentage_to_compress is not None:
             field_percentage_to_compress = float(field_percentage_to_compress)
@@ -335,6 +344,7 @@ def summarize_compression(netcdf_file: str, field_to_compress: str | None = None
                     data_to_compress,
                     netcdf_file,
                     var,
+                    where_to_write,
                     filters=None if isinstance(serializer, AnyNumcodecsArrayBytesCodec) else [filter,],  # TODO: fix (?) filter stacking with EBCC & numcodecs-wasm serializers
                     compressors=[compressor,],
                     serializer=serializer,

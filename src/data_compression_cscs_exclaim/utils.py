@@ -85,11 +85,13 @@ def open_zarr_zipstore(zarr_zipstore_file: str):
     return zarr.open_group(store, mode='r')
 
 
-def compress_with_zarr(data, netcdf_file, field_to_compress, filters, compressors, serializer='auto', verbose=True, rank=0):
+def compress_with_zarr(data, netcdf_file, field_to_compress, where_to_write, filters, compressors, serializer='auto', verbose=True, rank=0):
     assert isinstance(data.data, dask.array.Array)
     
     with Timer("zarr.create_array"):
-        store = zarr.storage.ZipStore(f"{netcdf_file}.=.field_{field_to_compress}.=.rank_{rank}.zarr.zip", mode='w')
+        basename = os.path.basename(netcdf_file)
+        zarr_file = os.path.join(where_to_write, basename)
+        store = zarr.storage.ZipStore(f"{zarr_file}.=.field_{field_to_compress}.=.rank_{rank}.zarr.zip", mode='w')
         z = zarr.create_array(
             store=store,
             name=field_to_compress,
@@ -289,7 +291,7 @@ def serializer_space(da):
     # TODO: take care of integer data types
     serializer_space = []
     
-    _SERIALIZERS = [numcodecs.zarr3.PCodec, numcodecs.zarr3.ZFPY]
+    _SERIALIZERS = [numcodecs.zarr3.PCodec] # numcodecs.zarr3.ZFPY
     if _WITH_EBCC:
         _SERIALIZERS += [EBCCZarrFilter]
     if _WITH_NUMCODECS_WASM:

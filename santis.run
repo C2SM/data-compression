@@ -3,22 +3,23 @@
 #SBATCH --account=...
 #SBATCH --uenv=prgenv-gnu/25.06:rc5
 #SBATCH --view=default
-#SBATCH --partition=debug
-#SBATCH --ntasks=128
-#SBATCH --nodes=1
-#SBATCH --time=00:15:00
+#SBATCH --partition=normal
+#SBATCH --ntasks-per-node=32
+#SBATCH --nodes=2
+#SBATCH --time=01:00:00
 #SBATCH --output=out-%j.out
 #SBATCH --error=out-%j.out
 
 source venv/bin/activate
 
 # ("1", "true", "yes") -> any other value is treated as "false"
-export WITH_NUMCODECS_WASM=yes
+export WITH_NUMCODECS_WASM=no
 export WITH_EBCC=no
 
 srun data_compression_cscs_exclaim \
      summarize_compression \
-     netCDF_files/tigge_pl_t_q_dx=2_2024_08_02.nc \
-     --field-to-compress t \
-     --field-percentage-to-compress 99 \
+     /capstor/store/cscs/userlab/cwp03/ppothapa/Data_Dyamond_PostProcessed/DYAMOND_R02B10L120_main/out_15/temp_20200410T000000Z.nc \
+     ./netCDF_files \
+     --field-to-compress temp \
+     --field-percentage-to-compress 1 \
      2>&1 | grep -v "wasmtime"
