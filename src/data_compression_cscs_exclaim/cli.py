@@ -250,12 +250,13 @@ def open_zarr_file_and_inspect(zarr_file: str):
 
 @cli.command("summarize_compression")
 @click.argument("netcdf_file", type=click.Path(exists=True, dir_okay=False))
-@click.argument("where_to_write", type=click.Path(exists=True, dir_okay=False))
+@click.argument("where_to_write", type=click.Path(dir_okay=True, file_okay=False, exists=False))
 @click.option("--field-to-compress", default=None, help="Field to compress [if not given, all fields will be compressed].")
 @click.option("--field-percentage-to-compress", default=None, callback=utils.validate_percentage, help="Compress a percentage of the field [1-99%]. If not given, the whole field will be compressed.")
 def summarize_compression(netcdf_file: str, where_to_write: str, field_to_compress: str | None = None, field_percentage_to_compress: str | None = None):
     ## https://numcodecs.readthedocs.io/en/stable/zarr3.html#zarr-3-codecs
     ## https://numcodecs-wasm.readthedocs.io/en/latest/
+    os.makedirs(where_to_write, exist_ok=True)
 
     dask.config.set(scheduler="single-threaded")
     dask.config.set(array__chunk_size="512MiB")
