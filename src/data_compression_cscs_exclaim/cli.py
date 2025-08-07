@@ -236,7 +236,7 @@ def merge_compressed_fields(netcdf_file: str):
 @cli.command("open_zarr_file_and_inspect")
 @click.argument("zarr_file", type=click.Path(exists=True, dir_okay=False))
 def open_zarr_file_and_inspect(zarr_file: str):
-    zarr_group = utils.open_zarr_zipstore(zarr_file)
+    zarr_group, store = utils.open_zarr_zipstore(zarr_file)
 
     click.echo(zarr_group.tree())
 
@@ -246,6 +246,8 @@ def open_zarr_file_and_inspect(zarr_file: str):
         click.echo(zarr_group[array_name].info_complete())
         click.echo(zarr_group[array_name][:])
         click.echo(80* "-")
+
+    store.close()
 
 
 @cli.command("summarize_compression")

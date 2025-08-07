@@ -82,17 +82,19 @@ def open_netcdf(netcdf_file: str, field_to_compress: str | None = None, field_pe
 
 def open_zarr_zipstore(zarr_zipstore_file: str):
     store = zarr.storage.ZipStore(zarr_zipstore_file, read_only=True)
-    return zarr.open_group(store, mode='r')
+    return zarr.open_group(store, mode='r'), store
 
 
 def compress_with_zarr(data, netcdf_file, field_to_compress, where_to_write, filters, compressors, serializer='auto', verbose=True, rank=0):
     assert isinstance(data.data, dask.array.Array)
     
+    basename = os.path.basename(netcdf_file)
+    zarr_file = os.path.join(where_to_write, basename)
+    zarr_file = f"{zarr_file}.=.field_{field_to_compress}.=.rank_{rank}.zarr.zip"
+
     with Timer("zarr.create_array"):
-        basename = os.path.basename(netcdf_file)
-        zarr_file = os.path.join(where_to_write, basename)
-        store = zarr.storage.ZipStore(f"{zarr_file}.=.field_{field_to_compress}.=.rank_{rank}.zarr.zip", mode='w')
-        z = zarr.create_array(
+        store = zarr.storage.ZipStore(zarr_file, mode='w')
+        zarr.create_array(
             store=store,
             name=field_to_compress,
             data=data,
@@ -101,6 +103,11 @@ def compress_with_zarr(data, netcdf_file, field_to_compress, where_to_write, fil
             compressors=compressors,
             serializer=serializer,
             )
+        store.close()
+
+    group, store = open_zarr_zipstore(zarr_file)
+    z = group[field_to_compress]
+    z_dask = dask.array.from_zarr(z)
 
     info_array = z.info_complete()
     compression_ratio = info_array._count_bytes / info_array._count_bytes_stored
@@ -109,13 +116,14 @@ def compress_with_zarr(data, netcdf_file, field_to_compress, where_to_write, fil
         click.echo(info_array)
 
     with Timer("compute_relative_errors"):
-        pprint_, errors = compute_relative_errors(z[:], data)
+        pprint_, errors = compute_relative_errors(z_dask, data)
     if verbose and rank == 0:
         click.echo(80* "-")
         click.echo(pprint_)
         click.echo(80* "-")
 
     with Timer("calc_dwt_dist"):
+        # TODO: make it Dask compatible
         dwt_dist = calc_dwt_dist(z[:], data)
     if verbose and rank == 0:
         click.echo(f"DWT Distance: {dwt_dist}")
