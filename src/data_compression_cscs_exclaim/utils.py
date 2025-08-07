@@ -116,7 +116,7 @@ def compress_with_zarr(data, netcdf_file, field_to_compress, where_to_write, fil
         click.echo(info_array)
 
     with Timer("compute_relative_errors"):
-        pprint_, errors = compute_relative_errors(z_dask, data)
+        pprint_, errors = compute_relative_errors(z_dask, data.data)
     if verbose and rank == 0:
         click.echo(80* "-")
         click.echo(pprint_)
