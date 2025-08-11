@@ -115,16 +115,16 @@ def compress_with_zarr(data, netcdf_file, field_to_compress, where_to_write, fil
         click.echo(80* "-")
         click.echo(info_array)
 
-    with Timer("compute_relative_errors"):
-        pprint_, errors = compute_relative_errors(z_dask, data.data)
+    with Timer("compute_errors_distances"):
+        pprint_, errors, euclidean_distance, normalized_euclidean_distance = compute_errors_distances(z_dask, data.data)
     if verbose and rank == 0:
         click.echo(80* "-")
         click.echo(pprint_)
         click.echo(80* "-")
 
     with Timer("calc_dwt_dist"):
-        # TODO: make it Dask compatible
-        dwt_dist = calc_dwt_dist(z[:], data)
+        # TODO: make it Dask compatible, otherwise use the euclidean which we already compute
+        dwt_dist = euclidean_distance #calc_dwt_dist(z[:], data)
     if verbose and rank == 0:
         click.echo(f"DWT Distance: {dwt_dist}")
         click.echo(80* "-")
@@ -160,7 +160,7 @@ def get_filter_parameters(parameters_file: str, filter_name: str):
         traceback.print_exc(file=sys.stderr)
 
 
-def compute_relative_errors(da_compressed, da):
+def compute_errors_distances(da_compressed, da):
     da_error = da_compressed - da
 
     # These are still lazy Dask computations
@@ -195,6 +195,9 @@ def compute_relative_errors(da_compressed, da):
     relative_error_L2 = norm_L2_error_val / norm_L2_original_val
     relative_error_Linf = norm_Linf_error_val / norm_Linf_original_val
 
+    euclidean_distance = norm_L2_error_val
+    normalized_euclidean_distance = relative_error_L2
+
     errors = {
         "Relative_Error_L1": relative_error_L1,
         "Relative_Error_L2": relative_error_L2,
@@ -202,7 +205,7 @@ def compute_relative_errors(da_compressed, da):
     }
 
     errors_ = {k: f"{v:.3e}" for k, v in errors.items()}
-    return "\n".join(f"{k:20s}: {v}" for k, v in errors_.items()), errors
+    return "\n".join(f"{k:20s}: {v}" for k, v in errors_.items()), errors, euclidean_distance, normalized_euclidean_distance
 
 
 def calc_dwt_dist(input_1, input_2, n_levels=4, wavelet="haar"):

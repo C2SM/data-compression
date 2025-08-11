@@ -23,3 +23,11 @@ srun data_compression_cscs_exclaim \
      --field-to-compress temp \
      --field-percentage-to-compress 1 \
      2>&1 | grep -v "wasmtime"
+
+# srun data_compression_cscs_exclaim \
+#      compress_with_optimal \
+#      /capstor/store/cscs/userlab/cwp03/ppothapa/Data_Dyamond_PostProcessed/DYAMOND_R02B10L120_main/out_15/temp_20200410T000000Z.nc \
+#      ./netCDF_files \
+#      temp \
+#      60 2 1 \
+#      2>&1 | grep -v "wasmtime"

@@ -163,11 +163,14 @@ def ebcc(netcdf_file: str, field_to_compress: str):
 
 @cli.command("compress_with_optimal")
 @click.argument("netcdf_file", type=click.Path(exists=True, dir_okay=False))
+@click.argument("where_to_write", type=click.Path(dir_okay=True, file_okay=False, exists=False))
 @click.argument("field_to_compress")
 @click.argument("comp_idx", type=int)
 @click.argument("filt_idx", type=int)
 @click.argument("ser_idx", type=int)
-def compress_with_optimal(netcdf_file, field_to_compress, comp_idx, filt_idx, ser_idx):
+def compress_with_optimal(netcdf_file, where_to_write, field_to_compress, comp_idx, filt_idx, ser_idx):
+    os.makedirs(where_to_write, exist_ok=True)
+
     ds = utils.open_netcdf(netcdf_file, field_to_compress)
     da = ds[field_to_compress]
 
@@ -189,12 +192,13 @@ def compress_with_optimal(netcdf_file, field_to_compress, comp_idx, filt_idx, se
         da,
         netcdf_file,
         field_to_compress,
+        where_to_write,
         filters=None if isinstance(optimal_serializer, AnyNumcodecsArrayBytesCodec) else [optimal_filter,],  # TODO: fix (?) filter stacking with EBCC & numcodecs-wasm serializers
         compressors=[optimal_compressor,],
         serializer=optimal_serializer,
         verbose=False,
     )
-    
+
     click.echo(f" | {(optimal_compressor, optimal_filter, optimal_serializer)} | --> Ratio: {compression_ratio:.3f} | Error: {errors['Relative_Error_L1']:.3e} | DWT: {dwt_dist:.3e}")
 
 
