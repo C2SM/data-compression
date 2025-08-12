@@ -381,6 +381,8 @@ def summarize_compression(netcdf_file: str, where_to_write: str, field_to_compre
 
             utils.progress_bar(rank, i, total_configs, print_every=100)
 
+        click.echo("Compressors analysis completed. Writing files...")
+
         results_gather = comm.gather(results, root=0)
         raw_values_explicit_gather = comm.gather(raw_values_explicit, root=0)
         raw_values_explicit_with_names_gather = comm.gather(raw_values_explicit_with_names, root=0)

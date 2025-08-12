@@ -236,6 +236,7 @@ if uploaded_file is not None and uploaded_file.name.endswith(".nc"):
                 "data_compression_cscs_exclaim",
                 "summarize_compression",
                 path_to_modified_file,
+                os.getcwd(),
                 "--field-to-compress=" + field_to_compress
             ]
         else:
@@ -246,6 +247,7 @@ if uploaded_file is not None and uploaded_file.name.endswith(".nc"):
                 "data_compression_cscs_exclaim",
                 "summarize_compression",
                 path_to_modified_file,
+                os.getcwd(),
                 "--field-to-compress="+field_to_compress
             ]
 
@@ -312,14 +314,15 @@ if uploaded_file is not None and uploaded_file.name.endswith(".nc"):
     ser_idx = st.number_input('ser_idx', min_value=0, max_value=193, value=10)
 
     if st.button("Compress file"):
+        temp_dir = os.path.dirname(path_to_modified_file)
         cmd_compress = [
             "data_compression_cscs_exclaim",
             "compress_with_optimal",
             path_to_modified_file,
+            temp_dir,
             field_to_compress,
             str(comp_idx), str(filt_idx), str(ser_idx)
         ]
-        temp_dir = os.path.dirname(path_to_modified_file)
         before = set(os.listdir(temp_dir))
         st.info("Compressing file...")
         result = subprocess.run(cmd_compress, capture_output=True, text=True, check=True)

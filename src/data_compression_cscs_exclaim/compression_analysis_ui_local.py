@@ -351,6 +351,7 @@ class CompressionAnalysisUI(QMainWindow):
                 "data_compression_cscs_exclaim",
                 "summarize_compression",
                 self.modified_file_path,
+                os.getcwd(),
                 "--field-to-compress=" + selected_var
             ]
         else:
@@ -361,6 +362,7 @@ class CompressionAnalysisUI(QMainWindow):
                 "data_compression_cscs_exclaim",
                 "summarize_compression",
                 self.modified_file_path,
+                os.getcwd(),
                 "--field-to-compress="+selected_var
             ]
 
@@ -391,17 +393,18 @@ class CompressionAnalysisUI(QMainWindow):
         comp_idx = self.comp_idx_spin.value()
         filt_idx = self.filt_idx_spin.value()
         ser_idx = self.ser_idx_spin.value()
+        temp_dir = os.path.dirname(self.modified_file_path)
 
         cmd = [
             "data_compression_cscs_exclaim",
             "compress_with_optimal",
             self.modified_file_path,
+            temp_dir,
             selected_var,
             str(comp_idx), str(filt_idx), str(ser_idx)
         ]
 
         self.log.append(f"Running compression with parameters: comp_idx={comp_idx}, filt_idx={filt_idx}, ser_idx={ser_idx}")
-        temp_dir = os.path.dirname(self.modified_file_path)
         before = set(os.listdir(temp_dir))
         try:
             subprocess.run(cmd, capture_output=True, text=True, check=True)
