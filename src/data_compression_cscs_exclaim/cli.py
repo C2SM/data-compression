@@ -586,6 +586,12 @@ def analyze_clustering(npy_file: str):
     fig.show()
 
 
+@cli.command("check_errors_at_dateline")
+@click.argument("message")
+def check_errors_at_dateline(message: str):
+    print(message)
+
+
 @cli.command("help")
 @click.pass_context
 def help(ctx):
