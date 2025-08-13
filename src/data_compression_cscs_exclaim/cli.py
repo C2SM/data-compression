@@ -15,7 +15,6 @@ import click
 from tqdm import tqdm
 from pathlib import Path
 import math
-from time import perf_counter
 import zarr
 import shutil
 import itertools
@@ -592,12 +591,10 @@ def analyze_clustering(npy_file: str):
 @click.argument("field_to_compress")
 def check_errors_at_dateline(netcdf_file: str, field_to_compress: str):
 
-    output_filepath_zarr         = 'compressed_data.zarr.zip'
-    shifted_output_filepath_zarr = 'shifted_compressed_data_zarr.zarr.zip'
+    output_filepath         = 'compressed_data.zarr.zip'
+    shifted_output_filepath = 'shifted_compressed_data.zarr.zip'
 
     dataset = utils.open_netcdf(netcdf_file, field_to_compress)
-
-    original_size = 0
 
     data = dataset[field_to_compress]
 
@@ -614,14 +611,13 @@ def check_errors_at_dateline(netcdf_file: str, field_to_compress: str):
     shifted_np_data[:, :(np_data_shape[1]-half_idx)] = np_data[:, half_idx:]
     shifted_np_data[:, (np_data_shape[1]-half_idx):] = np_data[:, :half_idx]
 
-    original_size += np_data.nbytes
-
     print("Shape of {}: {}".format(field_to_compress, np_data_shape))
 
     ##################
     # CREATE FILTERS #
     ##################
 
+    # TODO: Make this general so that any filter+compressor+serializer combination can be used
     ebcc_filter = EBCC_Filter(
         base_cr=100,                                     # base compression ratio
         height=np_data_shape[0] / 4,                     # height of each 2D data chunk
@@ -643,9 +639,9 @@ def check_errors_at_dateline(netcdf_file: str, field_to_compress: str):
     ############
 
     # Normal compression
-    start_time_compression = perf_counter()
-    store = zarr.storage.ZipStore(output_filepath_zarr, mode='w')
-    np_data_compressed_zarr = zarr.create_array(
+    # store = zarr.storage.ZipStore(output_filepath, mode='w')
+    store = zarr.storage.MemoryStore()
+    np_data_compressed = zarr.create_array(
         store=store,
         name=field_to_compress,
         data=np_data[:],
@@ -654,11 +650,11 @@ def check_errors_at_dateline(netcdf_file: str, field_to_compress: str):
         compressors=None,
         serializer=zarr_serializer,
     )
-    end_time_compression = perf_counter()
 
     # Shifted compression
-    shifted_store = zarr.storage.ZipStore(shifted_output_filepath_zarr, mode='w')
-    shifted_np_data_compressed_zarr = zarr.create_array(
+    # shifted_store = zarr.storage.ZipStore(shifted_output_filepath, mode='w')
+    shifted_store = zarr.storage.MemoryStore()
+    shifted_np_data_compressed = zarr.create_array(
         store=shifted_store,
         name=field_to_compress,
         data=shifted_np_data[:],
@@ -668,84 +664,60 @@ def check_errors_at_dateline(netcdf_file: str, field_to_compress: str):
         serializer=zarr_serializer,
     )
 
-    print("Zarr compression time of {}: {}".format(field_to_compress, end_time_compression - start_time_compression))
-
     ##############
     # DECOMPRESS #
     ##############
 
     # Normal
-    start_time_decompression = perf_counter()
-    np_data_decompressed_zarr = np_data_compressed_zarr[:]
-    end_time_decompression = perf_counter()
+    np_data_decompressed = np_data_compressed[:]
 
     # Shifted
-    tmp_zarr = shifted_np_data_compressed_zarr[:]
+    tmp = shifted_np_data_compressed[:]
 
-    shifted_np_data_decompressed_zarr = np.empty(np_data_shape, dtype=np_data.dtype)
+    shifted_np_data_decompressed = np.empty(np_data_shape, dtype=np_data.dtype)
 
-    shifted_np_data_decompressed_zarr[:, half_idx:] = tmp_zarr[:, :(np_data_shape[1]-half_idx)]
-    shifted_np_data_decompressed_zarr[:, :half_idx] = tmp_zarr[:, (np_data_shape[1]-half_idx):]
+    shifted_np_data_decompressed[:, half_idx:] = tmp[:, :(np_data_shape[1]-half_idx)]
+    shifted_np_data_decompressed[:, :half_idx] = tmp[:, (np_data_shape[1]-half_idx):]
 
+    store.close()
     shifted_store.close()
-
-    print("Zarr decompression time of {}: {}".format(field_to_compress, end_time_decompression - start_time_decompression))
-
-    ##########
-    # ERRORS #
-    ##########
-
-    # Check if error target is correctly enforced
-    data_range = (np.max(np_data) - np.min(np_data))
-    max_error = np.max(np.abs(np_data - np_data_decompressed_zarr))
-    if data_range > 0:
-        rel_error = max_error / data_range
-        print('Achieved max relative error:', rel_error)
-    else:
-        print('Achieved max absolute error:', max_error)
-
-    print()
 
     #########
     # PLOTS #
     #########
 
-    fig2, ((ax1, ax2), (ax3, ax4), (ax5, ax6)) = plt.subplots(3, 2, layout='constrained')
+    fig, axes = plt.subplots(3, 2, layout='constrained')
+    ax1, ax2, ax3, ax4, ax5, ax6 = axes.flatten()
 
-    tmp = ax1.imshow(np_data_decompressed_zarr, interpolation='none')
+    tmp = ax1.imshow(np_data_decompressed, interpolation='none')
     ax1.set_title("Normal decompressed", fontsize=10)
-    fig2.colorbar(tmp, ax=ax1, shrink=0.7)
+    fig.colorbar(tmp, ax=ax1, shrink=0.7)
 
-    tmp = ax2.imshow(shifted_np_data_decompressed_zarr, interpolation='none')
+    tmp = ax2.imshow(shifted_np_data_decompressed, interpolation='none')
     ax2.set_title("Shifted decompressed", fontsize=10)
-    fig2.colorbar(tmp, ax=ax2, shrink=0.7)
+    fig.colorbar(tmp, ax=ax2, shrink=0.7)
 
-    relative_error = np.abs(np_data_decompressed_zarr - shifted_np_data_decompressed_zarr) / (np.abs(np_data_decompressed_zarr) + 1e-20)
+    relative_error = np.abs(np_data_decompressed - shifted_np_data_decompressed) / (np.abs(np_data_decompressed) + 1e-20)
     tmp = ax3.imshow(relative_error, interpolation='none', cmap='binary')
     ax3.set_title("Relative error (normal-shifted)/normal", fontsize=10)
-    fig2.colorbar(tmp, ax=ax3, shrink=0.7)
+    fig.colorbar(tmp, ax=ax3, shrink=0.7)
 
     tmp = ax4.imshow(np_data, interpolation='none')
     ax4.set_title("Original", fontsize=10)
-    fig2.colorbar(tmp, ax=ax4, shrink=0.7)
+    fig.colorbar(tmp, ax=ax4, shrink=0.7)
 
-    relative_error = np.abs(np_data - np_data_decompressed_zarr) / (np.abs(np_data) + 1e-20)
+    relative_error = np.abs(np_data - np_data_decompressed) / (np.abs(np_data) + 1e-20)
     tmp = ax5.imshow(relative_error, interpolation='none', cmap='binary')
     ax5.set_title("Relative error (original-normal)/original", fontsize=10)
-    fig2.colorbar(tmp, ax=ax5, shrink=0.7)
+    fig.colorbar(tmp, ax=ax5, shrink=0.7)
 
-    relative_error = np.abs(np_data - shifted_np_data_decompressed_zarr) / (np.abs(np_data) + 1e-20)
+    relative_error = np.abs(np_data - shifted_np_data_decompressed) / (np.abs(np_data) + 1e-20)
     tmp = ax6.imshow(relative_error, interpolation='none', cmap='binary')
     ax6.set_title("Relative error (original-shifted)/original", fontsize=10)
-    fig2.colorbar(tmp, ax=ax6, shrink=0.7)
+    fig.colorbar(tmp, ax=ax6, shrink=0.7)
 
-    fig2.savefig(f'{field_to_compress}_compression_errors_zarr.pdf', bbox_inches='tight')
-    plt.close(fig2)
-
-    # original_size = os.path.getsize(input_filepath)
-    compressed_size = os.path.getsize(output_filepath_zarr)
-
-    print(f'achieved compression ratio of {original_size/compressed_size}')
+    fig.savefig(f'{field_to_compress}_compression_errors.pdf', bbox_inches='tight')
+    plt.close(fig)
 
 
 @cli.command("help")
