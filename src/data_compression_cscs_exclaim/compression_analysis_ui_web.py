@@ -25,6 +25,12 @@ st.title("Upload a file and evaluate compressors")
 
 uploaded_file = st.file_uploader("Choose a netcdf file")
 
+def find_file(base_path, file_name):
+    for root, dirs, files in os.walk(base_path):
+        if file_name in files:
+            return os.path.join(root, file_name)
+    return None
+
 @st.cache_data
 def load_scored_results(uploaded_file_name: str):
     return np.load(uploaded_file_name + "_scored_results_with_names.npy", allow_pickle=True)
@@ -224,6 +230,7 @@ if uploaded_file is not None and uploaded_file.name.endswith(".nc"):
     if st.button("Analyze compressors"):
         where_am_i = subprocess.run(["uname", "-a"], capture_output=True, text=True)
         if "santis" in where_am_i.stdout.strip():
+            file_path = find_file(os.getcwd(), display_file_name)
             cmd_compress = [
                 "srun",
                 "-A", "d75",
@@ -235,7 +242,7 @@ if uploaded_file is not None and uploaded_file.name.endswith(".nc"):
                 "--partition=debug",
                 "data_compression_cscs_exclaim",
                 "summarize_compression",
-                path_to_modified_file,
+                file_path,
                 os.getcwd(),
                 "--field-to-compress=" + field_to_compress
             ]
@@ -263,7 +270,8 @@ if uploaded_file is not None and uploaded_file.name.endswith(".nc"):
         ) as proc:
             for line in proc.stdout:
                 progress_text.text(f"{line}")
-
+        
+        path_to_modified_file = display_file_name if "santis" in where_am_i.stdout.strip() else path_to_modified_file
         scored_results = load_scored_results(os.path.basename(path_to_modified_file))
 
         scored_results_pd = pd.DataFrame(scored_results)
