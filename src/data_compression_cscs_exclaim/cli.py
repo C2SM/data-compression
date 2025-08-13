@@ -26,6 +26,7 @@ from numcodecs_wasm_bit_round import BitRound
 from numcodecs_wasm_linear_quantize import LinearQuantize
 from numcodecs_wasm_zlib import Zlib
 from zarr_any_numcodecs import AnyNumcodecsArrayArrayCodec, AnyNumcodecsArrayBytesCodec, AnyNumcodecsBytesBytesCodec
+from ebcc.filter_wrapper import EBCC_Filter
 from ebcc.zarr_filter import EBCCZarrFilter
 import pandas as pd
 import numpy as np
@@ -139,8 +140,6 @@ def sz3_eb_compressors(netcdf_file: str, field_to_compress: str, parameters_file
 @click.argument("netcdf_file", type=click.Path(exists=True, dir_okay=False))
 @click.argument("field_to_compress")
 def ebcc(netcdf_file: str, field_to_compress: str):
-    from ebcc.filter_wrapper import EBCC_Filter
-    from ebcc.zarr_filter import EBCCZarrFilter
     
     ds = utils.open_netcdf(netcdf_file, field_to_compress)
     da = ds[field_to_compress].squeeze().astype("float32")
