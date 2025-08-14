@@ -586,13 +586,10 @@ def analyze_clustering(npy_file: str):
     fig.show()
 
 
-@cli.command("check_errors_at_dateline")
+@cli.command("plot_compression_errors")
 @click.argument("netcdf_file", type=click.Path(exists=True, dir_okay=False))
 @click.argument("field_to_compress")
-def check_errors_at_dateline(netcdf_file: str, field_to_compress: str):
-
-    output_filepath         = 'compressed_data.zarr.zip'
-    shifted_output_filepath = 'shifted_compressed_data.zarr.zip'
+def plot_compression_errors(netcdf_file: str, field_to_compress: str):
 
     dataset = utils.open_netcdf(netcdf_file, field_to_compress)
 
@@ -602,6 +599,8 @@ def check_errors_at_dateline(netcdf_file: str, field_to_compress: str):
     # PROCESS DATA #
     ################
 
+    units = data.attrs["units"]
+
     np_data = np.flip(data[1,:].squeeze().to_numpy(), axis=0) # Flipping latitude dimension because it goes from South to North
     np_data_shape = np_data.shape
 
@@ -610,6 +609,11 @@ def check_errors_at_dateline(netcdf_file: str, field_to_compress: str):
     half_idx = math.floor(0.5 * np_data_shape[1])
     shifted_np_data[:, :(np_data_shape[1]-half_idx)] = np_data[:, half_idx:]
     shifted_np_data[:, (np_data_shape[1]-half_idx):] = np_data[:, :half_idx]
+
+    shifted_np_data_backshifted = np.empty(np_data_shape, dtype=np_data.dtype)
+
+    shifted_np_data_backshifted[:, half_idx:] = shifted_np_data[:, :(np_data_shape[1]-half_idx)]
+    shifted_np_data_backshifted[:, :half_idx] = shifted_np_data[:, (np_data_shape[1]-half_idx):]
 
     print("Shape of {}: {}".format(field_to_compress, np_data_shape))
 
@@ -639,7 +643,6 @@ def check_errors_at_dateline(netcdf_file: str, field_to_compress: str):
     ############
 
     # Normal compression
-    # store = zarr.storage.ZipStore(output_filepath, mode='w')
     store = zarr.storage.MemoryStore()
     np_data_compressed = zarr.create_array(
         store=store,
@@ -652,7 +655,6 @@ def check_errors_at_dateline(netcdf_file: str, field_to_compress: str):
     )
 
     # Shifted compression
-    # shifted_store = zarr.storage.ZipStore(shifted_output_filepath, mode='w')
     shifted_store = zarr.storage.MemoryStore()
     shifted_np_data_compressed = zarr.create_array(
         store=shifted_store,
@@ -672,12 +674,12 @@ def check_errors_at_dateline(netcdf_file: str, field_to_compress: str):
     np_data_decompressed = np_data_compressed[:]
 
     # Shifted
-    tmp = shifted_np_data_compressed[:]
+    shifted_np_data_decompressed = shifted_np_data_compressed[:]
 
-    shifted_np_data_decompressed = np.empty(np_data_shape, dtype=np_data.dtype)
+    shifted_np_data_decompressed_backshifted = np.empty(np_data_shape, dtype=np_data.dtype)
 
-    shifted_np_data_decompressed[:, half_idx:] = tmp[:, :(np_data_shape[1]-half_idx)]
-    shifted_np_data_decompressed[:, :half_idx] = tmp[:, (np_data_shape[1]-half_idx):]
+    shifted_np_data_decompressed_backshifted[:, half_idx:] = shifted_np_data_decompressed[:, :(np_data_shape[1]-half_idx)]
+    shifted_np_data_decompressed_backshifted[:, :half_idx] = shifted_np_data_decompressed[:, (np_data_shape[1]-half_idx):]
 
     store.close()
     shifted_store.close()
@@ -686,35 +688,51 @@ def check_errors_at_dateline(netcdf_file: str, field_to_compress: str):
     # PLOTS #
     #########
 
-    fig, axes = plt.subplots(3, 2, layout='constrained')
-    ax1, ax2, ax3, ax4, ax5, ax6 = axes.flatten()
+    fig, axes = plt.subplots(3, 3, layout='constrained', figsize=(16, 9))
+    ax1, ax2, ax3, ax4, ax5, ax6, ax7, ax8, ax9 = axes.flatten()
 
-    tmp = ax1.imshow(np_data_decompressed, interpolation='none')
-    ax1.set_title("Normal decompressed", fontsize=10)
+    fig.suptitle(f"Compression errors for variable {field_to_compress} ({units})", fontsize=16)
+
+    ax1.set_title("Original", fontsize=10)
+    tmp = ax1.imshow(np_data, interpolation='none')
     fig.colorbar(tmp, ax=ax1, shrink=0.7)
 
-    tmp = ax2.imshow(shifted_np_data_decompressed, interpolation='none')
-    ax2.set_title("Shifted decompressed", fontsize=10)
+    ax2.set_title("Original compressed&decompressed", fontsize=10)
+    tmp = ax2.imshow(np_data_decompressed, interpolation='none')
     fig.colorbar(tmp, ax=ax2, shrink=0.7)
 
-    relative_error = np.abs(np_data_decompressed - shifted_np_data_decompressed) / (np.abs(np_data_decompressed) + 1e-20)
-    tmp = ax3.imshow(relative_error, interpolation='none', cmap='binary')
-    ax3.set_title("Relative error (normal-shifted)/normal", fontsize=10)
+    ax3.set_title("Absolute error [original - original c&d]", fontsize=10)
+    absolute_error = np.abs(np_data - np_data_decompressed)
+    tmp = ax3.imshow(absolute_error, interpolation='none', cmap='binary')
     fig.colorbar(tmp, ax=ax3, shrink=0.7)
 
-    tmp = ax4.imshow(np_data, interpolation='none')
-    ax4.set_title("Original", fontsize=10)
+    ax4.set_title("Shifted (by +180 deg)", fontsize=10)
+    tmp = ax4.imshow(shifted_np_data, interpolation='none')
     fig.colorbar(tmp, ax=ax4, shrink=0.7)
 
-    relative_error = np.abs(np_data - np_data_decompressed) / (np.abs(np_data) + 1e-20)
-    tmp = ax5.imshow(relative_error, interpolation='none', cmap='binary')
-    ax5.set_title("Relative error (original-normal)/original", fontsize=10)
+    ax5.set_title("Shifted compressed&decompressed", fontsize=10)
+    tmp = ax5.imshow(shifted_np_data_decompressed, interpolation='none')
     fig.colorbar(tmp, ax=ax5, shrink=0.7)
 
-    relative_error = np.abs(np_data - shifted_np_data_decompressed) / (np.abs(np_data) + 1e-20)
-    tmp = ax6.imshow(relative_error, interpolation='none', cmap='binary')
-    ax6.set_title("Relative error (original-shifted)/original", fontsize=10)
+    ax6.set_title("Absolute error [shifted - shifted c&d]", fontsize=10)
+    absolute_error = np.abs(shifted_np_data - shifted_np_data_decompressed)
+    tmp = ax6.imshow(absolute_error, interpolation='none', cmap='binary')
     fig.colorbar(tmp, ax=ax6, shrink=0.7)
+
+    ax7.set_title("Absolute error [original - (shifted-180)]", fontsize=10)
+    absolute_error = np.abs(np_data - shifted_np_data_backshifted) / (np.abs(np_data) + 1e-20)
+    tmp = ax7.imshow(absolute_error, interpolation='none', cmap='binary')
+    fig.colorbar(tmp, ax=ax7, shrink=0.7)
+
+    ax8.set_title("Absolute error [original c&d - (shifted c&d-180)]", fontsize=10)
+    absolute_error = np.abs(np_data_decompressed - shifted_np_data_decompressed_backshifted)
+    tmp = ax8.imshow(absolute_error, interpolation='none', cmap='binary')
+    fig.colorbar(tmp, ax=ax8, shrink=0.7)
+
+    ax9.set_title("Absolute error [original - (shifted c&d-180)]", fontsize=10)
+    absolute_error = np.abs(np_data - shifted_np_data_decompressed_backshifted)
+    tmp = ax9.imshow(absolute_error, interpolation='none', cmap='binary')
+    fig.colorbar(tmp, ax=ax9, shrink=0.7)
 
     fig.savefig(f'{field_to_compress}_compression_errors.pdf', bbox_inches='tight')
     plt.close(fig)
