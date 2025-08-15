@@ -8,6 +8,8 @@
 import os
 import subprocess
 import tempfile
+import argparse
+import shutil
 
 import streamlit as st
 import pandas as pd
@@ -21,9 +23,25 @@ from io import BytesIO
 
 from data_compression_cscs_exclaim import utils
 
+where_am_i = subprocess.run(["uname", "-a"], capture_output=True, text=True)
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--input_file', type=str, default='default.csv')
+    parser.add_argument('--verbose', action='store_true')
+    parser.add_argument('--user_account', type=str, default=None)
+    parser.add_argument('--uploaded_file', type=str, default=None)
+    parser.add_argument('--time', type=str, default=None)
+    parser.add_argument('--nodes', type=str, default=None)
+    parser.add_argument('--ntasks-per-node', type=str, default=None)
+    return parser.parse_args()
+
 st.title("Upload a file and evaluate compressors")
 
-uploaded_file = st.file_uploader("Choose a netcdf file")
+if len(parse_args().uploaded_file) == 0:
+    uploaded_file = st.file_uploader("Choose a netcdf file")
+else:
+    uploaded_file = open(parse_args().uploaded_file, "rb")
 
 def find_file(base_path, file_name):
     for root, dirs, files in os.walk(base_path):
@@ -228,21 +246,19 @@ if uploaded_file is not None and uploaded_file.name.endswith(".nc"):
         st.session_state.temp_plot_file = None
 
     if st.button("Analyze compressors"):
-        where_am_i = subprocess.run(["uname", "-a"], capture_output=True, text=True)
         if "santis" in where_am_i.stdout.strip():
-            file_path = find_file(os.getcwd(), display_file_name)
             cmd_compress = [
                 "srun",
-                "-A", "d75",
-                "-t", "00:15:00",
-                "-N", "1",
-                "-n", "128",
+                "-A", parse_args().user_account,
+                "--time", parse_args().time,
+                "--nodes", parse_args().nodes,
+                "--ntasks-per-node", parse_args().ntasks_per_node,
                 "--uenv=prgenv-gnu/25.06:rc5",
                 "--view=default",
                 "--partition=debug",
                 "data_compression_cscs_exclaim",
                 "summarize_compression",
-                file_path,
+                parse_args().uploaded_file,
                 os.getcwd(),
                 "--field-to-compress=" + field_to_compress
             ]
@@ -322,27 +338,47 @@ if uploaded_file is not None and uploaded_file.name.endswith(".nc"):
     ser_idx = st.number_input('ser_idx', min_value=0, max_value=193, value=10)
 
     if st.button("Compress file"):
+        destination_dir = os.getcwd() + "/netCDF_files/"
         temp_dir = os.path.dirname(path_to_modified_file)
-        cmd_compress = [
-            "data_compression_cscs_exclaim",
-            "compress_with_optimal",
-            path_to_modified_file,
-            temp_dir,
-            field_to_compress,
-            str(comp_idx), str(filt_idx), str(ser_idx)
-        ]
+
+        if "santis" in where_am_i.stdout.strip():
+            cmd_compress = [
+                "data_compression_cscs_exclaim",
+                "compress_with_optimal",
+                path_to_modified_file,
+                temp_dir,
+                field_to_compress,
+                str(comp_idx), str(filt_idx), str(ser_idx)
+            ]
+        else:
+            cmd_compress = [
+                "mpirun",
+                "-n",
+                "8",
+                "data_compression_cscs_exclaim",
+                "compress_with_optimal",
+                path_to_modified_file,
+                temp_dir,
+                field_to_compress,
+                str(comp_idx), str(filt_idx), str(ser_idx)
+            ]
+
         before = set(os.listdir(temp_dir))
-        st.info("Compressing file...")
-        result = subprocess.run(cmd_compress, capture_output=True, text=True, check=True)
-        st.success("Compression completed successfully")
+        status = st.empty()
+        status.info("Compressing file...")
+        subprocess.run(cmd_compress)
+        status.empty()
+        st.success(f"Compression completed successfully. File saved in {destination_dir}")
         after = set(os.listdir(temp_dir))
         output_file_path = os.path.join(temp_dir, list(after - before)[0])
+        dest_path = os.path.join(destination_dir, list(after - before)[0])
+        shutil.copy(output_file_path, dest_path)
 
         split_tmp_name = os.path.basename(output_file_path).split(".=.", 1)
         compressed_file_name = f"{uploaded_file.name}.=.{split_tmp_name[1]}"
         with open(output_file_path, "rb") as data_file:
             st.download_button(
-                label="Download Compressed File",
+                label="Download compressed file locally",
                 data=data_file,
                 file_name=compressed_file_name,
             )

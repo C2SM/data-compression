@@ -43,7 +43,7 @@ import plotly.io as pio
 import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-
+import subprocess
 import warnings
 warnings.filterwarnings(
     "ignore",
@@ -585,6 +585,19 @@ def analyze_clustering(npy_file: str):
     pio.renderers.default = "browser"
     fig.show()
 
+@cli.command("run_web_ui")
+@click.option("--user_account", type=str, default="", help="Santis user account name")
+@click.option("--uploaded_file", type=str, default="", help="Upload file from santis")
+@click.option("--time", type=str, default="", help="Allocated time")
+@click.option("--nodes", type=str, default="", help="Number of nodes")
+@click.option("--ntasks-per-node", type=str, default="", help="Number of tasks per node")
+def run_web_ui(user_account: str = None, uploaded_file: str = "", time: str = "", nodes: str = "", ntasks_per_node: str = ""):
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    cmd_web_ui = [
+        "streamlit", "run", str(current_dir) + "/compression_analysis_ui_web.py", "--", "--user_account", user_account,
+        "--uploaded_file", uploaded_file, "--time", time, "--nodes", nodes, "--ntasks-per-node", ntasks_per_node
+    ]
+    subprocess.run(cmd_web_ui)
 
 @cli.command("help")
 @click.pass_context
