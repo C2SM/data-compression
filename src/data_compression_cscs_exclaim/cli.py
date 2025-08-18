@@ -195,8 +195,14 @@ def summarize_compression(netcdf_file: str, where_to_write: str, field_to_compre
             np.save(os.path.basename(netcdf_file) + '_scored_results_with_names.npy', np.asarray(pd.DataFrame(raw_values_explicit_with_names_gather)))
 
             best_combo = max(results_gather, key=lambda x: x[1])
-            click.echo("Best combo (valid threshold & max CR):")
-            click.echo(f" | {best_combo[0]} | --> Ratio: {best_combo[1]:.3f} | Error: {best_combo[2]:.3e} | Euclidean Distance: {best_combo[3]:.3e}")
+            msg = (
+                "optimal combo: \n"
+                f"compressor : {best_combo[0][0]}\nfilter     : {best_combo[0][1]}\nserializer : {best_combo[0][2]}\n"
+                "corresponding indices in lists of instantiated objects:\n"
+                f"compressor : {best_combo[0][3]}\nfilter     : {best_combo[0][4]}\nserializer : {best_combo[0][5]}\n"
+                f"Compression Ratio: {best_combo[1]:.3f} | Relative L1 Error: {best_combo[2]:.3e} | Euclidean Distance: {best_combo[3]:.3e}"
+            )
+            click.echo(msg)
 
 
 @cli.command("compress_with_optimal")
