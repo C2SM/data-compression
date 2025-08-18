@@ -1,6 +1,12 @@
 # Data Compression Project
 
-TODO
+Set of tools for compressing netCDF files with Zarr.
+
+The tools use the following compression libraries:
+
+- [Numcodecs](https://github.com/zarr-developers/numcodecs): Zarr native library [[documentation](https://numcodecs.readthedocs.io/en/stable/)]
+- [numcodecs-wasm](https://github.com/juntyr/numcodecs-rs): Compression for codecs compiled to WebAssembly [[documentation](https://numcodecs-wasm.readthedocs.io/en/latest/)]
+- [EBCC](https://github.com/spcl/EBCC): Error Bounded Climate Compressor [[documentation](https://github.com/spcl/EBCC/blob/master/README.md)]
 
 ## Installation
 
@@ -26,15 +32,17 @@ bash install_data_compression.sh
 ```
 --------------------------------------------------------------------------------
 
-Usage: data_compression_cscs_exclaim linear_quantization_zlib_compressors
-           [OPTIONS] NETCDF_FILE FIELD_TO_COMPRESS PARAMETERS_FILE
+Usage: data_compression_cscs_exclaim --help # List of available commands
+
+Usage: data_compression_cscs_exclaim COMMAND --help # Documentation per command
 
 Example:
 
-data_compression_cscs_exclaim linear_quantization_zlib_compressors netCDF_files/tigge_pl_t_q_dx=2_2024_08_02.nc t parameters.yaml
-
-Options:
-  --help  Show this message and exit.
+data_compression_cscs_exclaim \ # CLI-tool
+  summarize_compression \ # command
+  netCDF_files/tigge_pl_t_q_dx=2_2024_08_02.nc \ # netCDF file to compress
+  ./dump \ # where to write the compressed file(s)
+  --field-to-compress t # field of netCDF to compress
 
 --------------------------------------------------------------------------------
 ```

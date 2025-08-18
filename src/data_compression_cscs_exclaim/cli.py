@@ -53,99 +53,6 @@ def cli():
     pass
 
 
-@cli.command("compress_with_optimal")
-@click.argument("netcdf_file", type=click.Path(exists=True, dir_okay=False))
-@click.argument("where_to_write", type=click.Path(dir_okay=True, file_okay=False, exists=False))
-@click.argument("field_to_compress")
-@click.argument("comp_idx", type=int)
-@click.argument("filt_idx", type=int)
-@click.argument("ser_idx", type=int)
-def compress_with_optimal(netcdf_file, where_to_write, field_to_compress, comp_idx, filt_idx, ser_idx):
-    os.makedirs(where_to_write, exist_ok=True)
-
-    ds = utils.open_netcdf(netcdf_file, field_to_compress)
-    da = ds[field_to_compress]
-
-    compressors = utils.compressor_space(da)
-    filters = utils.filter_space(da)
-    serializers = utils.serializer_space(da)
-
-    optimal_compressor = compressors[comp_idx][1]
-    optimal_filter = filters[filt_idx][1]
-    optimal_serializer = serializers[ser_idx][1]
-
-    if isinstance(optimal_serializer, AnyNumcodecsArrayBytesCodec) or isinstance(optimal_serializer, numcodecs.zarr3.ZFPY):
-        if isinstance(optimal_serializer, numcodecs.zarr3.ZFPY) or isinstance(optimal_serializer.codec, (Sperr, Sz3)):
-            da = da.stack(flat_dim=da.dims)
-        elif isinstance(optimal_serializer.codec, EBCCZarrFilter):
-            da = da.squeeze().astype("float32")
-
-    compression_ratio, errors, euclidean_distance = utils.compress_with_zarr(
-        da,
-        netcdf_file,
-        field_to_compress,
-        where_to_write,
-        filters=None if isinstance(optimal_serializer, AnyNumcodecsArrayBytesCodec) else [optimal_filter,],  # TODO: fix (?) filter stacking with EBCC & numcodecs-wasm serializers
-        compressors=[optimal_compressor,],
-        serializer=optimal_serializer,
-        verbose=False,
-    )
-
-    click.echo(f" | {(optimal_compressor, optimal_filter, optimal_serializer)} | --> Ratio: {compression_ratio:.3f} | Error: {errors['Relative_Error_L1']:.3e} | Euclidean Distance: {euclidean_distance:.3e}")
-
-
-@cli.command("merge_compressed_fields")
-@click.argument("netcdf_file", type=click.Path(exists=True, dir_okay=False))
-def merge_compressed_fields(netcdf_file: str):
-    comm = MPI.COMM_WORLD
-    rank = comm.Get_rank()
-    size = comm.Get_size()
-    if size > 1:
-        if rank == 0:
-            click.echo("This command is not meant to be run in parallel. Please run it with a single process.")
-        sys.exit(1)
-
-    # populate this folder with the compressed fields
-    merged_folder = f"{netcdf_file}.zarr"
-    if Path(merged_folder).exists():
-        shutil.rmtree(merged_folder)
-    os.makedirs(merged_folder)
-
-    for var in utils.open_netcdf(netcdf_file).data_vars:
-        compressed_field = f"{netcdf_file}.=.field_{var}.=.rank_{rank}.zarr.zip"
-        if not Path(compressed_field).exists():
-            click.echo("All fields must be compressed first.")
-            sys.exit(1)
-        extract_to = utils.unzip_file(compressed_field)
-        utils.copy_folder_contents(extract_to, merged_folder)
-        shutil.rmtree(extract_to)
-
-    zipped_merged_folder = merged_folder + ".zip"
-    if Path(zipped_merged_folder).exists():
-        os.remove(zipped_merged_folder)
-    shutil.make_archive(merged_folder, 'zip', merged_folder)
-
-    if Path(merged_folder).exists():
-        shutil.rmtree(merged_folder)
-
-
-@cli.command("open_zarr_file_and_inspect")
-@click.argument("zarr_file", type=click.Path(exists=True, dir_okay=False))
-def open_zarr_file_and_inspect(zarr_file: str):
-    zarr_group, store = utils.open_zarr_zipstore(zarr_file)
-
-    click.echo(zarr_group.tree())
-
-    click.echo(80* "-")
-    for array_name in zarr_group.array_keys():
-        click.echo(f"Array: {array_name}")
-        click.echo(zarr_group[array_name].info_complete())
-        click.echo(zarr_group[array_name][:])
-        click.echo(80* "-")
-
-    store.close()
-
-
 @cli.command("summarize_compression")
 @click.argument("netcdf_file", type=click.Path(exists=True, dir_okay=False))
 @click.argument("where_to_write", type=click.Path(dir_okay=True, file_okay=False, exists=False))
@@ -291,6 +198,136 @@ def summarize_compression(netcdf_file: str, where_to_write: str, field_to_compre
             best_combo = max(results_gather, key=lambda x: x[1])
             click.echo("Best combo (valid threshold & max CR):")
             click.echo(f" | {best_combo[0]} | --> Ratio: {best_combo[1]:.3f} | Error: {best_combo[2]:.3e} | Euclidean Distance: {best_combo[3]:.3e}")
+
+
+@cli.command("compress_with_optimal")
+@click.argument("netcdf_file", type=click.Path(exists=True, dir_okay=False))
+@click.argument("where_to_write", type=click.Path(dir_okay=True, file_okay=False, exists=False))
+@click.argument("field_to_compress")
+@click.argument("comp_idx", type=int)
+@click.argument("filt_idx", type=int)
+@click.argument("ser_idx", type=int)
+def compress_with_optimal(netcdf_file, where_to_write, field_to_compress, comp_idx, filt_idx, ser_idx):
+    """
+    Compress a field with the optimal combination of 
+    compressor, filter, and serializer as generated by the summarize_compression command.
+
+    \b
+    Args:
+        netcdf_file (str): Path to the input NetCDF file.
+        where_to_write (str): Directory where the compressed output will be written.
+        field_to_compress (str): Name of the field to compress.
+        comp_idx (int): Index of the compressor to use.
+        filt_idx (int): Index of the filter to use.
+        ser_idx (int): Index of the serializer to use.
+    """
+    comm = MPI.COMM_WORLD
+    rank = comm.Get_rank()
+    size = comm.Get_size()
+    if size > 1:
+        if rank == 0:
+            click.echo("This command is not meant to be run in parallel. Please run it with a single process.")
+        sys.exit(1)
+
+    os.makedirs(where_to_write, exist_ok=True)
+
+    ds = utils.open_netcdf(netcdf_file, field_to_compress)
+    da = ds[field_to_compress]
+
+    compressors = utils.compressor_space(da)
+    filters = utils.filter_space(da)
+    serializers = utils.serializer_space(da)
+
+    optimal_compressor = compressors[comp_idx][1]
+    optimal_filter = filters[filt_idx][1]
+    optimal_serializer = serializers[ser_idx][1]
+
+    if isinstance(optimal_serializer, AnyNumcodecsArrayBytesCodec) or isinstance(optimal_serializer, numcodecs.zarr3.ZFPY):
+        if isinstance(optimal_serializer, numcodecs.zarr3.ZFPY) or isinstance(optimal_serializer.codec, (Sperr, Sz3)):
+            da = da.stack(flat_dim=da.dims)
+        elif isinstance(optimal_serializer.codec, EBCCZarrFilter):
+            da = da.squeeze().astype("float32")
+
+    compression_ratio, errors, euclidean_distance = utils.compress_with_zarr(
+        da,
+        netcdf_file,
+        field_to_compress,
+        where_to_write,
+        filters=None if isinstance(optimal_serializer, AnyNumcodecsArrayBytesCodec) else [optimal_filter,],  # TODO: fix (?) filter stacking with EBCC & numcodecs-wasm serializers
+        compressors=[optimal_compressor,],
+        serializer=optimal_serializer,
+        verbose=False,
+    )
+
+    click.echo(f" | {(optimal_compressor, optimal_filter, optimal_serializer)} | --> Ratio: {compression_ratio:.3f} | Error: {errors['Relative_Error_L1']:.3e} | Euclidean Distance: {euclidean_distance:.3e}")
+
+
+@cli.command("merge_compressed_fields")
+@click.argument("netcdf_file", type=click.Path(exists=True, dir_okay=False))
+@click.argument("compressed_files_location", type=click.Path(dir_okay=True, file_okay=False, exists=False))
+def merge_compressed_fields(netcdf_file: str, compressed_files_location: str):
+    """
+    Once all fields have been compressed, this command merges them into a single Zarr Zipped file.
+
+    \b
+    Args:
+        netcdf_file (str): Path to the input NetCDF file.
+        compressed_files_location (str): Directory where the compressed files are located.
+    """
+    comm = MPI.COMM_WORLD
+    rank = comm.Get_rank()
+    size = comm.Get_size()
+    if size > 1:
+        if rank == 0:
+            click.echo("This command is not meant to be run in parallel. Please run it with a single process.")
+        sys.exit(1)
+
+    # populate this folder with the compressed fields
+    netcdf_filename = Path(netcdf_file).name
+    merged_folder = Path(compressed_files_location) / f"{netcdf_filename}.zarr"
+    if Path(merged_folder).exists():
+        shutil.rmtree(merged_folder)
+    os.makedirs(merged_folder)
+
+    for var in utils.open_netcdf(netcdf_file).data_vars:
+        compressed_field = f"{Path(compressed_files_location) / netcdf_filename}.=.field_{var}.=.rank_{rank}.zarr.zip"
+        if not Path(compressed_field).exists():
+            click.echo("All fields must be compressed first.")
+            sys.exit(1)
+        extract_to = utils.unzip_file(compressed_field)
+        utils.copy_folder_contents(extract_to, merged_folder)
+        shutil.rmtree(extract_to)
+
+    zipped_merged_folder = str(merged_folder) + ".zip"
+    if Path(zipped_merged_folder).exists():
+        os.remove(zipped_merged_folder)
+    shutil.make_archive(merged_folder, 'zip', merged_folder)
+
+    if Path(merged_folder).exists():
+        shutil.rmtree(merged_folder)
+
+
+@cli.command("open_zarr_file_and_inspect")
+@click.argument("zarr_file", type=click.Path(exists=True, dir_okay=False))
+def open_zarr_file_and_inspect(zarr_file: str):
+    """
+    Open a Zarr file and inspect its contents.
+
+    Args:
+        zarr_file (str): Path to the Zarr file.
+    """
+    zarr_group, store = utils.open_zarr_zipstore(zarr_file)
+
+    click.echo(zarr_group.tree())
+
+    click.echo(80* "-")
+    for array_name in zarr_group.array_keys():
+        click.echo(f"Array: {array_name}")
+        click.echo(zarr_group[array_name].info_complete())
+        click.echo(zarr_group[array_name][:])
+        click.echo(80* "-")
+
+    store.close()
 
 
 @cli.command("perform_clustering")
