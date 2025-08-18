@@ -10,12 +10,6 @@ import sys
 import os
 import shutil
 import math
-import traceback
-import asyncio
-from collections import OrderedDict
-from collections.abc import Sequence
-import functools
-import inspect
 import zipfile
 import click
 import humanize
@@ -23,8 +17,6 @@ import numpy as np
 import dask
 import pandas as pd
 import xarray as xr
-import yaml
-import pywt
 import zarr
 from zarr_any_numcodecs import AnyNumcodecsArrayArrayCodec, AnyNumcodecsArrayBytesCodec, AnyNumcodecsBytesBytesCodec
 import numcodecs
@@ -121,43 +113,12 @@ def compress_with_zarr(data, netcdf_file, field_to_compress, where_to_write, fil
         click.echo(80* "-")
         click.echo(pprint_)
         click.echo(80* "-")
-
-    with Timer("calc_dwt_dist"):
-        # TODO: make it Dask compatible, otherwise use the euclidean which we already compute
-        dwt_dist = euclidean_distance #calc_dwt_dist(z[:], data)
-    if verbose and rank == 0:
-        click.echo(f"DWT Distance: {dwt_dist}")
+        click.echo(f"Euclidean Distance: {euclidean_distance}")
         click.echo(80* "-")
 
     store.close()
 
-    return compression_ratio, errors, dwt_dist
-
-
-def ordered_yaml_loader():
-    class OrderedLoader(yaml.SafeLoader):
-        pass
-
-    def construct_mapping(loader, node):
-        loader.flatten_mapping(node)
-        return OrderedDict(loader.construct_pairs(node))
-
-    OrderedLoader.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, construct_mapping)
-
-    return OrderedLoader
-
-
-def get_filter_parameters(parameters_file: str, filter_name: str):
-    with open(parameters_file, "r") as f:
-        params = yaml.load(f, Loader=ordered_yaml_loader())
-
-    try:
-        filter_config = params[filter_name]["params"]
-        return tuple(filter_config.values())
-
-    except Exception:
-        click.echo("An unexpected error occurred:", err=True)
-        traceback.print_exc(file=sys.stderr)
+    return compression_ratio, errors, euclidean_distance
 
 
 def compute_errors_distances(da_compressed, da):
@@ -206,14 +167,6 @@ def compute_errors_distances(da_compressed, da):
 
     errors_ = {k: f"{v:.3e}" for k, v in errors.items()}
     return "\n".join(f"{k:20s}: {v}" for k, v in errors_.items()), errors, euclidean_distance, normalized_euclidean_distance
-
-
-def calc_dwt_dist(input_1, input_2, n_levels=4, wavelet="haar"):
-    dwt_data_1 = pywt.wavedec(input_1, wavelet=wavelet, level=n_levels)
-    dwt_data_2 = pywt.wavedec(input_2, wavelet=wavelet, level=n_levels)
-    distances = [np.linalg.norm(c1 - c2) for c1, c2 in zip(dwt_data_1, dwt_data_2)]
-    dwt_distance = np.sqrt(sum(d**2 for d in distances))
-    return dwt_distance
 
 
 def compressor_space(da):
@@ -302,7 +255,7 @@ def serializer_space(da):
     # TODO: take care of integer data types
     serializer_space = []
     
-    _SERIALIZERS = [numcodecs.zarr3.PCodec] # numcodecs.zarr3.ZFPY
+    _SERIALIZERS = [numcodecs.zarr3.PCodec, numcodecs.zarr3.ZFPY]
     if _WITH_EBCC:
         _SERIALIZERS += [EBCCZarrFilter]
     if _WITH_NUMCODECS_WASM:
@@ -330,6 +283,8 @@ def serializer_space(da):
             for mode in [zfpy.mode_fixed_accuracy,
                          zfpy.mode_fixed_precision,
                          zfpy.mode_fixed_rate,]:
+                if da.dtype.kind == 'i' and mode != zfpy.mode_fixed_rate:
+                    continue
                 for compress_param_num in range(3):
                     if mode == zfpy.mode_fixed_accuracy:
                         serializer_space.append(numcodecs.zarr3.ZFPY(
