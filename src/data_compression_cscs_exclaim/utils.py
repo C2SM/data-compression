@@ -259,9 +259,13 @@ def serializer_space(da):
     if _WITH_EBCC:
         _SERIALIZERS += [EBCCZarrFilter]
     if _WITH_NUMCODECS_WASM:
-        _SERIALIZERS += [Sperr, Sz3]
+        _SERIALIZERS += [Sperr, Sz3, Zfp]
     if da.dtype.kind == 'i':
-        _SERIALIZERS = [numcodecs.zarr3.PCodec, numcodecs.zarr3.ZFPY, EBCCZarrFilter, Sz3]
+        _SERIALIZERS = [numcodecs.zarr3.PCodec, numcodecs.zarr3.ZFPY]
+        if _WITH_EBCC:
+            _SERIALIZERS += [EBCCZarrFilter]
+        if _WITH_NUMCODECS_WASM:
+            _SERIALIZERS += [Sz3, Zfp]
     for serializer in _SERIALIZERS:
         if serializer == numcodecs.zarr3.PCodec:
             # https://github.com/pcodec/pcodec
@@ -277,7 +281,7 @@ def serializer_space(da):
                                     delta_encoding_order=delta_encoding_order if delta_spec in ["try_consecutive", "auto"] else None
                                 )
                             )
-        elif serializer == numcodecs.zarr3.ZFPY:
+        elif serializer == numcodecs.zarr3.ZFPY or serializer == Zfp:
             # https://github.com/LLNL/zfp/tree/develop/python
             # https://github.com/LLNL/zfp/blob/develop/tests/python/test_numpy.py
             for mode in [zfpy.mode_fixed_accuracy,
@@ -290,14 +294,23 @@ def serializer_space(da):
                         serializer_space.append(numcodecs.zarr3.ZFPY(
                             mode=mode, tolerance=compute_fixed_accuracy_param(compress_param_num)
                         ))
+                        serializer_space.append(AnyNumcodecsArrayBytesCodec(Zfp(
+                            mode="fixed-accuracy", tolerance=compute_fixed_accuracy_param(compress_param_num)
+                        )))
                     elif mode == zfpy.mode_fixed_precision:
                         serializer_space.append(numcodecs.zarr3.ZFPY(
                             mode=mode, precision=compute_fixed_precision_param(compress_param_num)
                         ))
+                        serializer_space.append(AnyNumcodecsArrayBytesCodec(Zfp(
+                            mode="fixed-precision", precision=compute_fixed_precision_param(compress_param_num)
+                        )))
                     elif mode == zfpy.mode_fixed_rate:
                         serializer_space.append(numcodecs.zarr3.ZFPY(
                             mode=mode, rate=compute_fixed_rate_param(compress_param_num)
                         ))
+                        serializer_space.append(AnyNumcodecsArrayBytesCodec(Zfp(
+                            mode="fixed-rate", rate=compute_fixed_rate_param(compress_param_num)
+                        )))
         elif serializer == EBCCZarrFilter:
             # https://github.com/spcl/ebcc
             data = da.squeeze()  # TODO: add more checks on the shape of the data
