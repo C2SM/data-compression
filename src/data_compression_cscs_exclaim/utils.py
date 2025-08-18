@@ -175,7 +175,7 @@ def compressor_space(da):
     # TODO: take care of integer data types
     compressor_space = []
 
-    _COMPRESSORS = [numcodecs.zarr3.LZMA]
+    _COMPRESSORS = [numcodecs.zarr3.Blosc, numcodecs.zarr3.LZ4, numcodecs.zarr3.Zstd, numcodecs.zarr3.Zlib, numcodecs.zarr3.GZip, numcodecs.zarr3.BZ2, numcodecs.zarr3.LZMA]
     for compressor in _COMPRESSORS:
         if compressor == numcodecs.zarr3.Blosc:
             for cname in numcodecs.blosc.list_compressors():
@@ -199,10 +199,9 @@ def compressor_space(da):
             for level in inclusive_range(1,9,4):
                 compressor_space.append(numcodecs.zarr3.BZ2(level=level))
         elif compressor == numcodecs.zarr3.LZMA:
-            compressor_space.append(numcodecs.zarr3.LZMA(preset=9))
-            # # https://docs.python.org/3/library/lzma.html
-            # for preset in inclusive_range(1,9,4):
-            #     compressor_space.append(numcodecs.zarr3.LZMA(preset=preset))
+            # https://docs.python.org/3/library/lzma.html
+            for preset in inclusive_range(1,9,4):
+                compressor_space.append(numcodecs.zarr3.LZMA(preset=preset))
 
     return list(zip(range(len(compressor_space)), compressor_space))
 
@@ -214,7 +213,7 @@ def filter_space(da):
     # TODO: take care of integer data types
     filter_space = []
     
-    _FILTERS = [numcodecs.zarr3.BitRound]
+    _FILTERS = [numcodecs.zarr3.Delta, numcodecs.zarr3.BitRound, numcodecs.zarr3.Quantize]
     if _WITH_NUMCODECS_WASM:
         _FILTERS += [Asinh, FixedOffsetScale, Log, UniformNoise]
     if da.dtype.kind == 'i':
@@ -224,10 +223,9 @@ def filter_space(da):
         if filter == numcodecs.zarr3.Delta:
             filter_space.append(numcodecs.zarr3.Delta(dtype=str(da.dtype)))
         elif filter == numcodecs.zarr3.BitRound:
-            filter_space.append(numcodecs.zarr3.BitRound(keepbits=10))
-            # # If keepbits is equal to the maximum allowed for the data type, this is equivalent to no transform.
-            # for keepbits in valid_keepbits_for_bitround(da, step=9):
-            #     filter_space.append(numcodecs.zarr3.BitRound(keepbits=keepbits))
+            # If keepbits is equal to the maximum allowed for the data type, this is equivalent to no transform.
+            for keepbits in valid_keepbits_for_bitround(da, step=9):
+                filter_space.append(numcodecs.zarr3.BitRound(keepbits=keepbits))
         elif filter == numcodecs.zarr3.Quantize:
             for digits in valid_keepbits_for_bitround(da, step=9):
                 filter_space.append(numcodecs.zarr3.Quantize(digits=digits, dtype=str(da.dtype)))
@@ -257,7 +255,7 @@ def serializer_space(da):
     # TODO: take care of integer data types
     serializer_space = []
     
-    _SERIALIZERS = [Zfp, numcodecs.zarr3.ZFPY]
+    _SERIALIZERS = [numcodecs.zarr3.PCodec, numcodecs.zarr3.ZFPY]
     if _WITH_EBCC:
         _SERIALIZERS += [EBCCZarrFilter]
     if _WITH_NUMCODECS_WASM:
