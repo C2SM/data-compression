@@ -458,14 +458,16 @@ def copy_folder_contents(src_folder: str, dst_folder: str):
             shutil.copy2(src_path, dst_path)
 
 
-def progress_bar(rank, i, total_configs, print_every=100, bar_width=40):
+def progress_bar(i, total_configs, print_every=100, bar_width=40):
+    rank = MPI.COMM_WORLD.Get_rank()
     if rank != 0:
         return
+
     percent = (i + 1) / total_configs
     filled = int(bar_width * percent)
     bar = "*" * filled + "-" * (bar_width - filled)
     if int(i + 1) % print_every == 0 or (i + 1) == total_configs:
-        click.echo(f"[Rank {rank}] Progress: |{bar}| {percent*100:6.2f}% ({i+1}/{total_configs})")
+        click.echo(f"[Rank {rank}] Progress: |{bar}| {percent*100:6.2f}% ({i+1}/{total_configs}) [{total_configs} loops per MPI task]")
 
 
 # Global registry of all timings

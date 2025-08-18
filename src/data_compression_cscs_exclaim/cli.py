@@ -128,7 +128,7 @@ def summarize_compression(netcdf_file: str, where_to_write: str, field_to_compre
 
         num_loops = num_compressors * num_filters * num_serializers
         if rank == 0:
-            click.echo(f"Number of loops: {num_loops} ({num_compressors} compressors, {num_filters} filters, {num_serializers} serializers) -divided across multiple processes-")
+            click.echo(f"Number of loops: {num_loops} ({num_compressors} compressors, {num_filters} filters, {num_serializers} serializers) -divided across {size} MPI task(s)-")
 
         config_space = list(itertools.product(compressors, filters, serializers))
         configs_for_rank = config_space[rank::size]
@@ -173,12 +173,11 @@ def summarize_compression(netcdf_file: str, where_to_write: str, field_to_compre
                     raw_values_explicit_with_names.append((compression_ratio, l1_error_rel, l2_error_rel, linf_error_rel, euclidean_distance, str(compressor), str(filter), str(serializer)))
 
             except:
-                if rank == 0:
-                    click.echo(f"Failed to compress with {compressor}, {filter}, {serializer} [Indices: {comp_idx}, {filt_idx}, {ser_idx}]")
-                    traceback.print_exc(file=sys.stderr)
+                click.echo(f"Failed to compress with {compressor}, {filter}, {serializer} [Indices: {comp_idx}, {filt_idx}, {ser_idx}]")
+                # traceback.print_exc(file=sys.stderr)
                 sys.exit(1)
 
-            utils.progress_bar(rank, i, total_configs, print_every=100)
+            utils.progress_bar(i, total_configs, print_every=100)
 
         results_gather = comm.gather(results, root=0)
         raw_values_explicit_gather = comm.gather(raw_values_explicit, root=0)
