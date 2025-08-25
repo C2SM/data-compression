@@ -1,6 +1,8 @@
 #!/bin/bash
 set -euo pipefail
 
+pip install --upgrade pip
+
 # Install your local project
 pip install -e .
 pip install -r requirements.txt
