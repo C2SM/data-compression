@@ -59,6 +59,15 @@ def cli():
 @click.option("--field-to-compress", default=None, help="Field to compress [if not given, all fields will be compressed].")
 @click.option("--field-percentage-to-compress", default=None, callback=utils.validate_percentage, help="Compress a percentage of the field [1-99%]. If not given, the whole field will be compressed.")
 def summarize_compression(netcdf_file: str, where_to_write: str, field_to_compress: str | None = None, field_percentage_to_compress: str | None = None):
+    """
+    Loop over combinations of compressors, filters, and serializers to find the optimal configuration for compressing a given field in a NetCDF file.
+
+    Args:
+        netcdf_file (str): Path to the input NetCDF file.
+        where_to_write (str): Directory where the output files will be written.
+        field_to_compress (str | None, optional): Name of the field to compress. If None, all fields will be compressed. Defaults to None.
+        field_percentage_to_compress (str | None, optional): Percentage of the field to compress [1-99%]. If not given, the whole field will be compressed. Defaults to None.
+    """
     ## https://numcodecs.readthedocs.io/en/stable/zarr3.html#zarr-3-codecs
     ## https://numcodecs-wasm.readthedocs.io/en/latest/
     os.makedirs(where_to_write, exist_ok=True)
