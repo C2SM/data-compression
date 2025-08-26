@@ -77,9 +77,9 @@ def open_zarr_zipstore(zarr_zipstore_file: str):
     return zarr.open_group(store, mode='r'), store
 
 
-def compress_with_zarr(data, netcdf_file, field_to_compress, where_to_write, filters, compressors, serializer='auto', verbose=True, rank=0):
+def compress_with_zarr(data, netcdf_file, field_to_compress, where_to_write, filters, compressors, serializer, verbose=True, rank=0):
     assert isinstance(data.data, dask.array.Array)
-    
+
     basename = os.path.basename(netcdf_file)
     zarr_file = os.path.join(where_to_write, basename)
     zarr_file = f"{zarr_file}.=.field_{field_to_compress}.=.rank_{rank}.zarr.zip"
@@ -179,6 +179,9 @@ def compressor_space(da, compressor_class):
 
     if compressor_class and compressor_class.lower() in _COMPRESSOR_MAP:
         _COMPRESSORS = [_COMPRESSOR_MAP[compressor_class.lower()]]
+    elif compressor_class and compressor_class.lower() == "none":
+        _COMPRESSORS = []
+        compressor_space.append(None)
 
     for compressor in _COMPRESSORS:
         if compressor == numcodecs.zarr3.Blosc:
@@ -225,6 +228,9 @@ def filter_space(da, filter_class):
     _FILTER_MAP = {cls.__name__.lower(): cls for cls in _FILTERS}
     if filter_class and filter_class.lower() in _FILTER_MAP:
         _FILTERS = [_FILTER_MAP[filter_class.lower()]]
+    elif filter_class and filter_class.lower() == "none":
+        _FILTERS = []
+        filter_space.append(None)
 
     m = dask.array.nanmax(dask.array.absolute(da)).compute()
     if not np.isfinite(m) or m == 0:
@@ -243,8 +249,7 @@ def filter_space(da, filter_class):
             for digits in valid_keepbits_for_bitround(da, step=9):
                 filter_space.append(filter(digits=digits, dtype=str(da.dtype)))
         elif filter == Asinh:
-            for linear_width in [base_scale/10, base_scale, base_scale*10]:
-                filter_space.append(AnyNumcodecsArrayArrayCodec(filter(linear_width=linear_width)))
+            filter_space.append(AnyNumcodecsArrayArrayCodec(filter(linear_width=compute_linear_width(da, quantile=0.01, compute=True))))
         elif filter == FixedOffsetScale:
             # Setting o=mean(x) and s=std(x) normalizes that data
             filter_space.append(AnyNumcodecsArrayArrayCodec(filter(offset=da.mean(skipna=True).compute().item(), scale=da.std(skipna=True).compute().item())))
@@ -282,6 +287,9 @@ def serializer_space(da, serializer_class):
     _SERIALIZER_MAP = {cls.__name__.lower(): cls for cls in _SERIALIZERS}
     if serializer_class and serializer_class.lower() in _SERIALIZER_MAP:
         _SERIALIZERS = [_SERIALIZER_MAP[serializer_class.lower()]]
+    elif serializer_class and serializer_class.lower() == "none":
+        _SERIALIZERS = []
+        serializer_space.append(None)
 
     for serializer in _SERIALIZERS:
         if serializer == numcodecs.zarr3.PCodec:
@@ -531,3 +539,32 @@ def print_profile_summary():
         print(f"{label:<{label_width}} | {count:>5} | {avg:>10.6f} | {total:>10.6f}")
 
     print("=" * len(header))
+
+
+def compute_linear_width(
+    da: xr.DataArray,
+    *,
+    quantile: float = 0.01,
+    skipna: bool = True,
+    floor: float | None = None,
+    cap: float | None = None,
+    compute: bool = False,
+) -> float | xr.DataArray:
+    """Lazy, Dask-enabled estimate of Asinh.linear_width via small-quantile(|da|)."""
+    # mask to finite values (lazy)
+    finite = xr.apply_ufunc(np.isfinite, da, dask="parallelized")
+    abs_da = xr.apply_ufunc(np.abs, da.where(finite), dask="parallelized")
+
+    # small quantile of |da| (lazy)
+    lw = abs_da.quantile(quantile, skipna=skipna)
+
+    # drop the 'quantile' coord that xarray adds
+    if "quantile" in lw.dims:
+        lw = lw.squeeze("quantile", drop=True)
+
+    # Dask-safe bounds without apply_ufunc
+    if floor is not None or cap is not None:
+        lw = lw.clip(min=floor if floor is not None else None,
+                     max=cap if cap is not None else None)
+
+    return float(lw.compute()) if compute else lw

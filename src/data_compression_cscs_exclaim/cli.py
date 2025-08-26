@@ -58,9 +58,9 @@ def cli():
 @click.argument("where_to_write", type=click.Path(dir_okay=True, file_okay=False, exists=False))
 @click.option("--field-to-compress", default=None, help="Field to compress [if not given, all fields will be compressed].")
 @click.option("--field-percentage-to-compress", default=None, callback=utils.validate_percentage, help="Compress a percentage of the field [1-99%]. If not given, the whole field will be compressed.")
-@click.option("--compressor-class", default=None, help="Compressor Class to use, i.e. specified instead of the full list.")
-@click.option("--filter-class", default=None, help="Filter Class to use, i.e. specified instead of the full list.")
-@click.option("--serializer-class", default=None, help="Serializer Class to use, i.e. specified instead of the full list.")
+@click.option("--compressor-class", default=None, help="Compressor Class to use, i.e. specified instead of the full list (can be None).")
+@click.option("--filter-class", default=None, help="Filter Class to use, i.e. specified instead of the full list (can be None).")
+@click.option("--serializer-class", default=None, help="Serializer Class to use, i.e. specified instead of the full list (can be None).")
 def summarize_compression(netcdf_file: str, where_to_write: str, 
                           field_to_compress: str | None = None, field_percentage_to_compress: str | None = None, 
                           compressor_class: str | None = None, filter_class: str | None = None, serializer_class: str | None = None):
@@ -72,9 +72,9 @@ def summarize_compression(netcdf_file: str, where_to_write: str,
         where_to_write (str): Directory where the output files will be written.
         field_to_compress (str | None, optional): Name of the field to compress. If None, all fields will be compressed. Defaults to None.
         field_percentage_to_compress (str | None, optional): Percentage of the field to compress [1-99%]. If not given, the whole field will be compressed. Defaults to None.
-        compressor_class (str | None, optional): Compressor Class to use, i.e. specified instead of the full list. Defaults to None.
-        filter_class (str | None, optional): Filter Class to use, i.e. specified instead of the full list. Defaults to None.
-        serializer_class (str | None, optional): Serializer Class to use, i.e. specified instead of the full list. Defaults to None.
+        compressor_class (str | None, optional): Compressor Class to use, i.e. specified instead of the full list (can be None).
+        filter_class (str | None, optional): Filter Class to use, i.e. specified instead of the full list (can be None).
+        serializer_class (str | None, optional): Serializer Class to use, i.e. specified instead of the full list (can be None).
     """
     ## https://numcodecs.readthedocs.io/en/stable/zarr3.html#zarr-3-codecs
     ## https://numcodecs-wasm.readthedocs.io/en/latest/
@@ -162,15 +162,21 @@ def summarize_compression(netcdf_file: str, where_to_write: str,
                 elif isinstance(serializer.codec, EBCCZarrFilter):
                     data_to_compress = da.squeeze().astype("float32")
 
+            filters_ = [filter,]
+            if isinstance(serializer, AnyNumcodecsArrayBytesCodec):
+                filters_ = None  # TODO: fix (?) filter stacking with EBCC & numcodecs-wasm serializers
+            if filter is None:
+                filters_ = None
+
             try:
                 compression_ratio, errors, euclidean_distance = utils.compress_with_zarr(
                     data_to_compress,
                     netcdf_file,
                     var,
                     where_to_write,
-                    filters=None if isinstance(serializer, AnyNumcodecsArrayBytesCodec) else [filter,],  # TODO: fix (?) filter stacking with EBCC & numcodecs-wasm serializers
-                    compressors=[compressor,],
-                    serializer=serializer,
+                    filters=filters_,
+                    compressors=[compressor,] if compressor is not None else None,
+                    serializer=serializer if serializer is not None else "auto",
                     verbose=False,
                     rank=rank,
                 )
