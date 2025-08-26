@@ -221,7 +221,7 @@ def filter_space(da, filter_class):
 
     _FILTERS = [numcodecs.zarr3.Delta, numcodecs.zarr3.BitRound, numcodecs.zarr3.Quantize]
     if _WITH_NUMCODECS_WASM:
-        _FILTERS += [Asinh, FixedOffsetScale, Log, UniformNoise]
+        _FILTERS += [Asinh, FixedOffsetScale]
     if da.dtype.kind == 'i':
         _FILTERS = [numcodecs.zarr3.Delta]
 
@@ -231,12 +231,6 @@ def filter_space(da, filter_class):
     elif filter_class and filter_class.lower() == "none":
         _FILTERS = []
         filter_space.append(None)
-
-    m = dask.array.nanmax(dask.array.absolute(da)).compute()
-    if not np.isfinite(m) or m == 0:
-        base_scale = 1.0
-    else:
-        base_scale = 10 ** np.floor(np.log10(m))
 
     for filter in _FILTERS:
         if filter == numcodecs.zarr3.Delta:
@@ -255,13 +249,6 @@ def filter_space(da, filter_class):
             filter_space.append(AnyNumcodecsArrayArrayCodec(filter(offset=da.mean(skipna=True).compute().item(), scale=da.std(skipna=True).compute().item())))
             # Setting o=min(x) and s=max(x)−min(x)standardizes the data
             filter_space.append(AnyNumcodecsArrayArrayCodec(filter(offset=da.min(skipna=True).compute().item(), scale=da.max(skipna=True).compute().item()-da.min(skipna=True).compute().item())))
-        elif filter == Log:
-            if bool((da > 0).all()):
-                filter_space.append(AnyNumcodecsArrayArrayCodec(filter()))
-        elif filter == UniformNoise:
-            for seed in [0]:
-                for scale in [base_scale/10, base_scale, base_scale*10]:
-                    filter_space.append(AnyNumcodecsArrayArrayCodec(filter(scale=scale, seed=seed)))
 
     return list(zip(range(len(filter_space)), filter_space))
 
