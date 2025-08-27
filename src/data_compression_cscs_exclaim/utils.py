@@ -186,28 +186,26 @@ def compressor_space(da, compressor_class):
     for compressor in _COMPRESSORS:
         if compressor == numcodecs.zarr3.Blosc:
             for cname in numcodecs.blosc.list_compressors():
-                for clevel in inclusive_range(1,9,4):
-                    for shuffle in inclusive_range(0,2):
+                for clevel in [1, 6, 9]:
+                    for shuffle in [-1, 0, 1, 2]:
                         compressor_space.append(compressor(cname=cname, clevel=clevel, shuffle=shuffle))
         elif compressor == numcodecs.zarr3.LZ4:
-            # The larger the acceleration value, the faster the algorithm, but also the lesser the compression
-            for acceleration in inclusive_range(0, 16, 6):
+            for acceleration in [1, 10, 100]:
                 compressor_space.append(compressor(acceleration=acceleration))
         elif compressor == numcodecs.zarr3.Zstd:
-            for level in inclusive_range(-7, 22, 10):
+            for level in [0, 1, 9, 22]:
                 compressor_space.append(compressor(level=level))
         elif compressor == numcodecs.zarr3.Zlib:
-            for level in inclusive_range(1,9,4):
+            for level in [1, 6, 9]:
                 compressor_space.append(compressor(level=level))
         elif compressor == numcodecs.zarr3.GZip:
-            for level in inclusive_range(1,9,4):
+            for level in [1, 6, 9]:
                 compressor_space.append(compressor(level=level))
         elif compressor == numcodecs.zarr3.BZ2:
-            for level in inclusive_range(1,9,4):
+            for level in [1, 6, 9]:
                 compressor_space.append(compressor(level=level))
         elif compressor == numcodecs.zarr3.LZMA:
-            # https://docs.python.org/3/library/lzma.html
-            for preset in inclusive_range(1,9,4):
+            for preset in [1, 6, 9]:
                 compressor_space.append(compressor(preset=preset))
 
     return list(zip(range(len(compressor_space)), compressor_space))
@@ -232,23 +230,45 @@ def filter_space(da, filter_class):
         _FILTERS = []
         filter_space.append(None)
 
-    for filter in _FILTERS:
-        if filter == numcodecs.zarr3.Delta:
-            filter_space.append(filter(dtype=str(da.dtype)))
-        elif filter == numcodecs.zarr3.BitRound:
-            # If keepbits is equal to the maximum allowed for the data type, this is equivalent to no transform.
+    for filt in _FILTERS:
+        if filt == numcodecs.zarr3.Delta:
+            if np.issubdtype(da.dtype, np.number):
+                filter_space.append(filt(dtype=str(da.dtype)))
+        elif filt == numcodecs.zarr3.BitRound:
             for keepbits in valid_keepbits_for_bitround(da, step=9):
-                filter_space.append(filter(keepbits=keepbits))
-        elif filter == numcodecs.zarr3.Quantize:
-            for digits in valid_keepbits_for_bitround(da, step=9):
-                filter_space.append(filter(digits=digits, dtype=str(da.dtype)))
-        elif filter == Asinh:
-            filter_space.append(AnyNumcodecsArrayArrayCodec(filter(linear_width=compute_linear_width(da, quantile=0.01, compute=True))))
-        elif filter == FixedOffsetScale:
-            # Setting o=mean(x) and s=std(x) normalizes that data
-            filter_space.append(AnyNumcodecsArrayArrayCodec(filter(offset=da.mean(skipna=True).compute().item(), scale=da.std(skipna=True).compute().item())))
-            # Setting o=min(x) and s=max(x)−min(x)standardizes the data
-            filter_space.append(AnyNumcodecsArrayArrayCodec(filter(offset=da.min(skipna=True).compute().item(), scale=da.max(skipna=True).compute().item()-da.min(skipna=True).compute().item())))
+                filter_space.append(filt(keepbits=keepbits))
+        elif filt == numcodecs.zarr3.Quantize:
+            for digits in valid_digits_for_quantize(da, step=4):
+                filter_space.append(filt(digits=digits, dtype=str(da.dtype)))
+        elif filt == Asinh:
+            filter_space.append(AnyNumcodecsArrayArrayCodec(filt(linear_width=compute_linear_width(da, quantile=0.01, compute=True))))
+        elif filt == FixedOffsetScale:
+            # Compute required stats ONCE (global reductions; memory-light but do trigger a compute)
+            mean_val, std_val, min_val, max_val = dask.compute(
+                da.mean(skipna=True),
+                da.std(skipna=True),
+                da.min(skipna=True),
+                da.max(skipna=True),
+            )
+
+            # Helper to validate finite, nonzero scale (avoid divide-by-zero / NaNs)
+            def _safe_scale(x, min_eps=1e-12):
+                if not np.isfinite(x):
+                    return None
+                if abs(x) < min_eps:
+                    return None
+                return float(x)
+
+            # Normalize: (x - mean) / std
+            std_safe = _safe_scale(std_val)
+            if np.isfinite(mean_val) and std_safe is not None:
+                filter_space.append(AnyNumcodecsArrayArrayCodec(filt(offset=float(mean_val), scale=std_safe)))
+
+            # Standardize to [0,1]-like: (x - min) / (max - min)
+            rng = max_val - min_val
+            rng_safe = _safe_scale(rng)
+            if np.isfinite(min_val) and rng_safe is not None:
+                filter_space.append(AnyNumcodecsArrayArrayCodec(filt(offset=float(min_val), scale=rng_safe)))
 
     return list(zip(range(len(filter_space)), filter_space))
 
@@ -256,20 +276,15 @@ def filter_space(da, filter_class):
 def serializer_space(da, serializer_class):
     # https://numcodecs.readthedocs.io/en/stable/zarr3.html#serializers-array-to-bytes-codecs
     # https://numcodecs-wasm.readthedocs.io/en/latest/
+    is_int = (da.dtype.kind == "i")
 
     serializer_space = []
 
     _SERIALIZERS = [numcodecs.zarr3.PCodec, numcodecs.zarr3.ZFPY]
     if _WITH_EBCC:
-        _SERIALIZERS += [EBCCZarrFilter]
+        _SERIALIZERS.append(EBCCZarrFilter)
     if _WITH_NUMCODECS_WASM:
-        _SERIALIZERS += [Sperr, Sz3, Zfp]
-    if da.dtype.kind == 'i':
-        _SERIALIZERS = [numcodecs.zarr3.PCodec, numcodecs.zarr3.ZFPY]
-        if _WITH_EBCC:
-            _SERIALIZERS += [EBCCZarrFilter]
-        if _WITH_NUMCODECS_WASM:
-            _SERIALIZERS += [Sz3, Zfp]
+        _SERIALIZERS.append(Zfp)
 
     _SERIALIZER_MAP = {cls.__name__.lower(): cls for cls in _SERIALIZERS}
     if serializer_class and serializer_class.lower() in _SERIALIZER_MAP:
@@ -280,55 +295,33 @@ def serializer_space(da, serializer_class):
 
     for serializer in _SERIALIZERS:
         if serializer == numcodecs.zarr3.PCodec:
-            # https://github.com/pcodec/pcodec
-            # PCodec supports only the following numerical dtypes: uint16, uint32, uint64, int16, int32, int64, float16, float32, and float64.
-            for level in inclusive_range(0, 12, 4):  # where 12 take the longest and compresses the most
-                for mode_spec in ["auto", "classic"]:
-                    for delta_spec in ["auto", "none", "try_consecutive", "try_lookback"]:
-                        for delta_encoding_order in inclusive_range(0,7,4):
-                            serializer_space.append(serializer(
-                                    level=level,
-                                    mode_spec=mode_spec,
-                                    delta_spec=delta_spec,
-                                    delta_encoding_order=delta_encoding_order if delta_spec in ["try_consecutive", "auto"] else None
-                                )
-                            )
-        elif serializer == numcodecs.zarr3.ZFPY or serializer == Zfp:
+            for level in [0, 4, 8, 12]:
+                for delta_encoding_order in [0, 3, 7]:
+                    serializer_space.append(serializer(
+                            level=level,
+                            mode_spec="auto",
+                            delta_spec="auto",
+                            delta_encoding_order=delta_encoding_order
+                        )
+                    )
+        elif serializer in (numcodecs.zarr3.ZFPY, Zfp):
             # https://github.com/LLNL/zfp/tree/develop/python
             # https://github.com/LLNL/zfp/blob/develop/tests/python/test_numpy.py
-            for mode in [zfpy.mode_fixed_accuracy,
-                         zfpy.mode_fixed_precision,
-                         zfpy.mode_fixed_rate,]:
-                if da.dtype.kind == 'i' and mode != zfpy.mode_fixed_rate:
-                    continue
-                for compress_param_num in range(3):
-                    if mode == zfpy.mode_fixed_accuracy:
-                        if serializer == numcodecs.zarr3.ZFPY:
-                            serializer_space.append(serializer(
-                                mode=mode, tolerance=compute_fixed_accuracy_param(compress_param_num)
-                            ))
-                        else:
-                            serializer_space.append(AnyNumcodecsArrayBytesCodec(serializer(
-                                mode="fixed-accuracy", tolerance=compute_fixed_accuracy_param(compress_param_num)
-                            )))
-                    elif mode == zfpy.mode_fixed_precision:
-                        if serializer == numcodecs.zarr3.ZFPY:
-                            serializer_space.append(serializer(
-                                mode=mode, precision=compute_fixed_precision_param(compress_param_num)
-                            ))
-                        else:
-                            serializer_space.append(AnyNumcodecsArrayBytesCodec(serializer(
-                                mode="fixed-precision", precision=compute_fixed_precision_param(compress_param_num)
-                            )))
-                    elif mode == zfpy.mode_fixed_rate:
-                        if serializer == numcodecs.zarr3.ZFPY:
-                            serializer_space.append(serializer(
-                                mode=mode, rate=compute_fixed_rate_param(compress_param_num)
-                            ))
-                        else:
-                            serializer_space.append(AnyNumcodecsArrayBytesCodec(serializer(
-                                mode="fixed-rate", rate=compute_fixed_rate_param(compress_param_num)
-                            )))
+            _ZFP_MODES = [
+                ("fixed-accuracy",  zfpy.mode_fixed_accuracy,  "tolerance", compute_fixed_accuracy_param),
+                ("fixed-precision", zfpy.mode_fixed_precision, "precision", compute_fixed_precision_param),
+                ("fixed-rate",      zfpy.mode_fixed_rate,      "rate",      compute_fixed_rate_param),
+            ]
+            if is_int:
+                _ZFP_MODES = [m for m in _ZFP_MODES if m[0] == "fixed-rate"]
+            for mode_str, zfpy_mode, param_name, param_fn in _ZFP_MODES:
+                for k in range(3):
+                    val = param_fn(k)
+                    if serializer is numcodecs.zarr3.ZFPY:
+                        serializer_space.append(serializer(mode=zfpy_mode, **{param_name: val}))
+                    else:
+                        codec = serializer(mode=mode_str, **{param_name: val})
+                        serializer_space.append(AnyNumcodecsArrayBytesCodec(codec))
         elif serializer == EBCCZarrFilter:
             # https://github.com/spcl/ebcc
             data = da.squeeze()  # TODO: add more checks on the shape of the data
@@ -341,32 +334,6 @@ def serializer_space(da, serializer_class):
                     )
                 zarr_filter = serializer(ebcc_filter.hdf_filter_opts)
                 serializer_space.append(AnyNumcodecsArrayBytesCodec(zarr_filter))
-        elif serializer == Sperr:
-            # https://github.com/juntyr/numcodecs-rs/blob/main/codecs/sperr/tests/config.rs
-            for mode in ["bpp", "psnr", "pwe"]:
-                serializer_space.append(AnyNumcodecsArrayBytesCodec(serializer(mode=mode, bpp=1.0, psnr=42.0, pwe=0.1)))
-        elif serializer == Sz3:
-            # https://github.com/juntyr/numcodecs-rs/blob/main/codecs/sz3/tests/config.rs
-            abs_err = [1.0, 1e-1, 1e-2]
-            rel_err = [1.0, 1e-1, 1e-2]
-            l2      = [1.0, 1e-1]
-            for eb_mode in ["abs-and-rel", "abs-or-rel", "abs", "rel", "psnr", "l2"]:
-                for predictor in ["cubic-interpolation-lorenzo", "linear-interpolation", "lorenzo-regression"]:
-                    if eb_mode in ["abs-and-rel", "abs-or-rel"]:
-                        for eb_abs in abs_err:
-                            for eb_rel in rel_err:
-                                serializer_space.append(AnyNumcodecsArrayBytesCodec(serializer(eb_mode=eb_mode, eb_abs=eb_abs, eb_rel=eb_rel, predictor=predictor)))
-                    elif eb_mode == "abs":
-                        for eb_abs in abs_err:
-                            serializer_space.append(AnyNumcodecsArrayBytesCodec(serializer(eb_mode=eb_mode, eb_abs=eb_abs, predictor=predictor)))
-                    elif eb_mode == "rel":
-                        for eb_rel in rel_err:
-                            serializer_space.append(AnyNumcodecsArrayBytesCodec(serializer(eb_mode=eb_mode, eb_rel=eb_rel, predictor=predictor)))
-                    elif eb_mode == "psnr":
-                        serializer_space.append(AnyNumcodecsArrayBytesCodec(serializer(eb_mode=eb_mode, eb_psnr=1.0, predictor=predictor)))
-                    elif eb_mode == "l2":
-                        for eb_l2 in l2:
-                            serializer_space.append(AnyNumcodecsArrayBytesCodec(serializer(eb_mode=eb_mode, eb_l2=eb_l2, predictor=predictor)))
 
     return list(zip(range(len(serializer_space)), serializer_space))
 
@@ -379,6 +346,16 @@ def valid_keepbits_for_bitround(xr_dataarray, step=1):
         return inclusive_range(1, 23, step)  # float32 mantissa is 23 bits
     else:
         raise TypeError(f"Unsupported dtype '{dtype}'. BitRound only supports float32 and float64.")
+
+
+def valid_digits_for_quantize(xr_dataarray, step=1):
+    dtype = xr_dataarray.dtype
+    if np.issubdtype(dtype, np.float64):
+        return inclusive_range(1, 15, step)  # ~15–16 significant digits for float64
+    elif np.issubdtype(dtype, np.float32):
+        return inclusive_range(1, 7, step)   # ~7 significant digits for float32
+    else:
+        raise TypeError(f"Unsupported dtype '{dtype}'. Quantize only supports float32 and float64.")
 
 
 def compute_fixed_precision_param(param: int) -> int:

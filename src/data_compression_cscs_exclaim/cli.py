@@ -156,11 +156,10 @@ def summarize_compression(netcdf_file: str, where_to_write: str,
         total_configs = len(configs_for_rank)
         for i, ((comp_idx, compressor), (filt_idx, filter), (ser_idx, serializer)) in enumerate(configs_for_rank):
             data_to_compress = da
-            if isinstance(serializer, AnyNumcodecsArrayBytesCodec) or isinstance(serializer, numcodecs.zarr3.ZFPY):
-                if isinstance(serializer, numcodecs.zarr3.ZFPY) or isinstance(serializer.codec, (Sperr, Sz3)):
-                    data_to_compress = da.stack(flat_dim=da.dims)
-                elif isinstance(serializer.codec, EBCCZarrFilter):
-                    data_to_compress = da.squeeze().astype("float32")
+            if isinstance(serializer, numcodecs.zarr3.ZFPY):
+                data_to_compress = da.stack(flat_dim=da.dims)
+            if isinstance(serializer, AnyNumcodecsArrayBytesCodec) and isinstance(serializer.codec, EBCCZarrFilter):
+                data_to_compress = da.squeeze().astype("float32")
 
             filters_ = [filter,]
             if isinstance(serializer, AnyNumcodecsArrayBytesCodec):
@@ -197,7 +196,7 @@ def summarize_compression(netcdf_file: str, where_to_write: str,
 
             except:
                 click.echo(f"Failed to compress with {compressor}, {filter}, {serializer} [Indices: {comp_idx}, {filt_idx}, {ser_idx}]")
-                # traceback.print_exc(file=sys.stderr)
+                traceback.print_exc(file=sys.stderr)
                 sys.exit(1)
 
             utils.progress_bar(i, total_configs, print_every=100)
@@ -270,11 +269,10 @@ def compress_with_optimal(netcdf_file, where_to_write, field_to_compress, comp_i
     optimal_filter = filters[filt_idx][1]
     optimal_serializer = serializers[ser_idx][1]
 
-    if isinstance(optimal_serializer, AnyNumcodecsArrayBytesCodec) or isinstance(optimal_serializer, numcodecs.zarr3.ZFPY):
-        if isinstance(optimal_serializer, numcodecs.zarr3.ZFPY) or isinstance(optimal_serializer.codec, (Sperr, Sz3)):
-            da = da.stack(flat_dim=da.dims)
-        elif isinstance(optimal_serializer.codec, EBCCZarrFilter):
-            da = da.squeeze().astype("float32")
+    if isinstance(optimal_serializer, numcodecs.zarr3.ZFPY):
+        da = da.stack(flat_dim=da.dims)
+    if isinstance(optimal_serializer, AnyNumcodecsArrayBytesCodec) and isinstance(optimal_serializer.codec, EBCCZarrFilter):
+        da = da.squeeze().astype("float32")
 
     compression_ratio, errors, euclidean_distance = utils.compress_with_zarr(
         da,
