@@ -58,9 +58,9 @@ def cli():
 @click.argument("where_to_write", type=click.Path(dir_okay=True, file_okay=False, exists=False))
 @click.option("--field-to-compress", default=None, help="Field to compress [if not given, all fields will be compressed].")
 @click.option("--field-percentage-to-compress", default=None, callback=utils.validate_percentage, help="Compress a percentage of the field [1-99%]. If not given, the whole field will be compressed.")
-@click.option("--compressor-class", default=None, help="Compressor Class to use, i.e. specified instead of the full list (can be None).")
-@click.option("--filter-class", default=None, help="Filter Class to use, i.e. specified instead of the full list (can be None).")
-@click.option("--serializer-class", default=None, help="Serializer Class to use, i.e. specified instead of the full list (can be None).")
+@click.option("--compressor-class", default=None, help="Compressor class to use, i.e. specified instead of the full list [`none` skips all compressors].")
+@click.option("--filter-class", default=None, help="Filter class to use, i.e. specified instead of the full list [`none` skips all filters].")
+@click.option("--serializer-class", default=None, help="Serializer class to use, i.e. specified instead of the full list [`none` skips all serializers].")
 def summarize_compression(netcdf_file: str, where_to_write: str, 
                           field_to_compress: str | None = None, field_percentage_to_compress: str | None = None, 
                           compressor_class: str | None = None, filter_class: str | None = None, serializer_class: str | None = None):
@@ -72,24 +72,22 @@ def summarize_compression(netcdf_file: str, where_to_write: str,
         where_to_write (str): Directory where the output files will be written.
         field_to_compress (str | None, optional): Name of the field to compress. If None, all fields will be compressed. Defaults to None.
         field_percentage_to_compress (str | None, optional): Percentage of the field to compress [1-99%]. If not given, the whole field will be compressed. Defaults to None.
-        compressor_class (str | None, optional): Compressor Class to use, i.e. specified instead of the full list (can be None).
-        filter_class (str | None, optional): Filter Class to use, i.e. specified instead of the full list (can be None).
-        serializer_class (str | None, optional): Serializer Class to use, i.e. specified instead of the full list (can be None).
+        compressor_class (str | None, optional): Compressor class to use, i.e. specified instead of the full list [`none` skips all compressors].
+        filter_class (str | None, optional): Filter class to use, i.e. specified instead of the full list [`none` skips all filters].
+        serializer_class (str | None, optional): Serializer class to use, i.e. specified instead of the full list [`none` skips all serializers].
     """
-    ## https://numcodecs.readthedocs.io/en/stable/zarr3.html#zarr-3-codecs
-    ## https://numcodecs-wasm.readthedocs.io/en/latest/
-    os.makedirs(where_to_write, exist_ok=True)
-
     dask.config.set(scheduler="single-threaded")
     dask.config.set(array__chunk_size="512MiB")
     comm = MPI.COMM_WORLD
     rank = comm.Get_rank()
     size = comm.Get_size()
 
+    os.makedirs(where_to_write, exist_ok=True) 
+
     if rank == 0:
         try:
             # Lookup table for valid thresholds
-            # https://docs.google.com/spreadsheets/d/1lHcX-HE2WpVCOeKyDvM4iFqjlWvkd14lJlA-CUoCxMM/edit?gid=0#gid=0
+            # https://docs.google.com/spreadsheets/d/1lHcX-HE2WpVCOeKyDvM4iFqjlWvkd14lJlA-CUoCxMM
             sheet_id = "1lHcX-HE2WpVCOeKyDvM4iFqjlWvkd14lJlA-CUoCxMM"
             sheet_url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv"
             thresholds = pd.read_csv(sheet_url)
@@ -109,7 +107,7 @@ def summarize_compression(netcdf_file: str, where_to_write: str,
         buffer = io.BytesIO(data_bytes)
         thresholds = pd.read_parquet(buffer)
 
-    # This is opened by all MPI processes
+    # This is opened by all MPI processes -lazy evaluation with Dask backend-
     ds = utils.open_netcdf(netcdf_file, field_to_compress, field_percentage_to_compress, rank=rank)
 
     for var in ds.data_vars:
@@ -117,7 +115,7 @@ def summarize_compression(netcdf_file: str, where_to_write: str,
             continue
         da = ds[var]
 
-        # TODO: fix this hack
+        # TODO: fix this UGLY hack
         lookup = var
         if var == "temp":
             lookup = "t"

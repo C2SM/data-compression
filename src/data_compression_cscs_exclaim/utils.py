@@ -54,7 +54,7 @@ _WITH_EBCC = os.getenv("WITH_EBCC", "true").lower() in ("1", "true", "yes")
 
 
 def open_netcdf(netcdf_file: str, field_to_compress: str | None = None, field_percentage_to_compress: float | None = None, rank: int = 0):
-    ds = xr.open_dataset(netcdf_file, chunks="auto")
+    ds = xr.open_dataset(netcdf_file, chunks="auto")  # auto for Dask backend
 
     if field_to_compress is not None and field_to_compress not in ds.data_vars:
         if rank == 0:
