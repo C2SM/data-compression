@@ -9,22 +9,16 @@
 import os
 import sys
 import io
-import inspect
 import traceback
 import click
 from tqdm import tqdm
 from pathlib import Path
-import zarr
 import shutil
 import itertools
+import zarr
 import numcodecs
 import numcodecs.zarr3
 from data_compression_cscs_exclaim import utils
-from numcodecs_combinators.stack import CodecStack
-from numcodecs_wasm_asinh import Asinh
-from numcodecs_wasm_bit_round import BitRound
-from numcodecs_wasm_linear_quantize import LinearQuantize
-from numcodecs_wasm_zlib import Zlib
 from zarr_any_numcodecs import AnyNumcodecsArrayArrayCodec, AnyNumcodecsArrayBytesCodec, AnyNumcodecsBytesBytesCodec
 from ebcc.zarr_filter import EBCCZarrFilter
 import pandas as pd
@@ -32,11 +26,8 @@ import numpy as np
 import matplotlib.pyplot as plt
 from sklearn.cluster import KMeans
 from sklearn.metrics import silhouette_score
-from numcodecs_wasm_pco import Pco
 from numcodecs_wasm_sperr import Sperr
 from numcodecs_wasm_sz3 import Sz3
-from numcodecs_wasm_zfp import Zfp
-from sklearn.preprocessing import StandardScaler
 from mpi4py import MPI
 import dask
 import plotly.io as pio
@@ -44,6 +35,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import subprocess
+
 import warnings
 warnings.filterwarnings(
     "ignore",
@@ -61,219 +53,41 @@ def cli():
     pass
 
 
-@cli.command("linear_quantization_zlib_compressors")
-@click.argument("netcdf_file", type=click.Path(exists=True, dir_okay=False))
-@click.argument("field_to_compress")
-@click.argument("parameters_file", type=click.Path(exists=True, dir_okay=False))
-def linear_quantization_zlib_compressors(
-    netcdf_file: str, field_to_compress: str, parameters_file: str
-):
-    ds = utils.open_netcdf(netcdf_file, field_to_compress)
-
-    linear_quantization_bits, zlib_level = utils.get_filter_parameters(
-        parameters_file, inspect.currentframe().f_code.co_name
-    )
-
-    utils.compress_with_zarr(ds[field_to_compress], netcdf_file, field_to_compress,
-        filters=[AnyNumcodecsArrayArrayCodec(LinearQuantize(bits=linear_quantization_bits, dtype=str(ds[field_to_compress].dtype)))],
-        compressors=[AnyNumcodecsBytesBytesCodec(Zlib(level=zlib_level))],
-    )
-
-
-@cli.command("bitround_zlib_compressors")
-@click.argument("netcdf_file", type=click.Path(exists=True, dir_okay=False))
-@click.argument("field_to_compress")
-@click.argument("parameters_file", type=click.Path(exists=True, dir_okay=False))
-def bitround_zlib_compressors(netcdf_file: str, field_to_compress: str, parameters_file: str):
-    ds = utils.open_netcdf(netcdf_file, field_to_compress)
-
-    bitround_bits, zlib_level = utils.get_filter_parameters(
-        parameters_file, inspect.currentframe().f_code.co_name
-    )
-
-    utils.compress_with_zarr(ds[field_to_compress], netcdf_file, field_to_compress,
-        filters=[AnyNumcodecsArrayArrayCodec(BitRound(keepbits=bitround_bits))],
-        compressors=[AnyNumcodecsBytesBytesCodec(Zlib(level=zlib_level))],
-    )
-
-
-@cli.command("zfp_asinh_compressors")
-@click.argument("netcdf_file", type=click.Path(exists=True, dir_okay=False))
-@click.argument("field_to_compress")
-@click.argument("parameters_file", type=click.Path(exists=True, dir_okay=False))
-def zfp_asinh_compressors(netcdf_file: str, field_to_compress: str, parameters_file: str):
-    ds = utils.open_netcdf(netcdf_file, field_to_compress)
-
-    asinh_linear_width, zfp_mode, zfp_tolerance = utils.get_filter_parameters(
-        parameters_file, inspect.currentframe().f_code.co_name
-    )
-
-    utils.compress_with_zarr(ds[field_to_compress], netcdf_file, field_to_compress,
-        filters=[AnyNumcodecsArrayArrayCodec(Asinh(linear_width=asinh_linear_width))],
-        compressors=None,
-        serializer=numcodecs.zarr3.ZFPY(tolerance=zfp_tolerance)
-    )
-
-
-@cli.command("sz3_eb_compressors")
-@click.argument("netcdf_file", type=click.Path(exists=True, dir_okay=False))
-@click.argument("field_to_compress")
-@click.argument("parameters_file", type=click.Path(exists=True, dir_okay=False))
-def sz3_eb_compressors(netcdf_file: str, field_to_compress: str, parameters_file: str):
-    ds = utils.open_netcdf(netcdf_file, field_to_compress)
-
-    sz3_eb_mode, sz3_eb_rel = utils.get_filter_parameters(
-        parameters_file, inspect.currentframe().f_code.co_name
-    )
-
-    sz3_ = Sz3(eb_mode=sz3_eb_mode, eb_rel=sz3_eb_rel)
-
-    utils.compress_with_zarr(ds[field_to_compress], netcdf_file, field_to_compress,
-        filters=None,
-        compressors=None,
-        serializer=AnyNumcodecsArrayBytesCodec(sz3_)
-    )
-
-
-@cli.command("ebcc")
-@click.argument("netcdf_file", type=click.Path(exists=True, dir_okay=False))
-@click.argument("field_to_compress")
-def ebcc(netcdf_file: str, field_to_compress: str):
-    from ebcc.filter_wrapper import EBCC_Filter
-    from ebcc.zarr_filter import EBCCZarrFilter
-    
-    ds = utils.open_netcdf(netcdf_file, field_to_compress)
-    da = ds[field_to_compress].squeeze().astype("float32")
-
-    atol = 1e-2
-    ebcc_filter = EBCC_Filter(
-            base_cr=2, 
-            height=da.shape[0],
-            width=da.shape[1],
-            residual_opt=("max_error_target", atol)
-        )
-    zarr_filter = EBCCZarrFilter(ebcc_filter.hdf_filter_opts)
-
-    utils.compress_with_zarr(da, netcdf_file, field_to_compress,
-        filters=None,
-        compressors=None,
-        serializer=AnyNumcodecsArrayBytesCodec(zarr_filter),
-    )
-
-
-@cli.command("compress_with_optimal")
-@click.argument("netcdf_file", type=click.Path(exists=True, dir_okay=False))
-@click.argument("where_to_write", type=click.Path(dir_okay=True, file_okay=False, exists=False))
-@click.argument("field_to_compress")
-@click.argument("comp_idx", type=int)
-@click.argument("filt_idx", type=int)
-@click.argument("ser_idx", type=int)
-def compress_with_optimal(netcdf_file, where_to_write, field_to_compress, comp_idx, filt_idx, ser_idx):
-    os.makedirs(where_to_write, exist_ok=True)
-
-    ds = utils.open_netcdf(netcdf_file, field_to_compress)
-    da = ds[field_to_compress]
-
-    compressors = utils.compressor_space(da)
-    filters = utils.filter_space(da)
-    serializers = utils.serializer_space(da)
-
-    optimal_compressor = compressors[comp_idx][1]
-    optimal_filter = filters[filt_idx][1]
-    optimal_serializer = serializers[ser_idx][1]
-    
-    if isinstance(optimal_serializer, AnyNumcodecsArrayBytesCodec):
-        if isinstance(optimal_serializer.codec, (Pco, Sperr, Sz3, Zfp)):
-            da = da.stack(flat_dim=da.dims)
-        elif isinstance(optimal_serializer.codec, EBCCZarrFilter):
-            da = da.squeeze().astype("float32")
-
-    compression_ratio, errors, dwt_dist = utils.compress_with_zarr(
-        da,
-        netcdf_file,
-        field_to_compress,
-        where_to_write,
-        filters=None if isinstance(optimal_serializer, AnyNumcodecsArrayBytesCodec) else [optimal_filter,],  # TODO: fix (?) filter stacking with EBCC & numcodecs-wasm serializers
-        compressors=[optimal_compressor,],
-        serializer=optimal_serializer,
-        verbose=False,
-    )
-
-    click.echo(f" | {(optimal_compressor, optimal_filter, optimal_serializer)} | --> Ratio: {compression_ratio:.3f} | Error: {errors['Relative_Error_L1']:.3e} | DWT: {dwt_dist:.3e}")
-
-
-@cli.command("merge_compressed_fields")
-@click.argument("netcdf_file", type=click.Path(exists=True, dir_okay=False))
-def merge_compressed_fields(netcdf_file: str):
-    comm = MPI.COMM_WORLD
-    rank = comm.Get_rank()
-    size = comm.Get_size()
-    if size > 1:
-        if rank == 0:
-            click.echo("This command is not meant to be run in parallel. Please run it with a single process.")
-        sys.exit(1)
-
-    # populate this folder with the compressed fields
-    merged_folder = f"{netcdf_file}.zarr"
-    if Path(merged_folder).exists():
-        shutil.rmtree(merged_folder)
-    os.makedirs(merged_folder)
-
-    for var in utils.open_netcdf(netcdf_file).data_vars:
-        compressed_field = f"{netcdf_file}.=.field_{var}.=.rank_{rank}.zarr.zip"
-        if not Path(compressed_field).exists():
-            click.echo("All fields must be compressed first.")
-            sys.exit(1)
-        extract_to = utils.unzip_file(compressed_field)
-        utils.copy_folder_contents(extract_to, merged_folder)
-        shutil.rmtree(extract_to)
-
-    zipped_merged_folder = merged_folder + ".zip"
-    if Path(zipped_merged_folder).exists():
-        os.remove(zipped_merged_folder)
-    shutil.make_archive(merged_folder, 'zip', merged_folder)
-
-    if Path(merged_folder).exists():
-        shutil.rmtree(merged_folder)
-
-
-@cli.command("open_zarr_file_and_inspect")
-@click.argument("zarr_file", type=click.Path(exists=True, dir_okay=False))
-def open_zarr_file_and_inspect(zarr_file: str):
-    zarr_group, store = utils.open_zarr_zipstore(zarr_file)
-
-    click.echo(zarr_group.tree())
-
-    click.echo(80* "-")
-    for array_name in zarr_group.array_keys():
-        click.echo(f"Array: {array_name}")
-        click.echo(zarr_group[array_name].info_complete())
-        click.echo(zarr_group[array_name][:])
-        click.echo(80* "-")
-
-    store.close()
-
-
 @cli.command("summarize_compression")
 @click.argument("netcdf_file", type=click.Path(exists=True, dir_okay=False))
 @click.argument("where_to_write", type=click.Path(dir_okay=True, file_okay=False, exists=False))
 @click.option("--field-to-compress", default=None, help="Field to compress [if not given, all fields will be compressed].")
 @click.option("--field-percentage-to-compress", default=None, callback=utils.validate_percentage, help="Compress a percentage of the field [1-99%]. If not given, the whole field will be compressed.")
-def summarize_compression(netcdf_file: str, where_to_write: str, field_to_compress: str | None = None, field_percentage_to_compress: str | None = None):
-    ## https://numcodecs.readthedocs.io/en/stable/zarr3.html#zarr-3-codecs
-    ## https://numcodecs-wasm.readthedocs.io/en/latest/
-    os.makedirs(where_to_write, exist_ok=True)
+@click.option("--compressor-class", default=None, help="Compressor class to use, i.e. specified instead of the full list [`none` skips all compressors].")
+@click.option("--filter-class", default=None, help="Filter class to use, i.e. specified instead of the full list [`none` skips all filters].")
+@click.option("--serializer-class", default=None, help="Serializer class to use, i.e. specified instead of the full list [`none` skips all serializers].")
+def summarize_compression(netcdf_file: str, where_to_write: str, 
+                          field_to_compress: str | None = None, field_percentage_to_compress: str | None = None, 
+                          compressor_class: str | None = None, filter_class: str | None = None, serializer_class: str | None = None):
+    """
+    Loop over combinations of compressors, filters, and serializers to find the optimal configuration for compressing a given field in a NetCDF file.
 
+    Args:
+        netcdf_file (str): Path to the input NetCDF file.
+        where_to_write (str): Directory where the output files will be written.
+        field_to_compress (str | None, optional): Name of the field to compress. If None, all fields will be compressed. Defaults to None.
+        field_percentage_to_compress (str | None, optional): Percentage of the field to compress [1-99%]. If not given, the whole field will be compressed. Defaults to None.
+        compressor_class (str | None, optional): Compressor class to use, i.e. specified instead of the full list [`none` skips all compressors].
+        filter_class (str | None, optional): Filter class to use, i.e. specified instead of the full list [`none` skips all filters].
+        serializer_class (str | None, optional): Serializer class to use, i.e. specified instead of the full list [`none` skips all serializers].
+    """
     dask.config.set(scheduler="single-threaded")
     dask.config.set(array__chunk_size="512MiB")
     comm = MPI.COMM_WORLD
     rank = comm.Get_rank()
     size = comm.Get_size()
 
+    os.makedirs(where_to_write, exist_ok=True) 
+
     if rank == 0:
         try:
             # Lookup table for valid thresholds
-            # https://docs.google.com/spreadsheets/d/1lHcX-HE2WpVCOeKyDvM4iFqjlWvkd14lJlA-CUoCxMM/edit?gid=0#gid=0
+            # https://docs.google.com/spreadsheets/d/1lHcX-HE2WpVCOeKyDvM4iFqjlWvkd14lJlA-CUoCxMM
             sheet_id = "1lHcX-HE2WpVCOeKyDvM4iFqjlWvkd14lJlA-CUoCxMM"
             sheet_url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv"
             thresholds = pd.read_csv(sheet_url)
@@ -293,7 +107,7 @@ def summarize_compression(netcdf_file: str, where_to_write: str, field_to_compre
         buffer = io.BytesIO(data_bytes)
         thresholds = pd.read_parquet(buffer)
 
-    # This is opened by all MPI processes
+    # This is opened by all MPI processes -lazy evaluation with Dask backend-
     ds = utils.open_netcdf(netcdf_file, field_to_compress, field_percentage_to_compress, rank=rank)
 
     for var in ds.data_vars:
@@ -301,7 +115,7 @@ def summarize_compression(netcdf_file: str, where_to_write: str, field_to_compre
             continue
         da = ds[var]
 
-        # TODO: fix this hack
+        # TODO: fix this UGLY hack
         lookup = var
         if var == "temp":
             lookup = "t"
@@ -319,9 +133,9 @@ def summarize_compression(netcdf_file: str, where_to_write: str, field_to_compre
             slices = {dim: slice(0, max(1, int(size * (field_percentage_to_compress / 100)))) for dim, size in da.sizes.items()}
             da = da.isel(**slices)
 
-        compressors = utils.compressor_space(da)
-        filters = utils.filter_space(da)
-        serializers = utils.serializer_space(da)
+        compressors = utils.compressor_space(da, compressor_class)
+        filters = utils.filter_space(da, filter_class)
+        serializers = utils.serializer_space(da, serializer_class)
 
         num_compressors = len(compressors)
         num_filters = len(filters)
@@ -329,7 +143,7 @@ def summarize_compression(netcdf_file: str, where_to_write: str, field_to_compre
 
         num_loops = num_compressors * num_filters * num_serializers
         if rank == 0:
-            click.echo(f"Number of loops: {num_loops} ({num_compressors} compressors, {num_filters} filters, {num_serializers} serializers) -divided across multiple processes-")
+            click.echo(f"Number of loops: {num_loops} ({num_compressors} compressors, {num_filters} filters, {num_serializers} serializers) -divided across {size} MPI task(s)-")
 
         config_space = list(itertools.product(compressors, filters, serializers))
         configs_for_rank = config_space[rank::size]
@@ -340,21 +154,26 @@ def summarize_compression(netcdf_file: str, where_to_write: str, field_to_compre
         total_configs = len(configs_for_rank)
         for i, ((comp_idx, compressor), (filt_idx, filter), (ser_idx, serializer)) in enumerate(configs_for_rank):
             data_to_compress = da
+            if isinstance(serializer, numcodecs.zarr3.ZFPY):
+                data_to_compress = da.stack(flat_dim=da.dims)
+            if isinstance(serializer, AnyNumcodecsArrayBytesCodec) and isinstance(serializer.codec, EBCCZarrFilter):
+                data_to_compress = da.squeeze().astype("float32")
+
+            filters_ = [filter,]
             if isinstance(serializer, AnyNumcodecsArrayBytesCodec):
-                if isinstance(serializer.codec, (Pco, Sperr, Sz3, Zfp)):
-                    data_to_compress = da.stack(flat_dim=da.dims)
-                elif isinstance(serializer.codec, EBCCZarrFilter):
-                    data_to_compress = da.squeeze().astype("float32")
+                filters_ = None  # TODO: fix (?) filter stacking with EBCC & numcodecs-wasm serializers
+            if filter is None:
+                filters_ = None
 
             try:
-                compression_ratio, errors, dwt_dist = utils.compress_with_zarr(
+                compression_ratio, errors, euclidean_distance = utils.compress_with_zarr(
                     data_to_compress,
                     netcdf_file,
                     var,
                     where_to_write,
-                    filters=None if isinstance(serializer, AnyNumcodecsArrayBytesCodec) else [filter,],  # TODO: fix (?) filter stacking with EBCC & numcodecs-wasm serializers
-                    compressors=[compressor,],
-                    serializer=serializer,
+                    filters=filters_,
+                    compressors=[compressor,] if compressor is not None else None,
+                    serializer=serializer if serializer is not None else "auto",
                     verbose=False,
                     rank=rank,
                 )
@@ -362,24 +181,23 @@ def summarize_compression(netcdf_file: str, where_to_write: str, field_to_compre
                 l1_error_rel = errors["Relative_Error_L1"]
                 l2_error_rel = errors["Relative_Error_L2"]
                 linf_error_rel = errors["Relative_Error_Linf"]
-                raw_values_explicit.append((compression_ratio, l1_error_rel, l2_error_rel, linf_error_rel, dwt_dist))
+                raw_values_explicit.append((compression_ratio, l1_error_rel, l2_error_rel, linf_error_rel, euclidean_distance))
 
                 # TODO: refine criteria based on the thersholds table
                 if existing_l1_error:
                     if l1_error_rel <= existing_l1_error:
-                        results.append(((str(compressor), str(filter), str(serializer), comp_idx, filt_idx, ser_idx), compression_ratio, l1_error_rel, dwt_dist))
-                        raw_values_explicit_with_names.append((compression_ratio, l1_error_rel, l2_error_rel, linf_error_rel, dwt_dist, str(compressor), str(filter), str(serializer)))
+                        results.append(((str(compressor), str(filter), str(serializer), comp_idx, filt_idx, ser_idx), compression_ratio, l1_error_rel, euclidean_distance))
+                        raw_values_explicit_with_names.append((compression_ratio, l1_error_rel, l2_error_rel, linf_error_rel, euclidean_distance, str(compressor), str(filter), str(serializer)))
                 else:
-                    results.append(((str(compressor), str(filter), str(serializer), comp_idx, filt_idx, ser_idx), compression_ratio, l1_error_rel, dwt_dist))
-                    raw_values_explicit_with_names.append((compression_ratio, l1_error_rel, l2_error_rel, linf_error_rel, dwt_dist, str(compressor), str(filter), str(serializer)))
+                    results.append(((str(compressor), str(filter), str(serializer), comp_idx, filt_idx, ser_idx), compression_ratio, l1_error_rel, euclidean_distance))
+                    raw_values_explicit_with_names.append((compression_ratio, l1_error_rel, l2_error_rel, linf_error_rel, euclidean_distance, str(compressor), str(filter), str(serializer)))
 
             except:
-                if rank == 0:
-                    click.echo(f"Failed to compress with {compressor}, {filter}, {serializer} [Indices: {comp_idx}, {filt_idx}, {ser_idx}]")
-                    traceback.print_exc(file=sys.stderr)
+                click.echo(f"Failed to compress with {compressor}, {filter}, {serializer} [Indices: {comp_idx}, {filt_idx}, {ser_idx}]")
+                traceback.print_exc(file=sys.stderr)
                 sys.exit(1)
 
-            utils.progress_bar(rank, i, total_configs, print_every=100)
+            utils.progress_bar(i, total_configs, print_every=100)
 
         results_gather = comm.gather(results, root=0)
         raw_values_explicit_gather = comm.gather(raw_values_explicit, root=0)
@@ -397,8 +215,143 @@ def summarize_compression(netcdf_file: str, where_to_write: str, field_to_compre
             np.save(os.path.basename(netcdf_file) + '_scored_results_with_names.npy', np.asarray(pd.DataFrame(raw_values_explicit_with_names_gather)))
 
             best_combo = max(results_gather, key=lambda x: x[1])
-            click.echo("Best combo (valid threshold & max CR):")
-            click.echo(f" | {best_combo[0]} | --> Ratio: {best_combo[1]:.3f} | Error: {best_combo[2]:.3e} | DWT: {best_combo[3]:.3e}")
+            msg = (
+                "optimal combo: \n"
+                f"compressor : {best_combo[0][0]}\nfilter     : {best_combo[0][1]}\nserializer : {best_combo[0][2]}\n"
+                "corresponding indices in lists of instantiated objects:\n"
+                f"compressor : {best_combo[0][3]}\nfilter     : {best_combo[0][4]}\nserializer : {best_combo[0][5]}\n"
+                f"Compression Ratio: {best_combo[1]:.3f} | Relative L1 Error: {best_combo[2]:.3e} | Euclidean Distance: {best_combo[3]:.3e}"
+            )
+            click.echo(msg)
+
+
+@cli.command("compress_with_optimal")
+@click.argument("netcdf_file", type=click.Path(exists=True, dir_okay=False))
+@click.argument("where_to_write", type=click.Path(dir_okay=True, file_okay=False, exists=False))
+@click.argument("field_to_compress")
+@click.argument("comp_idx", type=int)
+@click.argument("filt_idx", type=int)
+@click.argument("ser_idx", type=int)
+def compress_with_optimal(netcdf_file, where_to_write, field_to_compress, comp_idx, filt_idx, ser_idx):
+    """
+    Compress a field with the optimal combination of 
+    compressor, filter, and serializer as generated by the summarize_compression command.
+
+    \b
+    Args:
+        netcdf_file (str): Path to the input NetCDF file.
+        where_to_write (str): Directory where the compressed output will be written.
+        field_to_compress (str): Name of the field to compress.
+        comp_idx (int): Index of the compressor to use.
+        filt_idx (int): Index of the filter to use.
+        ser_idx (int): Index of the serializer to use.
+    """
+    comm = MPI.COMM_WORLD
+    rank = comm.Get_rank()
+    size = comm.Get_size()
+    if size > 1:
+        if rank == 0:
+            click.echo("This command is not meant to be run in parallel. Please run it with a single process.")
+        sys.exit(1)
+
+    os.makedirs(where_to_write, exist_ok=True)
+
+    ds = utils.open_netcdf(netcdf_file, field_to_compress)
+    da = ds[field_to_compress]
+
+    compressors = utils.compressor_space(da)
+    filters = utils.filter_space(da)
+    serializers = utils.serializer_space(da)
+
+    optimal_compressor = compressors[comp_idx][1]
+    optimal_filter = filters[filt_idx][1]
+    optimal_serializer = serializers[ser_idx][1]
+
+    if isinstance(optimal_serializer, numcodecs.zarr3.ZFPY):
+        da = da.stack(flat_dim=da.dims)
+    if isinstance(optimal_serializer, AnyNumcodecsArrayBytesCodec) and isinstance(optimal_serializer.codec, EBCCZarrFilter):
+        da = da.squeeze().astype("float32")
+
+    compression_ratio, errors, euclidean_distance = utils.compress_with_zarr(
+        da,
+        netcdf_file,
+        field_to_compress,
+        where_to_write,
+        filters=None if isinstance(optimal_serializer, AnyNumcodecsArrayBytesCodec) else [optimal_filter,],  # TODO: fix (?) filter stacking with EBCC & numcodecs-wasm serializers
+        compressors=[optimal_compressor,],
+        serializer=optimal_serializer,
+        verbose=False,
+    )
+
+    click.echo(f" | {(optimal_compressor, optimal_filter, optimal_serializer)} | --> Ratio: {compression_ratio:.3f} | Error: {errors['Relative_Error_L1']:.3e} | Euclidean Distance: {euclidean_distance:.3e}")
+
+
+@cli.command("merge_compressed_fields")
+@click.argument("netcdf_file", type=click.Path(exists=True, dir_okay=False))
+@click.argument("compressed_files_location", type=click.Path(dir_okay=True, file_okay=False, exists=False))
+def merge_compressed_fields(netcdf_file: str, compressed_files_location: str):
+    """
+    Once all fields have been compressed, this command merges them into a single Zarr Zipped file.
+
+    \b
+    Args:
+        netcdf_file (str): Path to the input NetCDF file.
+        compressed_files_location (str): Directory where the compressed files are located.
+    """
+    comm = MPI.COMM_WORLD
+    rank = comm.Get_rank()
+    size = comm.Get_size()
+    if size > 1:
+        if rank == 0:
+            click.echo("This command is not meant to be run in parallel. Please run it with a single process.")
+        sys.exit(1)
+
+    # populate this folder with the compressed fields
+    netcdf_filename = Path(netcdf_file).name
+    merged_folder = Path(compressed_files_location) / f"{netcdf_filename}.zarr"
+    if Path(merged_folder).exists():
+        shutil.rmtree(merged_folder)
+    os.makedirs(merged_folder)
+
+    for var in utils.open_netcdf(netcdf_file).data_vars:
+        compressed_field = f"{Path(compressed_files_location) / netcdf_filename}.=.field_{var}.=.rank_{rank}.zarr.zip"
+        if not Path(compressed_field).exists():
+            click.echo("All fields must be compressed first.")
+            sys.exit(1)
+        extract_to = utils.unzip_file(compressed_field)
+        utils.copy_folder_contents(extract_to, merged_folder)
+        shutil.rmtree(extract_to)
+
+    zipped_merged_folder = str(merged_folder) + ".zip"
+    if Path(zipped_merged_folder).exists():
+        os.remove(zipped_merged_folder)
+    shutil.make_archive(merged_folder, 'zip', merged_folder)
+
+    if Path(merged_folder).exists():
+        shutil.rmtree(merged_folder)
+
+
+@cli.command("open_zarr_file_and_inspect")
+@click.argument("zarr_file", type=click.Path(exists=True, dir_okay=False))
+def open_zarr_file_and_inspect(zarr_file: str):
+    """
+    Open a Zarr file and inspect its contents.
+
+    Args:
+        zarr_file (str): Path to the Zarr file.
+    """
+    zarr_group, store = utils.open_zarr_zipstore(zarr_file)
+
+    click.echo(zarr_group.tree())
+
+    click.echo(80* "-")
+    for array_name in zarr_group.array_keys():
+        click.echo(f"Array: {array_name}")
+        click.echo(zarr_group[array_name].info_complete())
+        click.echo(zarr_group[array_name][:])
+        click.echo(80* "-")
+
+    store.close()
 
 
 @cli.command("perform_clustering")
@@ -438,6 +391,7 @@ def perform_clustering(npy_file: str):
     plt.title('Silhouette Score for Optimal k')
     plt.tight_layout()
     plt.show()
+
 
 @cli.command("analyze_clustering")
 @click.argument("npy_file", type=click.Path(exists=True, dir_okay=False))
@@ -585,6 +539,7 @@ def analyze_clustering(npy_file: str):
     pio.renderers.default = "browser"
     fig.show()
 
+
 @cli.command("run_web_ui")
 @click.option("--user_account", type=str, default="", help="Santis user account name")
 @click.option("--uploaded_file", type=str, default="", help="Upload file from santis")
@@ -598,6 +553,7 @@ def run_web_ui(user_account: str = None, uploaded_file: str = "", time: str = ""
         "--uploaded_file", uploaded_file, "--time", time, "--nodes", nodes, "--ntasks-per-node", ntasks_per_node
     ]
     subprocess.run(cmd_web_ui)
+
 
 @cli.command("help")
 @click.pass_context

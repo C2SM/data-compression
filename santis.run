@@ -13,7 +13,7 @@
 source venv/bin/activate
 
 # ("1", "true", "yes") -> any other value is treated as "false"
-export WITH_NUMCODECS_WASM=no
+export WITH_NUMCODECS_WASM=yes
 export WITH_EBCC=no
 
 srun data_compression_cscs_exclaim \
