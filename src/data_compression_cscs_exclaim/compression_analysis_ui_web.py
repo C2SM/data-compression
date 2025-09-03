@@ -31,7 +31,7 @@ def parse_args():
     parser.add_argument('--verbose', action='store_true')
     parser.add_argument('--user_account', type=str, default=None)
     parser.add_argument('--uploaded_file', type=str, default=None)
-    parser.add_argument('--time', type=str, default=None)
+    parser.add_argument('--t', type=str, default=None)
     parser.add_argument('--nodes', type=str, default=None)
     parser.add_argument('--ntasks-per-node', type=str, default=None)
     return parser.parse_args()
@@ -250,7 +250,7 @@ if uploaded_file is not None and uploaded_file.name.endswith(".nc"):
             cmd_compress = [
                 "srun",
                 "-A", parse_args().user_account,
-                "--time", parse_args().time,
+                "--time", parse_args().t,
                 "--nodes", parse_args().nodes,
                 "--ntasks-per-node", parse_args().ntasks_per_node,
                 "--uenv=prgenv-gnu/25.06:rc5",
@@ -338,19 +338,27 @@ if uploaded_file is not None and uploaded_file.name.endswith(".nc"):
     ser_idx = st.number_input('ser_idx', min_value=0, max_value=193, value=10)
 
     if st.button("Compress file"):
-        destination_dir = os.getcwd() + "/netCDF_files/"
-        temp_dir = os.path.dirname(path_to_modified_file)
 
         if "santis" in where_am_i.stdout.strip():
+            temp_dir = os.getcwd()
             cmd_compress = [
+                "srun",
+                "-A", parse_args().user_account,
+                "--time", parse_args().t,
+                "--nodes", parse_args().nodes,
+                "--ntasks-per-node", parse_args().ntasks_per_node,
+                "--uenv=prgenv-gnu/25.06:rc5",
+                "--view=default",
+                "--partition=debug",
                 "data_compression_cscs_exclaim",
                 "compress_with_optimal",
                 path_to_modified_file,
-                temp_dir,
+                os.getcwd(),
                 field_to_compress,
                 str(comp_idx), str(filt_idx), str(ser_idx)
             ]
         else:
+            temp_dir = os.path.dirname(path_to_modified_file)
             cmd_compress = [
                 "mpirun",
                 "-n",
@@ -368,10 +376,10 @@ if uploaded_file is not None and uploaded_file.name.endswith(".nc"):
         status.info("Compressing file...")
         subprocess.run(cmd_compress)
         status.empty()
-        st.success(f"Compression completed successfully. File saved in {destination_dir}")
+        st.success(f"Compression completed successfully. File saved in {temp_dir}")
         after = set(os.listdir(temp_dir))
         output_file_path = os.path.join(temp_dir, list(after - before)[0])
-        dest_path = os.path.join(destination_dir, list(after - before)[0])
+        dest_path = os.path.join(temp_dir, list(after - before)[0])
         shutil.copy(output_file_path, dest_path)
 
         split_tmp_name = os.path.basename(output_file_path).split(".=.", 1)
