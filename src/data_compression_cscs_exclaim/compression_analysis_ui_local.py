@@ -337,34 +337,16 @@ class CompressionAnalysisUI(QMainWindow):
             path_to_modified_file = tmp.name
             ds.to_netcdf(path_to_modified_file)
 
-        where_am_i = subprocess.run(["uname", "-a"], capture_output=True, text=True)
-        if "santis" in where_am_i.stdout.strip():
-            cmd = [
-                "srun",
-                "-A", "d75",
-                "-t", "00:15:00",
-                "-N", "1",
-                "-n", "128",
-                "--uenv=prgenv-gnu/25.06:rc5",
-                "--view=default",
-                "--partition=debug",
-                "data_compression_cscs_exclaim",
-                "summarize_compression",
-                self.modified_file_path,
-                os.getcwd(),
-                "--field-to-compress=" + selected_var
-            ]
-        else:
-            cmd = [
-                "mpirun",
-                "-n",
-                "8",
-                "data_compression_cscs_exclaim",
-                "summarize_compression",
-                self.modified_file_path,
-                os.getcwd(),
-                "--field-to-compress="+selected_var
-            ]
+        cmd = [
+            "mpirun",
+            "-n",
+            "8",
+            "data_compression_cscs_exclaim",
+            "summarize_compression",
+            self.modified_file_path,
+            os.getcwd(),
+            "--field-to-compress="+selected_var
+        ]
 
         self.thread = CompressorThread(cmd)
         self.thread.progress.connect(self.update_progress)

@@ -38,7 +38,8 @@ def parse_args():
 
 st.title("Upload a file and evaluate compressors")
 
-if len(parse_args().uploaded_file) == 0:
+
+if parse_args().uploaded_file is None:
     uploaded_file = st.file_uploader("Choose a netcdf file")
 else:
     uploaded_file = open(parse_args().uploaded_file, "rb")

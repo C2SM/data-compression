@@ -64,9 +64,12 @@ if launched from santis, make sure to ssh correctly:
 ssh -L 8501:localhost:8501 santis
 ```
 ```
-data_compression_cscs_exclaim run_web_ui --user_account "d75" --uploaded_file "./netCDF_files/tigge_pl_t_q_dx=2_2024_08_02.nc" --t "00:15:00" --nodes "1" --ntasks-per-node "72"
+data_compression_cscs_exclaim run_web_ui_santis --user_account "d75" --uploaded_file "./netCDF_files/tigge_pl_t_q_dx=2_2024_08_02.nc" --t "00:15:00" --nodes "1" --ntasks-per-node "72"
 ```
-A local version is also available:
+Local web-versions and non are also available:
+```
+data_compression_cscs_exclaim run_local_ui
+```
 ````
-python ./src/data_compression_cscs_exclaim/compression_analysis_ui_local.py
+ data_compression_cscs_exclaim run_web_ui
 ````
