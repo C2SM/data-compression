@@ -159,7 +159,7 @@ def compute_errors_distances(da_compressed, da):
     return "\n".join(f"{k:20s}: {v}" for k, v in errors_.items()), errors, euclidean_distance, normalized_euclidean_distance
 
 
-def compressor_space(da, compressor_class):
+def compressor_space(da, compressor_class=None):
     # https://numcodecs.readthedocs.io/en/stable/zarr3.html#compressors-bytes-to-bytes-codecs
 
     compressor_space = []
@@ -201,7 +201,7 @@ def compressor_space(da, compressor_class):
     return list(zip(range(len(compressor_space)), compressor_space))
 
 
-def filter_space(da, filter_class):
+def filter_space(da, filter_class=None):
     # https://numcodecs.readthedocs.io/en/stable/zarr3.html#filters-array-to-array-codecs
     # https://numcodecs-wasm.readthedocs.io/en/latest/
 
@@ -267,7 +267,7 @@ def filter_space(da, filter_class):
     return list(zip(range(len(filter_space)), filter_space))
 
 
-def serializer_space(da, serializer_class):
+def serializer_space(da, serializer_class=None):
     # https://numcodecs.readthedocs.io/en/stable/zarr3.html#serializers-array-to-bytes-codecs
     # https://numcodecs-wasm.readthedocs.io/en/latest/
     is_int = (da.dtype.kind == "i")
