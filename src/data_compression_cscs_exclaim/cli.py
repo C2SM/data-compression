@@ -67,6 +67,11 @@ def summarize_compression(netcdf_file: str, where_to_write: str,
     """
     Loop over combinations of compressors, filters, and serializers to find the optimal configuration for compressing a given field in a NetCDF file.
 
+    List of compressors : Blosc, LZ4, Zstd, Zlib, GZip, BZ2, LZMA \n
+    List of filters     : Delta, BitRound, Quantize, Asinh, FixedOffsetScale \n
+    List of serializers : PCodec, ZFPY, EBCCZarrFilter, Zfp, Sperr, Sz3
+
+    \b
     Args:
         netcdf_file (str): Path to the input NetCDF file.
         where_to_write (str): Directory where the output files will be written.
@@ -152,18 +157,21 @@ def summarize_compression(netcdf_file: str, where_to_write: str,
         raw_values_explicit = []
         raw_values_explicit_with_names = []
         total_configs = len(configs_for_rank)
-        for i, ((comp_idx, compressor), (filt_idx, filter), (ser_idx, serializer)) in enumerate(configs_for_rank):
+        for i, ((comp_idx, compressor), (filt_idx, filt), (ser_idx, serializer)) in enumerate(configs_for_rank):
             data_to_compress = da
             if isinstance(serializer, numcodecs.zarr3.ZFPY):
                 data_to_compress = da.stack(flat_dim=da.dims)
             if isinstance(serializer, AnyNumcodecsArrayBytesCodec) and isinstance(serializer.codec, EBCCZarrFilter):
                 data_to_compress = da.squeeze().astype("float32")
 
-            filters_ = [filter,]
+            filters_ = [filt,]
             if isinstance(serializer, AnyNumcodecsArrayBytesCodec):
                 filters_ = None  # TODO: fix (?) filter stacking with EBCC & numcodecs-wasm serializers
-            if filter is None:
+            if filt is None:
                 filters_ = None
+            if filters_ is None:
+                filt = None
+                filt_idx = -1
 
             try:
                 compression_ratio, errors, euclidean_distance = utils.compress_with_zarr(
@@ -186,14 +194,14 @@ def summarize_compression(netcdf_file: str, where_to_write: str,
                 # TODO: refine criteria based on the thersholds table
                 if existing_l1_error:
                     if l1_error_rel <= existing_l1_error:
-                        results.append(((str(compressor), str(filter), str(serializer), comp_idx, filt_idx, ser_idx), compression_ratio, l1_error_rel, euclidean_distance))
-                        raw_values_explicit_with_names.append((compression_ratio, l1_error_rel, l2_error_rel, linf_error_rel, euclidean_distance, str(compressor), str(filter), str(serializer)))
+                        results.append(((str(compressor), str(filt), str(serializer), comp_idx, filt_idx, ser_idx), compression_ratio, l1_error_rel, euclidean_distance))
+                        raw_values_explicit_with_names.append((compression_ratio, l1_error_rel, l2_error_rel, linf_error_rel, euclidean_distance, str(compressor), str(filt), str(serializer)))
                 else:
-                    results.append(((str(compressor), str(filter), str(serializer), comp_idx, filt_idx, ser_idx), compression_ratio, l1_error_rel, euclidean_distance))
-                    raw_values_explicit_with_names.append((compression_ratio, l1_error_rel, l2_error_rel, linf_error_rel, euclidean_distance, str(compressor), str(filter), str(serializer)))
+                    results.append(((str(compressor), str(filt), str(serializer), comp_idx, filt_idx, ser_idx), compression_ratio, l1_error_rel, euclidean_distance))
+                    raw_values_explicit_with_names.append((compression_ratio, l1_error_rel, l2_error_rel, linf_error_rel, euclidean_distance, str(compressor), str(filt), str(serializer)))
 
             except:
-                click.echo(f"Failed to compress with {compressor}, {filter}, {serializer} [Indices: {comp_idx}, {filt_idx}, {ser_idx}]")
+                click.echo(f"Failed to compress with {compressor}, {filt}, {serializer} [Indices: {comp_idx}, {filt_idx}, {ser_idx}]")
                 traceback.print_exc(file=sys.stderr)
                 sys.exit(1)
 
@@ -263,9 +271,9 @@ def compress_with_optimal(netcdf_file, where_to_write, field_to_compress, comp_i
     filters = utils.filter_space(da)
     serializers = utils.serializer_space(da)
 
-    optimal_compressor = compressors[comp_idx][1]
-    optimal_filter = filters[filt_idx][1]
-    optimal_serializer = serializers[ser_idx][1]
+    optimal_compressor = compressors[comp_idx][1] if 0 <= comp_idx < len(compressors) else None
+    optimal_filter = filters[filt_idx][1] if 0 <= filt_idx < len(filters) else None
+    optimal_serializer = serializers[ser_idx][1] if 0 <= ser_idx < len(serializers) else None
 
     if isinstance(optimal_serializer, numcodecs.zarr3.ZFPY):
         da = da.stack(flat_dim=da.dims)
@@ -337,6 +345,7 @@ def open_zarr_file_and_inspect(zarr_file: str):
     """
     Open a Zarr file and inspect its contents.
 
+    \b
     Args:
         zarr_file (str): Path to the Zarr file.
     """

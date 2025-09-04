@@ -15,6 +15,7 @@ source venv/bin/activate
 # ("1", "true", "yes") -> any other value is treated as "false"
 export WITH_NUMCODECS_WASM=yes
 export WITH_EBCC=no
+export WITH_LOSSY=yes
 
 srun data_compression_cscs_exclaim \
      summarize_compression \

@@ -52,6 +52,8 @@ from numcodecs_wasm_zfp import Zfp
 _WITH_NUMCODECS_WASM = os.getenv("WITH_NUMCODECS_WASM", "true").lower() in ("1", "true", "yes")
 _WITH_EBCC = os.getenv("WITH_EBCC", "true").lower() in ("1", "true", "yes")
 
+# By default, we enable lossy compressors/serializers/filters
+_WITH_LOSSY = os.getenv("WITH_LOSSY", "true").lower() in ("1", "true", "yes")
 
 def open_netcdf(netcdf_file: str, field_to_compress: str | None = None, field_percentage_to_compress: float | None = None, rank: int = 0):
     ds = xr.open_dataset(netcdf_file, chunks="auto")  # auto for Dask backend
@@ -217,9 +219,13 @@ def filter_space(da, filter_class):
 
     filter_space = []
 
-    _FILTERS = [numcodecs.zarr3.Delta, numcodecs.zarr3.BitRound, numcodecs.zarr3.Quantize]
+    _FILTERS = [numcodecs.zarr3.Delta]
+    if _WITH_LOSSY:
+        _FILTERS += [numcodecs.zarr3.BitRound, numcodecs.zarr3.Quantize]
     if _WITH_NUMCODECS_WASM:
-        _FILTERS += [Asinh, FixedOffsetScale]
+        if _WITH_LOSSY:
+            _FILTERS.append(Asinh)
+        _FILTERS.append(FixedOffsetScale)
     if da.dtype.kind == 'i':
         _FILTERS = [numcodecs.zarr3.Delta]
 
@@ -280,10 +286,12 @@ def serializer_space(da, serializer_class):
 
     serializer_space = []
 
-    _SERIALIZERS = [numcodecs.zarr3.PCodec, numcodecs.zarr3.ZFPY]
-    if _WITH_EBCC:
+    _SERIALIZERS = [numcodecs.zarr3.PCodec]
+    if _WITH_LOSSY:
+        _SERIALIZERS.append(numcodecs.zarr3.ZFPY)
+    if _WITH_EBCC and _WITH_LOSSY:
         _SERIALIZERS.append(EBCCZarrFilter)
-    if _WITH_NUMCODECS_WASM:
+    if _WITH_NUMCODECS_WASM and _WITH_LOSSY:
         _SERIALIZERS.append(Zfp)
 
     _SERIALIZER_MAP = {cls.__name__.lower(): cls for cls in _SERIALIZERS}
