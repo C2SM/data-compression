@@ -31,29 +31,17 @@ import atexit
 
 # numcodecs-wasm filters
 from numcodecs_wasm_asinh import Asinh
-from numcodecs_wasm_bit_round import BitRound
 from numcodecs_wasm_fixed_offset_scale import FixedOffsetScale
-from numcodecs_wasm_identity import Identity
-from numcodecs_wasm_linear_quantize import LinearQuantize
-from numcodecs_wasm_log import Log
-from numcodecs_wasm_round import Round
-from numcodecs_wasm_swizzle_reshape import SwizzleReshape
-from numcodecs_wasm_uniform_noise import UniformNoise
-# numcodecs-wasm compressors
-from numcodecs_wasm_zlib import Zlib
-from numcodecs_wasm_zstd import Zstd
 # numcodecs-wasm serializers
-from numcodecs_wasm_pco import Pco
-from numcodecs_wasm_sperr import Sperr
-from numcodecs_wasm_sz3 import Sz3
 from numcodecs_wasm_zfp import Zfp
 
+
+# By default, we enable lossy compressors/serializers/filters
+_WITH_LOSSY = os.getenv("WITH_LOSSY", "true").lower() in ("1", "true", "yes")
 
 _WITH_NUMCODECS_WASM = os.getenv("WITH_NUMCODECS_WASM", "true").lower() in ("1", "true", "yes")
 _WITH_EBCC = os.getenv("WITH_EBCC", "true").lower() in ("1", "true", "yes")
 
-# By default, we enable lossy compressors/serializers/filters
-_WITH_LOSSY = os.getenv("WITH_LOSSY", "true").lower() in ("1", "true", "yes")
 
 def open_netcdf(netcdf_file: str, field_to_compress: str | None = None, field_percentage_to_compress: float | None = None, rank: int = 0):
     ds = xr.open_dataset(netcdf_file, chunks="auto")  # auto for Dask backend
