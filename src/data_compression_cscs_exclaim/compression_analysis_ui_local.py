@@ -274,15 +274,15 @@ class CompressionAnalysisUI(QMainWindow):
         form_layout = QFormLayout()
 
         self.comp_idx_spin = QSpinBox()
-        self.comp_idx_spin.setRange(0, 65)
+        self.comp_idx_spin.setRange(0, 78)
         self.comp_idx_spin.setValue(10)
 
         self.filt_idx_spin = QSpinBox()
-        self.filt_idx_spin.setRange(0, 24)
+        self.filt_idx_spin.setRange(0, 15)
         self.filt_idx_spin.setValue(10)
 
         self.ser_idx_spin = QSpinBox()
-        self.ser_idx_spin.setRange(0, 193)
+        self.ser_idx_spin.setRange(0, 33)
         self.ser_idx_spin.setValue(10)
 
         form_layout.addRow("Compression index:", self.comp_idx_spin)

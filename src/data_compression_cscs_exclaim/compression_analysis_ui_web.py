@@ -334,9 +334,9 @@ if uploaded_file is not None and uploaded_file.name.endswith(".nc"):
                 mime="text/html",
             )
 
-    comp_idx = st.number_input('comp_idx', min_value=0, max_value=65, value=10)
-    filt_idx = st.number_input('filt_idx', min_value=0, max_value=24, value=10)
-    ser_idx = st.number_input('ser_idx', min_value=0, max_value=193, value=10)
+    comp_idx = st.number_input('comp_idx', min_value=0, max_value=78, value=10)
+    filt_idx = st.number_input('filt_idx', min_value=0, max_value=15, value=10)
+    ser_idx = st.number_input('ser_idx', min_value=0, max_value=33, value=10)
 
     if st.button("Compress file"):
 
