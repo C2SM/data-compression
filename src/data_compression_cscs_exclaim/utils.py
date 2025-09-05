@@ -18,7 +18,7 @@ import dask
 import pandas as pd
 import xarray as xr
 import zarr
-from zarr_any_numcodecs import AnyNumcodecsArrayArrayCodec, AnyNumcodecsArrayBytesCodec, AnyNumcodecsBytesBytesCodec
+from zarr_any_numcodecs import AnyNumcodecsArrayArrayCodec, AnyNumcodecsArrayBytesCodec
 import numcodecs
 import numcodecs.zarr3
 import zfpy
@@ -35,6 +35,7 @@ from numcodecs_wasm_fixed_offset_scale import FixedOffsetScale
 # numcodecs-wasm serializers
 from numcodecs_wasm_zfp import Zfp
 
+os.environ["EBCC_LOG_LEVEL"] = "4"  # ERROR (suppress WARN and below)
 
 # By default, we enable lossy compressors/serializers/filters
 _WITH_LOSSY = os.getenv("WITH_LOSSY", "true").lower() in ("1", "true", "yes")
