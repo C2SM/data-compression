@@ -56,13 +56,13 @@ def load_scored_results(uploaded_file_name: str):
 
 
 @st.cache_resource
-def create_cluster_plots(clean_arr_l1, clean_arr_l2, clean_arr_linf, clean_arr_dwt):
+def create_cluster_plots(clean_arr_l1, clean_arr_l2, clean_arr_linf):
     kmeans = KMeans(n_clusters=5, random_state=0, n_init="auto")
 
-    fig = make_subplots(rows=2, cols=2,
+    fig = make_subplots(rows=3, cols=1,
                         subplot_titles=[
                             "L1 VS Ratio KMeans Clustering", "L2 VS Ratio KMeans Clustering",
-                            "LInf VS Ratio KMeans Clustering", "DWT VS Ratio KMeans Clustering"
+                            "LInf VS Ratio KMeans Clustering"
                         ])
 
     # L1 clustering
@@ -122,13 +122,13 @@ def create_cluster_plots(clean_arr_l1, clean_arr_l2, clean_arr_linf, clean_arr_d
             name="Centroids",
             showlegend=False
         ),
-        row=1,
-        col=2
+        row=2,
+        col=1
     )
-    fig.update_xaxes(title_text="Ratio", row=1, col=2)
-    fig.update_yaxes(title_text="L2", row=1, col=2)
+    fig.update_xaxes(title_text="Ratio", row=2, col=1)
+    fig.update_yaxes(title_text="L2", row=2, col=1)
     for trace in fig_l2.data:
-        fig.add_trace(trace, row=1, col=2)
+        fig.add_trace(trace, row=2, col=1)
 
     # LInf clustering
     clean_arr_linf_filtered = np.column_stack(
@@ -155,45 +155,13 @@ def create_cluster_plots(clean_arr_l1, clean_arr_l2, clean_arr_linf, clean_arr_d
             name="Centroids",
             showlegend=False
         ),
-        row=2,
+        row=3,
         col=1
     )
-    fig.update_xaxes(title_text="Ratio", row=2, col=1)
-    fig.update_yaxes(title_text="LInf", row=2, col=1)
+    fig.update_xaxes(title_text="Ratio", row=3, col=1)
+    fig.update_yaxes(title_text="LInf", row=3, col=1)
     for trace in fig_linf.data:
-        fig.add_trace(trace, row=2, col=1)
-
-    # DWT clustering
-    clean_arr_dwt_filtered = np.column_stack((clean_arr_dwt[:, 0].astype(float), clean_arr_dwt[:, 1].astype(float)))
-    y_kmeans = kmeans.fit_predict(clean_arr_dwt_filtered)
-    df_dwt = pd.DataFrame(clean_arr_dwt_filtered, columns=["Ratio", "DWT"])
-    df_dwt["compressor"] = clean_arr_dwt[:, 2]
-    df_dwt["filter"] = clean_arr_dwt[:, 3]
-    df_dwt["serializer"] = clean_arr_dwt[:, 4]
-    df_dwt["compressor_idx"] = np.arange(len(clean_arr_dwt[:, 2]))
-    df_dwt["filter_idx"] = np.arange(len(clean_arr_dwt[:, 3]))
-    df_dwt["serializer_idx"] = np.arange(len(clean_arr_dwt[:, 4]))
-
-    fig_dwt = px.scatter(df_dwt, x="Ratio", y="DWT", color=y_kmeans,
-                         title="DWT VS Ratio KMeans Clustering", hover_data=["compressor", "filter", "serializer", "compressor_idx", "filter_idx", "serializer_idx"])
-
-    fig.add_trace(
-        go.Scatter(
-            x=kmeans.cluster_centers_[:, 0],
-            y=kmeans.cluster_centers_[:, 1],
-            mode="markers+text",
-            marker=dict(color="black", size=12, symbol="x"),
-            textposition="top center",
-            name="Centroids",
-            showlegend=False
-        ),
-        row=2,
-        col=2
-    )
-    fig.update_xaxes(title_text="Ratio", row=2, col=2)
-    fig.update_yaxes(title_text="DWT", row=2, col=2)
-    for trace in fig_dwt.data:
-        fig.add_trace(trace, row=2, col=2)
+        fig.add_trace(trace, row=3, col=1)
 
     fig.update_layout(
         title="",
@@ -287,6 +255,7 @@ if uploaded_file is not None and uploaded_file.name.endswith(".nc"):
         ) as proc:
             for line in proc.stdout:
                 progress_text.text(f"{line}")
+
         
         path_to_modified_file = display_file_name if "santis" in where_am_i.stdout.strip() else path_to_modified_file
         scored_results = load_scored_results(os.path.basename(path_to_modified_file))
@@ -300,17 +269,15 @@ if uploaded_file is not None and uploaded_file.name.endswith(".nc"):
         clean_arr_l1 = utils.slice_array(scored_results_pd, [0, 1, 5, 6, 7])
         clean_arr_l2 = utils.slice_array(scored_results_pd, [0, 2, 5, 6, 7])
         clean_arr_linf = utils.slice_array(scored_results_pd, [0, 3, 5, 6, 7])
-        clean_arr_dwt = utils.slice_array(scored_results_pd, [0, 4, 5, 6, 7])
 
         st.session_state.analysis_data = {
             "l1": clean_arr_l1,
             "l2": clean_arr_l2,
             "linf": clean_arr_linf,
-            "dwt": clean_arr_dwt,
         }
 
         fig_to_save = create_cluster_plots(
-            clean_arr_l1, clean_arr_l2, clean_arr_linf, clean_arr_dwt
+            clean_arr_l1, clean_arr_l2, clean_arr_linf
         )
 
         temp_dir = tempfile.gettempdir()
@@ -377,14 +344,20 @@ if uploaded_file is not None and uploaded_file.name.endswith(".nc"):
         status.info("Compressing file...")
         subprocess.run(cmd_compress)
         status.empty()
-        st.success(f"Compression completed successfully. File saved in {temp_dir}")
-        after = set(os.listdir(temp_dir))
-        output_file_path = os.path.join(temp_dir, list(after - before)[0])
-        dest_path = os.path.join(temp_dir, list(after - before)[0])
-        shutil.copy(output_file_path, dest_path)
+        st.success(f"Compression completed successfully. File saved in {os.getcwd()}")
+        if "santis" in where_am_i.stdout.strip():
+            after = set(os.listdir(temp_dir))
+            output_file_path = os.path.join(temp_dir, list(after - before)[0])
+            dest_path = os.path.join(temp_dir, list(after - before)[0])
+            shutil.copy(output_file_path, dest_path)
+            split_tmp_name = os.path.basename(output_file_path).split(".=.", 1)
+            compressed_file_name = f"{uploaded_file.name}.=.{split_tmp_name[1]}"
+        else:
+            split_tmp_name = os.path.basename(path_to_modified_file).split(".=.", 1)
+            compressed_file_name = f"{uploaded_file.name}.=.{split_tmp_name[0]}"
+            shutil.copy(path_to_modified_file, os.getcwd())
+            output_file_path = os.path.basename(path_to_modified_file)
 
-        split_tmp_name = os.path.basename(output_file_path).split(".=.", 1)
-        compressed_file_name = f"{uploaded_file.name}.=.{split_tmp_name[1]}"
         with open(output_file_path, "rb") as data_file:
             st.download_button(
                 label="Download compressed file locally",

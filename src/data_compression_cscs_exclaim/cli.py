@@ -373,7 +373,7 @@ def perform_clustering(npy_file: str):
     numeric_cols = scored_results_pd.select_dtypes(include=[np.number]).columns
     mask = np.isfinite(scored_results_pd[numeric_cols]).all(axis=1)
     scored_results_pd = scored_results_pd[mask].dropna()
-    clean_arr_dwt = np.hstack((np.asarray(scored_results_pd[[0]]), np.asarray(scored_results_pd[[4]])))
+    clean_arr_inf = np.hstack((np.asarray(scored_results_pd[[0]]), np.asarray(scored_results_pd[[2]])))
 
     k_values = range(3, 10)
     inertias = []
@@ -381,12 +381,13 @@ def perform_clustering(npy_file: str):
 
     for k in tqdm(k_values, desc="Looping over k values"):
         kmeans = KMeans(n_clusters=k, random_state=0, n_init="auto")
-        labels = kmeans.fit_predict(clean_arr_dwt)
+        labels = kmeans.fit_predict(clean_arr_inf)
         inertias.append(kmeans.inertia_)
-        silhouette_scores.append(silhouette_score(clean_arr_dwt, labels))
+        silhouette_scores.append(silhouette_score(clean_arr_inf, labels))
 
     # Plot Elbow Curve
     plt.figure(figsize=(12, 5))
+    plt.suptitle("LInf")
     plt.subplot(1, 2, 1)
     plt.plot(k_values, inertias, 'bo-')
     plt.xlabel('Number of Clusters (k)')

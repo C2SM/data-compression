@@ -68,7 +68,7 @@ data_compression_cscs_exclaim run_web_ui_santis --user_account "d75" --uploaded_
 ```
 Local web-versions and non are also available:
 ```
-data_compression_cscs_exclaim run_local_ui
+  data_compression_cscs_exclaim run_local_ui
 ```
 ````
  data_compression_cscs_exclaim run_web_ui

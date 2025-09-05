@@ -37,13 +37,13 @@ import zipfile
 def load_scored_results(file_name: str):
     return np.load(file_name + "_scored_results_with_names.npy", allow_pickle=True)
 
-def create_cluster_plots(clean_arr_l1, clean_arr_l2, clean_arr_linf, clean_arr_dwt):
+def create_cluster_plots(clean_arr_l1, clean_arr_l2, clean_arr_linf):
     kmeans = KMeans(n_clusters=5, random_state=0, n_init="auto")
 
-    fig = make_subplots(rows=2, cols=2,
+    fig = make_subplots(rows=3, cols=1,
                         subplot_titles=[
                             "L1 VS Ratio KMeans Clustering", "L2 VS Ratio KMeans Clustering",
-                            "LInf VS Ratio KMeans Clustering", "DWT VS Ratio KMeans Clustering"
+                            "LInf VS Ratio KMeans Clustering"
                         ])
 
     # L1 clustering
@@ -103,13 +103,13 @@ def create_cluster_plots(clean_arr_l1, clean_arr_l2, clean_arr_linf, clean_arr_d
             name="Centroids",
             showlegend=False,
         ),
-        row=1,
-        col=2
+        row=2,
+        col=1
     )
-    fig.update_xaxes(title_text="Ratio", row=1, col=2)
-    fig.update_yaxes(title_text="L2", row=1, col=2)
+    fig.update_xaxes(title_text="Ratio", row=2, col=1)
+    fig.update_yaxes(title_text="L2", row=2, col=1)
     for trace in fig_l2.data:
-        fig.add_trace(trace, row=1, col=2)
+        fig.add_trace(trace, row=2, col=1)
 
     # LInf clustering
     clean_arr_linf_filtered = np.column_stack(
@@ -136,46 +136,13 @@ def create_cluster_plots(clean_arr_l1, clean_arr_l2, clean_arr_linf, clean_arr_d
             name="Centroids",
             showlegend=False
         ),
-        row=2,
+        row=3,
         col=1
     )
-    fig.update_xaxes(title_text="Ratio", row=2, col=1)
-    fig.update_yaxes(title_text="LInf", row=2, col=1)
+    fig.update_xaxes(title_text="Ratio", row=3, col=1)
+    fig.update_yaxes(title_text="LInf", row=3, col=1)
     for trace in fig_linf.data:
-        fig.add_trace(trace, row=2, col=1)
-
-    # DWT clustering
-    clean_arr_dwt_filtered = np.column_stack((clean_arr_dwt[:, 0].astype(float), clean_arr_dwt[:, 1].astype(float)))
-    y_kmeans = kmeans.fit_predict(clean_arr_dwt_filtered)
-    df_dwt = pd.DataFrame(clean_arr_dwt_filtered, columns=["Ratio", "DWT"])
-    df_dwt["compressor"] = clean_arr_dwt[:, 2]
-    df_dwt["filter"] = clean_arr_dwt[:, 3]
-    df_dwt["serializer"] = clean_arr_dwt[:, 4]
-    df_dwt["compressor_idx"] = np.arange(len(clean_arr_dwt[:, 2]))
-    df_dwt["filter_idx"] = np.arange(len(clean_arr_dwt[:, 3]))
-    df_dwt["serializer_idx"] = np.arange(len(clean_arr_dwt[:, 4]))
-
-
-    fig_dwt = px.scatter(df_dwt, x="Ratio", y="DWT", color=y_kmeans,
-                         title="DWT VS Ratio KMeans Clustering", hover_data=["compressor", "filter", "serializer", "compressor_idx", "filter_idx", "serializer_idx"])
-
-    fig.add_trace(
-        go.Scatter(
-            x=kmeans.cluster_centers_[:, 0],
-            y=kmeans.cluster_centers_[:, 1],
-            mode="markers+text",
-            marker=dict(color="black", size=12, symbol="x"),
-            textposition="top center",
-            name="Centroids",
-            showlegend=False
-        ),
-        row=2,
-        col=2
-    )
-    fig.update_xaxes(title_text="Ratio", row=2, col=2)
-    fig.update_yaxes(title_text="DWT", row=2, col=2)
-    for trace in fig_dwt.data:
-        fig.add_trace(trace, row=2, col=2)
+        fig.add_trace(trace, row=3, col=1)
 
     fig.update_layout(
         title="",
@@ -230,10 +197,9 @@ class CompressorThread(QThread):
         clean_arr_l1 = utils.slice_array(scored_results_pd, [0, 1, 5, 6, 7])
         clean_arr_l2 = utils.slice_array(scored_results_pd, [0, 2, 5, 6, 7])
         clean_arr_linf = utils.slice_array(scored_results_pd, [0, 3, 5, 6, 7])
-        clean_arr_dwt = utils.slice_array(scored_results_pd, [0, 4, 5, 6, 7])
 
         create_cluster_plots(
-            clean_arr_l1, clean_arr_l2, clean_arr_linf, clean_arr_dwt
+            clean_arr_l1, clean_arr_l2, clean_arr_linf
         )
 
         self.finished.emit()
