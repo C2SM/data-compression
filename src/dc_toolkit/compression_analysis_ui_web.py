@@ -21,7 +21,7 @@ from plotly.subplots import make_subplots
 import xarray
 from io import BytesIO
 
-from data_compression_cscs_exclaim import utils
+from dc_toolkit import utils
 
 where_am_i = subprocess.run(["uname", "-a"], capture_output=True, text=True)
 
@@ -225,8 +225,8 @@ if uploaded_file is not None and uploaded_file.name.endswith(".nc"):
                 "--uenv=prgenv-gnu/25.06:rc5",
                 "--view=default",
                 "--partition=debug",
-                "data_compression_cscs_exclaim",
-                "summarize_compression",
+                "dc_toolkit",
+                "evaluate_combos",
                 parse_args().uploaded_file,
                 os.getcwd(),
                 "--field-to-compress=" + field_to_compress
@@ -236,8 +236,8 @@ if uploaded_file is not None and uploaded_file.name.endswith(".nc"):
                 "mpirun",
                 "-n",
                 "8",
-                "data_compression_cscs_exclaim",
-                "summarize_compression",
+                "dc_toolkit",
+                "evaluate_combos",
                 path_to_modified_file,
                 os.getcwd(),
                 "--field-to-compress="+field_to_compress
@@ -318,7 +318,7 @@ if uploaded_file is not None and uploaded_file.name.endswith(".nc"):
                 "--uenv=prgenv-gnu/25.06:rc5",
                 "--view=default",
                 "--partition=debug",
-                "data_compression_cscs_exclaim",
+                "dc_toolkit",
                 "compress_with_optimal",
                 path_to_modified_file,
                 os.getcwd(),
@@ -331,7 +331,7 @@ if uploaded_file is not None and uploaded_file.name.endswith(".nc"):
                 "mpirun",
                 "-n",
                 "8",
-                "data_compression_cscs_exclaim",
+                "dc_toolkit",
                 "compress_with_optimal",
                 path_to_modified_file,
                 temp_dir,

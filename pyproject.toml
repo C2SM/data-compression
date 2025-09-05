@@ -50,13 +50,13 @@ dependencies = [
     "numcodecs_wasm_zfp",
 ]
 description = 'Data compression tool for Weather and Climate data'
-name = 'data_compression_cscs_exclaim'
+name = 'dc_toolkit'
 readme = {file = 'README.md', content-type = 'text/markdown'}
 requires-python = '>=3.11'
 version = '0.0'
 
 [project.scripts]
-data_compression_cscs_exclaim = 'data_compression_cscs_exclaim.cli:cli'
+dc_toolkit = 'dc_toolkit.cli:cli'
 model_eval_cscs_exclaim = 'model_eval_cscs_exclaim.cli:cli'
 
 [tool.setuptools]

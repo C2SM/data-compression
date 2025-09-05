@@ -30,7 +30,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
-from data_compression_cscs_exclaim import utils
+from dc_toolkit import utils
 import zipfile
 
 
@@ -307,8 +307,8 @@ class CompressionAnalysisUI(QMainWindow):
             "mpirun",
             "-n",
             "8",
-            "data_compression_cscs_exclaim",
-            "summarize_compression",
+            "dc_toolkit",
+            "evaluate_combos",
             self.modified_file_path,
             os.getcwd(),
             "--field-to-compress="+selected_var
@@ -344,7 +344,7 @@ class CompressionAnalysisUI(QMainWindow):
         temp_dir = os.path.dirname(self.modified_file_path)
 
         cmd = [
-            "data_compression_cscs_exclaim",
+            "dc_toolkit",
             "compress_with_optimal",
             self.modified_file_path,
             temp_dir,
