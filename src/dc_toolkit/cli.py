@@ -352,17 +352,17 @@ def merge_compressed_fields(netcdf_file: str, compressed_files_location: str):
         shutil.rmtree(merged_folder)
 
 
-@cli.command("open_zarr_file_and_inspect")
-@click.argument("zarr_file", type=click.Path(exists=True, dir_okay=False))
-def open_zarr_file_and_inspect(zarr_file: str):
+@cli.command("open_zarr_zip_file_and_inspect")
+@click.argument("zarr_zip_file", type=click.Path(exists=True, dir_okay=False))
+def open_zarr_zip_file_and_inspect(zarr_zip_file: str):
     """
-    Open a Zarr file and inspect its contents.
+    Open a Zarr Zipped file and inspect its contents.
 
     \b
     Args:
-        zarr_file (str): Path to the Zarr file.
+        zarr_zip_file (str): Path to the Zarr file.
     """
-    zarr_group, store = utils.open_zarr_zipstore(zarr_file)
+    zarr_group, store = utils.open_zarr_zipstore(zarr_zip_file)
 
     click.echo(zarr_group.tree())
 
