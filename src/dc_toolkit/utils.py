@@ -15,6 +15,7 @@ import click
 import humanize
 import numpy as np
 import dask
+import dask.array
 import pandas as pd
 import xarray as xr
 import zarr

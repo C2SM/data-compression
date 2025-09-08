@@ -17,6 +17,7 @@ import shutil
 import itertools
 import numcodecs
 import numcodecs.zarr3
+import xarray as xr
 from dc_toolkit import utils
 from zarr_any_numcodecs import AnyNumcodecsArrayBytesCodec
 from ebcc.zarr_filter import EBCCZarrFilter
@@ -27,6 +28,7 @@ from sklearn.cluster import KMeans
 from sklearn.metrics import silhouette_score
 from mpi4py import MPI
 import dask
+import dask.array
 import plotly.io as pio
 import plotly.express as px
 import plotly.graph_objects as go
@@ -374,6 +376,31 @@ def open_zarr_zip_file_and_inspect(zarr_zip_file: str):
         click.echo(80* "-")
 
     store.close()
+
+
+@cli.command("from_zarr_zip_to_netcdf")
+@click.argument("zarr_zip_file", type=click.Path(exists=True, dir_okay=False))
+@click.option("--out", "out_nc", type=click.Path(dir_okay=False), default=None,
+              help="Output NetCDF file. Defaults to INPUT with .nc extension.")
+def from_zarr_zip_to_netcdf(zarr_zip_file: str, out_nc: str | None):
+    if out_nc is None:
+        out_nc = os.path.splitext(zarr_zip_file)[0] + ".nc"
+
+    zgroup, store = utils.open_zarr_zipstore(zarr_zip_file)
+    try:
+        names = list(zgroup.array_keys())
+        if not names:
+            raise click.ClickException("No arrays found in the Zarr store.")
+        ds = xr.Dataset({
+            n: xr.DataArray(dask.array.from_zarr(zgroup[n]),
+                            dims=[f"{n}_d{i}" for i in range(zgroup[n].ndim)],
+                            name=n)
+            for n in names
+        })
+        ds.to_netcdf(out_nc, engine="h5netcdf")
+        click.echo(f"Wrote NetCDF: {out_nc}")
+    finally:
+        store.close()
 
 
 @cli.command("perform_clustering")
