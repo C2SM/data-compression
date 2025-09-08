@@ -31,7 +31,7 @@ def parse_args():
     parser.add_argument('--verbose', action='store_true')
     parser.add_argument('--user_account', type=str, default=None)
     parser.add_argument('--uploaded_file', type=str, default=None)
-    parser.add_argument('--t', type=str, default=None)
+    parser.add_argument('--time', type=str, default=None)
     parser.add_argument('--nodes', type=str, default=None)
     parser.add_argument('--ntasks-per-node', type=str, default=None)
     return parser.parse_args()
@@ -219,7 +219,7 @@ if uploaded_file is not None and uploaded_file.name.endswith(".nc"):
             cmd_compress = [
                 "srun",
                 "-A", parse_args().user_account,
-                "--time", parse_args().t,
+                "--time", parse_args().time,
                 "--nodes", parse_args().nodes,
                 "--ntasks-per-node", parse_args().ntasks_per_node,
                 "--uenv=prgenv-gnu/25.06:rc5",
