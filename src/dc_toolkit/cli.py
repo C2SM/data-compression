@@ -58,9 +58,13 @@ def cli():
 @click.option("--compressor-class", default=None, help="Compressor class to use, i.e. specified instead of the full list [`none` skips all compressors].")
 @click.option("--filter-class", default=None, help="Filter class to use, i.e. specified instead of the full list [`none` skips all filters].")
 @click.option("--serializer-class", default=None, help="Serializer class to use, i.e. specified instead of the full list [`none` skips all serializers].")
+@click.option("--override-existing-l1-error", type=float, default=None,
+              help="Override the existing L1 error threshold from the lookup table. "
+                   "If provided, this value will be used instead of the spreadsheet value.")
 def evaluate_combos(netcdf_file: str, where_to_write: str, 
-                          field_to_compress: str | None = None, field_percentage_to_compress: str | None = None, 
-                          compressor_class: str | None = None, filter_class: str | None = None, serializer_class: str | None = None):
+                    field_to_compress: str | None = None, field_percentage_to_compress: str | None = None, 
+                    compressor_class: str | None = None, filter_class: str | None = None, serializer_class: str | None = None,
+                    override_existing_l1_error: float | None = None):
     """
     Loop over combinations of compressors, filters, and serializers to find the optimal configuration for compressing a given field in a NetCDF file.
 
@@ -117,15 +121,14 @@ def evaluate_combos(netcdf_file: str, where_to_write: str,
             continue
         da = ds[var]
 
-        # TODO: fix this UGLY hack
-        lookup = var
-        if var == "temp":
-            lookup = "t"
-
-        threshold_row = thresholds[thresholds["Short Name"] == lookup]
-        matching_units = threshold_row.iloc[0]["Unit"] == da.attrs.get("units", None) if not threshold_row.empty else None
-        existing_l1_error = threshold_row.iloc[0]["Existing L1 error"] if not threshold_row.empty and matching_units else None
-        existing_l1_error = float(existing_l1_error.replace(",", ".")) if existing_l1_error else None
+        if override_existing_l1_error is None:
+            lookup = var
+            threshold_row = thresholds[thresholds["Short Name"] == lookup]
+            matching_units = threshold_row.iloc[0]["Unit"] == da.attrs.get("units", None) if not threshold_row.empty else None
+            existing_l1_error = threshold_row.iloc[0]["Existing L1 error"] if not threshold_row.empty and matching_units else None
+            existing_l1_error = float(existing_l1_error.replace(",", ".")) if existing_l1_error else None
+        else:
+            existing_l1_error = override_existing_l1_error
 
         if rank == 0:
             click.echo(f"Processing variable: {var} (Units: {da.attrs.get('units', 'N/A')}, Existing L1 Error: {existing_l1_error})")
