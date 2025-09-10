@@ -10,6 +10,11 @@ The tools use the following compression libraries:
 
 ## Installation
 
+**System Prerequisites**
+
+- C/C++ compiler toolchain (required to build mpi4py)
+- MPI implementation (required for mpi4py)
+
 In Santis@ALPS:
 
  ```commandline
