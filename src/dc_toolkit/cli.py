@@ -165,13 +165,19 @@ def evaluate_combos(netcdf_file: str, where_to_write: str,
                 data_to_compress = da.squeeze().astype("float32")
 
             filters_ = [filt,]
-            if isinstance(serializer, AnyNumcodecsArrayBytesCodec):
+            compressors_ = [compressor,]
+            serializer_ = serializer
+            
+            if isinstance(serializer_, AnyNumcodecsArrayBytesCodec) or filt is None:
                 filters_ = None  # TODO: fix (?) filter stacking with EBCC & numcodecs-wasm serializers
-            if filt is None:
-                filters_ = None
-            if filters_ is None:
                 filt = None
                 filt_idx = -1
+            if compressor is None:
+                compressors_ = None
+                comp_idx = -1
+            if serializer is None:
+                serializer_ = "auto"
+                ser_idx = -1
 
             try:
                 compression_ratio, errors, euclidean_distance = utils.compress_with_zarr(
@@ -180,8 +186,8 @@ def evaluate_combos(netcdf_file: str, where_to_write: str,
                     var,
                     where_to_write,
                     filters=filters_,
-                    compressors=[compressor,] if compressor is not None else None,
-                    serializer=serializer if serializer is not None else "auto",
+                    compressors=compressors_,
+                    serializer=serializer_,
                     verbose=False,
                     rank=rank,
                 )
@@ -291,14 +297,25 @@ def compress_with_optimal(netcdf_file, where_to_write, field_to_compress,
     if isinstance(optimal_serializer, AnyNumcodecsArrayBytesCodec) and isinstance(optimal_serializer.codec, EBCCZarrFilter):
         da = da.squeeze().astype("float32")
 
+    filters_ = [optimal_filter,]
+    compressors_ = [optimal_compressor,]
+    serializer_ = optimal_serializer
+
+    if isinstance(serializer_, AnyNumcodecsArrayBytesCodec) or optimal_filter is None:
+        filters_ = None
+    if optimal_compressor is None:
+        compressors_ = None
+    if optimal_serializer is None:
+        serializer_ = "auto"
+
     compression_ratio, errors, euclidean_distance = utils.compress_with_zarr(
         da,
         netcdf_file,
         field_to_compress,
         where_to_write,
-        filters=None if isinstance(optimal_serializer, AnyNumcodecsArrayBytesCodec) else [optimal_filter,],  # TODO: fix (?) filter stacking with EBCC & numcodecs-wasm serializers
-        compressors=[optimal_compressor,],
-        serializer=optimal_serializer,
+        filters=filters_,
+        compressors=compressors_,
+        serializer=serializer_,
         verbose=False,
     )
 
