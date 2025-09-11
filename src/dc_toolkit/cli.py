@@ -279,6 +279,22 @@ def compress_with_optimal(netcdf_file, where_to_write, field_to_compress,
             click.echo("This command is not meant to be run in parallel. Please run it with a single process.")
         sys.exit(1)
 
+    if 0 <= comp_idx < len(compressors):
+        pass
+    else:
+        click.echo(f"Invalid comp_idx: {comp_idx}")
+        sys.exit(1)
+    if 0 <= filt_idx < len(filters):
+        pass
+    else:
+        click.echo(f"Invalid filt_idx: {filt_idx}")
+        sys.exit(1)
+    if 0 <= ser_idx < len(serializers):
+        pass
+    else:
+        click.echo(f"Invalid ser_idx: {ser_idx}")
+        sys.exit(1)
+
     os.makedirs(where_to_write, exist_ok=True)
 
     ds = utils.open_netcdf(netcdf_file, field_to_compress)
@@ -288,9 +304,9 @@ def compress_with_optimal(netcdf_file, where_to_write, field_to_compress,
     filters = utils.filter_space(da, filter_class)
     serializers = utils.serializer_space(da, serializer_class)
 
-    optimal_compressor = compressors[comp_idx][1] if 0 <= comp_idx < len(compressors) else None
-    optimal_filter = filters[filt_idx][1] if 0 <= filt_idx < len(filters) else None
-    optimal_serializer = serializers[ser_idx][1] if 0 <= ser_idx < len(serializers) else None
+    optimal_compressor = compressors[comp_idx][1]
+    optimal_filter = filters[filt_idx][1]
+    optimal_serializer = serializers[ser_idx][1]
 
     if isinstance(optimal_serializer, numcodecs.zarr3.ZFPY):
         da = da.stack(flat_dim=da.dims)
