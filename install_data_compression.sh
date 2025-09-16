@@ -3,9 +3,9 @@ set -euo pipefail
 
 pip install --upgrade pip
 
-# Install your local project
+# Install dc_toolkit
 pip install -e .
-pip install -r requirements.txt
+CC=$(which mpicc) pip install --no-binary=mpi4py mpi4py
 
 # Install EBCC with Zarr support (always fresh clone)
 EBCC_DIR="EBCC"

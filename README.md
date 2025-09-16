@@ -18,7 +18,7 @@ The tools use the following compression libraries:
 In Santis@ALPS:
 
  ```commandline
-export UENV_NAME="prgenv-gnu/25.06:rc5"
+export UENV_NAME="prgenv-gnu/24.11:v2"
 uenv image pull $UENV_NAME
 uenv start --view=default $UENV_NAME
 ```
