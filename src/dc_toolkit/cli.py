@@ -279,6 +279,15 @@ def compress_with_optimal(netcdf_file, where_to_write, field_to_compress,
             click.echo("This command is not meant to be run in parallel. Please run it with a single process.")
         sys.exit(1)
 
+    os.makedirs(where_to_write, exist_ok=True)
+
+    ds = utils.open_netcdf(netcdf_file, field_to_compress)
+    da = ds[field_to_compress]
+
+    compressors = utils.compressor_space(da, compressor_class)
+    filters = utils.filter_space(da, filter_class)
+    serializers = utils.serializer_space(da, serializer_class)
+
     if 0 <= comp_idx < len(compressors):
         pass
     else:
@@ -294,15 +303,6 @@ def compress_with_optimal(netcdf_file, where_to_write, field_to_compress,
     else:
         click.echo(f"Invalid ser_idx: {ser_idx}")
         sys.exit(1)
-
-    os.makedirs(where_to_write, exist_ok=True)
-
-    ds = utils.open_netcdf(netcdf_file, field_to_compress)
-    da = ds[field_to_compress]
-
-    compressors = utils.compressor_space(da, compressor_class)
-    filters = utils.filter_space(da, filter_class)
-    serializers = utils.serializer_space(da, serializer_class)
 
     optimal_compressor = compressors[comp_idx][1]
     optimal_filter = filters[filt_idx][1]
