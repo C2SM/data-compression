@@ -271,14 +271,6 @@ class CompressionAnalysisUI(QMainWindow):
         self.predefined_l1.stateChanged.connect(self.toggle_spinbox_enabled)
         self.panel_layout.addWidget(self.predefined_l1)
 
-        # self.panel_layout.addWidget(QLabel("Set max L1 error:"))
-        # self.options_l1_error = ScientificSpinBox()
-        # self.options_l1_error.setDecimals(10)
-        # self.options_l1_error.setRange(0., 1.)
-        # self.options_l1_error.setSingleStep(0.0000000001)
-        # self.options_l1_error.setValue(0.)
-        # self.panel_layout.addWidget(self.options_l1_error)
-
         options_l1_error_label = QLabel("Set max L1 error:")
         self.options_l1_error = ScientificSpinBox()
         self.options_l1_error.setValue(0.0e0)
