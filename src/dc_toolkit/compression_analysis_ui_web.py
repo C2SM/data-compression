@@ -232,11 +232,8 @@ if uploaded_file is not None and uploaded_file.name.endswith(".nc"):
             options=options_serializer,
         )
 
-        options_l1_error = ["Pre-defined"] + [str(round(x, 1)) for x in np.arange(0., 1., 0.1)]
-        l1_error_class = st.selectbox(
-            "Set max L1 error:",
-            options=options_l1_error,
-        )
+        predefined_l1 = st.checkbox("Use pre-defined l1 error", value=False)
+        l1_error_class = st.number_input('comp_idx', min_value=0.0, max_value=1.0, value=0.0, step=0.0000000001, format="%.10f", disabled=predefined_l1)
 
     with tempfile.NamedTemporaryFile(suffix=".nc", delete=False) as tmp:
         path_to_modified_file = tmp.name
@@ -250,7 +247,7 @@ if uploaded_file is not None and uploaded_file.name.endswith(".nc"):
 
     if st.button("Analyze compressors"):
         if "santis" in where_am_i.stdout.strip():
-            if l1_error_class == "Pre-defined":
+            if predefined_l1:
                 cmd_compress = [
                     "srun",
                     "-A", parse_args().user_account,
@@ -287,10 +284,10 @@ if uploaded_file is not None and uploaded_file.name.endswith(".nc"):
                     "--compressor-class=" + compressor_class,
                     "--filter-class=" + filter_class,
                     "--serializer-class=" + serializer_class,
-                    "--override-existing-l1-error=" + l1_error_class
+                    "--override-existing-l1-error=" + str(l1_error_class)
                 ]
         else:
-            if l1_error_class == "Pre-defined":
+            if predefined_l1:
                 cmd_compress = [
                     "mpirun",
                     "-n",
@@ -317,7 +314,7 @@ if uploaded_file is not None and uploaded_file.name.endswith(".nc"):
                     "--compressor-class=" + compressor_class,
                     "--filter-class=" + filter_class,
                     "--serializer-class=" + serializer_class,
-                    "--override-existing-l1-error=" + l1_error_class
+                    "--override-existing-l1-error=" + str(l1_error_class)
                 ]
 
         st.info("Analyzing compressors...")

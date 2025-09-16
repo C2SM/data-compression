@@ -3,6 +3,8 @@ import importlib.util
 import subprocess
 import sys
 
+from PyQt6.QtGui import QValidator
+
 # PyQt6 might encounter issues when installed from pyproject.toml
 print("Installing PyQt6")
 subprocess.check_call([
@@ -14,10 +16,10 @@ import os
 import subprocess
 import tempfile
 
-from PyQt6.QtCore import QThread, pyqtSignal
+from PyQt6.QtCore import QThread, pyqtSignal, QLocale
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QPushButton, QLabel, QComboBox, QProgressBar, QTextEdit, QFormLayout,
-                             QSpinBox, QToolButton, QFrame, QFileDialog, QMessageBox)
+                             QSpinBox, QToolButton, QFrame, QFileDialog, QMessageBox, QCheckBox, QDoubleSpinBox)
 
 import xarray as xr
 
@@ -201,6 +203,24 @@ class CompressorThread(QThread):
 
         self.finished.emit()
 
+class ScientificSpinBox(QDoubleSpinBox):
+    def __init__(self, parent=None):
+        super(ScientificSpinBox, self).__init__(parent)
+        self.setLocale(QLocale(QLocale.Language.English, QLocale.Country.UnitedStates))
+        self.setDecimals(10)
+        self.setMinimum(0e0)
+        self.setMaximum(1e0)
+        self.setSingleStep(0.0000000001)
+        self.setKeyboardTracking(False)
+
+    def textFromValue(self, value: float) -> str:
+        return f'{value:.2e}'
+
+    def valueFromText(self, text: str) -> float:
+        try:
+            return float(text)
+        except ValueError:
+            return 0.0
 
 class CompressionAnalysisUI(QMainWindow):
     def __init__(self):
@@ -247,9 +267,22 @@ class CompressionAnalysisUI(QMainWindow):
         self.options_serializer.addItems(["", "PCodec", "ZFPY", "EBCCZarrFilter", "Zfp", "Sperr", "Sz3", "None"])
         self.panel_layout.addWidget(self.options_serializer)
 
-        self.panel_layout.addWidget(QLabel("Set max L1 error:"))
-        self.options_l1_error = QComboBox()
-        self.options_l1_error.addItems(["Pre-defined"] + [str(round(x, 1)) for x in np.arange(0., 1., 0.1)])
+        self.predefined_l1 = QCheckBox("Use pre-defined l1 error")
+        self.predefined_l1.stateChanged.connect(self.toggle_spinbox_enabled)
+        self.panel_layout.addWidget(self.predefined_l1)
+
+        # self.panel_layout.addWidget(QLabel("Set max L1 error:"))
+        # self.options_l1_error = ScientificSpinBox()
+        # self.options_l1_error.setDecimals(10)
+        # self.options_l1_error.setRange(0., 1.)
+        # self.options_l1_error.setSingleStep(0.0000000001)
+        # self.options_l1_error.setValue(0.)
+        # self.panel_layout.addWidget(self.options_l1_error)
+
+        options_l1_error_label = QLabel("Set max L1 error:")
+        self.options_l1_error = ScientificSpinBox()
+        self.options_l1_error.setValue(0.0e0)
+        self.panel_layout.addWidget(options_l1_error_label)
         self.panel_layout.addWidget(self.options_l1_error)
 
         self.main_layout.addWidget(self.panel_frame)
@@ -295,6 +328,9 @@ class CompressionAnalysisUI(QMainWindow):
         self.modified_file_path = None
         self.thread = None
         self.file_name = None
+
+    def toggle_spinbox_enabled(self, state):
+        self.options_l1_error.setEnabled(not self.predefined_l1.isChecked())
 
     def set_advanced_option_max(self, advnced_option_input, func):
         selected_field = self.field_selection.currentText()
@@ -345,7 +381,7 @@ class CompressionAnalysisUI(QMainWindow):
         filter_class = self.options_filter.currentText()
         serializer_class = self.options_serializer.currentText()
 
-        if self.options_l1_error.currentText() == "Pre-defined":
+        if self.predefined_l1.isChecked():
             cmd = [
                 "mpirun",
                 "-n",
@@ -372,7 +408,7 @@ class CompressionAnalysisUI(QMainWindow):
                 "--compressor-class=" + compressor_class,
                 "--filter-class=" + filter_class,
                 "--serializer-class=" + serializer_class,
-                "--override-existing-l1-error=" + self.options_l1_error.currentText()
+                "--override-existing-l1-error=" + str(self.options_l1_error.value())
             ]
 
         self.thread = CompressorThread(cmd)
