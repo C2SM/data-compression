@@ -10,6 +10,7 @@ import subprocess
 import tempfile
 import argparse
 import shutil
+import time
 
 import streamlit as st
 import pandas as pd
@@ -194,15 +195,48 @@ if uploaded_file is not None and uploaded_file.name.endswith(".nc"):
     file_content = uploaded_file.read()
     netcdf_file_xr, display_file_name = load_and_resize_netcdf(file_content, uploaded_file.name)
 
-    options = [var for var in netcdf_file_xr.data_vars]
+    options_field = [var for var in netcdf_file_xr.data_vars]
     if "selected_column" not in st.session_state:
-        st.session_state.selected_column = options[0]
+        st.session_state.selected_column = options_field[0]
+
     field_to_compress = st.selectbox(
         "Choose a field:",
-        options=options,
-        index=options.index(st.session_state.selected_column),
+        options=options_field,
+        index=options_field.index(st.session_state.selected_column),
         key="selected_column",
     )
+
+    compressor_class = ""
+    filter_class = ""
+    serializer_class = ""
+    l1_error_class = ""
+
+    st.session_state.expander_state = True
+
+    with st.expander("Advanced Selection", expanded=st.session_state.expander_state):
+        options_compressor = ["", "Blosc", "LZ4", "Zstd", "Zlib", "GZip", "BZ2", "LZMA", "None"]
+        compressor_class = st.selectbox(
+            "Choose a compressor:",
+            options=options_compressor,
+        )
+
+        options_filter = ["", "Delta", "BitRound", "Quantize", "Asinh", "FixedOffsetScale", "None"]
+        filter_class = st.selectbox(
+            "Choose a filter:",
+            options=options_filter,
+        )
+
+        options_serializer = ["", "PCodec", "ZFPY", "EBCCZarrFilter", "Zfp", "Sperr", "Sz3", "None"]
+        serializer_class = st.selectbox(
+            "Choose a serialzer:",
+            options=options_serializer,
+        )
+
+        options_l1_error = ["Pre-defined", range(0, 1, 0.1)]
+        l1_error_class = st.selectbox(
+            "Set max L1 error:",
+            options=options_l1_error,
+        )
 
     with tempfile.NamedTemporaryFile(suffix=".nc", delete=False) as tmp:
         path_to_modified_file = tmp.name
@@ -229,7 +263,11 @@ if uploaded_file is not None and uploaded_file.name.endswith(".nc"):
                 "evaluate_combos",
                 parse_args().uploaded_file,
                 os.getcwd(),
-                "--field-to-compress=" + field_to_compress
+                "--field-to-compress=" + field_to_compress,
+                "--compressor-class=" + compressor_class,
+                "--filter-class=" + filter_class,
+                "--serializer-class=" + serializer_class,
+                "--override-existing-l1-error=" + l1_error_class
             ]
         else:
             cmd_compress = [
@@ -240,7 +278,11 @@ if uploaded_file is not None and uploaded_file.name.endswith(".nc"):
                 "evaluate_combos",
                 path_to_modified_file,
                 os.getcwd(),
-                "--field-to-compress="+field_to_compress
+                "--field-to-compress="+field_to_compress,
+                "--compressor-class="+compressor_class,
+                "--filter-class="+filter_class,
+                "--serializer-class="+serializer_class,
+                "--override-existing-l1-error=" + l1_error_class
             ]
 
         st.info("Analyzing compressors...")
@@ -301,69 +343,116 @@ if uploaded_file is not None and uploaded_file.name.endswith(".nc"):
                 mime="text/html",
             )
 
-    comp_idx = st.number_input('comp_idx', min_value=0, max_value=78, value=10)
-    filt_idx = st.number_input('filt_idx', min_value=0, max_value=15, value=10)
-    ser_idx = st.number_input('ser_idx', min_value=0, max_value=33, value=10)
+    comp_idx = st.number_input('comp_idx', min_value=1, max_value=79, value=10)
+    filt_idx = st.number_input('filt_idx', min_value=1, max_value=16, value=10)
+    ser_idx = st.number_input('ser_idx', min_value=1, max_value=34, value=10)
 
     if st.button("Compress file"):
+        da = xarray.open_dataset(path_to_modified_file)[field_to_compress]
 
-        if "santis" in where_am_i.stdout.strip():
-            temp_dir = os.getcwd()
-            cmd_compress = [
-                "srun",
-                "-A", parse_args().user_account,
-                "--time", parse_args().t,
-                "--nodes", parse_args().nodes,
-                "--ntasks-per-node", parse_args().ntasks_per_node,
-                "--uenv=prgenv-gnu/25.06:rc5",
-                "--view=default",
-                "--partition=debug",
-                "dc_toolkit",
-                "compress_with_optimal",
-                path_to_modified_file,
-                os.getcwd(),
-                field_to_compress,
-                str(comp_idx), str(filt_idx), str(ser_idx)
-            ]
+        max_compressor_value = len(utils.compressor_space(da, compressor_class))
+        check_compx_val = comp_idx <= max_compressor_value
+
+        max_filter_value = len(utils.filter_space(da, filter_class))
+        check_filter_val = filt_idx <= max_filter_value
+
+        max_serializer_value = len(utils.serializer_space(da, serializer_class))
+        check_serializer_val = ser_idx <= max_serializer_value
+
+        if not check_compx_val:
+            placeholder = st.empty()
+            style_str = f"""
+            <div style='text-align: center; color: {"black"}; font-size: 1.2rem; margin-top: 10px; padding: 10px; border: 1px solid {"black"}; border-radius: 5px;'>
+                ⚠️ Compressor input value {comp_idx} is higher than the max allowed {max_compressor_value}
+            </div>
+            """
+
+            placeholder.markdown(style_str, unsafe_allow_html=True)
+            time.sleep(4)
+            placeholder.empty()
+            #st.toast(f"Compressor input value {comp_idx} is higher than the max allowed {max_compressor_value}")
+        elif not check_filter_val:
+            placeholder = st.empty()
+            style_str = f"""
+            <div style='text-align: center; color: {"black"}; font-size: 1.2rem; margin-top: 10px; padding: 10px; border: 1px solid {"black"}; border-radius: 5px;'>
+                ⚠️ Filter input value {filt_idx} is higher than the max allowed {max_filter_value}
+            </div>
+            """
+
+            placeholder.markdown(style_str, unsafe_allow_html=True)
+            time.sleep(4)
+            placeholder.empty()
+            #st.toast(f"Filter input value {filt_idx} is higher than the max allowed {max_filter_value}")
+        elif not check_serializer_val:
+            placeholder = st.empty()
+            style_str = f"""
+            <div style='text-align: center; color: {"black"}; font-size: 1.2rem; margin-top: 10px; padding: 10px; border: 1px solid {"black"}; border-radius: 5px;'>
+                ⚠️ Serializer input value {ser_idx} is higher than the max allowed {max_serializer_value}
+            </div>
+            """
+
+            placeholder.markdown(style_str, unsafe_allow_html=True)
+            time.sleep(4)
+            placeholder.empty()
+            #st.toast(f"Serializer input value {ser_idx} is higher than the max allowed {max_serializer_value}")
         else:
-            temp_dir = os.path.dirname(path_to_modified_file)
-            cmd_compress = [
-                "mpirun",
-                "-n",
-                "8",
-                "dc_toolkit",
-                "compress_with_optimal",
-                path_to_modified_file,
-                temp_dir,
-                field_to_compress,
-                str(comp_idx), str(filt_idx), str(ser_idx)
-            ]
+            if "santis" in where_am_i.stdout.strip():
+                temp_dir = os.getcwd()
+                cmd_compress = [
+                    "srun",
+                    "-A", parse_args().user_account,
+                    "--time", parse_args().t,
+                    "--nodes", parse_args().nodes,
+                    "--ntasks-per-node", parse_args().ntasks_per_node,
+                    "--uenv=prgenv-gnu/25.06:rc5",
+                    "--view=default",
+                    "--partition=debug",
+                    "dc_toolkit",
+                    "compress_with_optimal",
+                    path_to_modified_file,
+                    os.getcwd(),
+                    field_to_compress,
+                    str(comp_idx), str(filt_idx), str(ser_idx)
+                ]
+            else:
+                temp_dir = os.path.dirname(path_to_modified_file)
+                cmd_compress = [
+                    "mpirun",
+                    "-n",
+                    "8",
+                    "dc_toolkit",
+                    "compress_with_optimal",
+                    path_to_modified_file,
+                    temp_dir,
+                    field_to_compress,
+                    str(comp_idx), str(filt_idx), str(ser_idx)
+                ]
 
-        before = set(os.listdir(temp_dir))
-        status = st.empty()
-        status.info("Compressing file...")
-        subprocess.run(cmd_compress)
-        status.empty()
-        st.success(f"Compression completed successfully. File saved in {os.getcwd()}")
-        if "santis" in where_am_i.stdout.strip():
-            after = set(os.listdir(temp_dir))
-            output_file_path = os.path.join(temp_dir, list(after - before)[0])
-            dest_path = os.path.join(temp_dir, list(after - before)[0])
-            shutil.copy(output_file_path, dest_path)
-            split_tmp_name = os.path.basename(output_file_path).split(".=.", 1)
-            compressed_file_name = f"{uploaded_file.name}.=.{split_tmp_name[1]}"
-        else:
-            split_tmp_name = os.path.basename(path_to_modified_file).split(".=.", 1)
-            compressed_file_name = f"{uploaded_file.name}.=.{split_tmp_name[0]}"
-            shutil.copy(path_to_modified_file, os.getcwd())
-            output_file_path = os.path.basename(path_to_modified_file)
+            before = set(os.listdir(temp_dir))
+            status = st.empty()
+            status.info("Compressing file...")
+            subprocess.run(cmd_compress)
+            status.empty()
+            st.success(f"Compression completed successfully. File saved in {os.getcwd()}")
+            if "santis" in where_am_i.stdout.strip():
+                after = set(os.listdir(temp_dir))
+                output_file_path = os.path.join(temp_dir, list(after - before)[0])
+                dest_path = os.path.join(temp_dir, list(after - before)[0])
+                shutil.copy(output_file_path, dest_path)
+                split_tmp_name = os.path.basename(output_file_path).split(".=.", 1)
+                compressed_file_name = f"{uploaded_file.name}.=.{split_tmp_name[1]}"
+            else:
+                split_tmp_name = os.path.basename(path_to_modified_file).split(".=.", 1)
+                compressed_file_name = f"{uploaded_file.name}.=.{split_tmp_name[0]}"
+                shutil.copy(path_to_modified_file, os.getcwd())
+                output_file_path = os.path.basename(path_to_modified_file)
 
-        with open(output_file_path, "rb") as data_file:
-            st.download_button(
-                label="Download compressed file locally",
-                data=data_file,
-                file_name=compressed_file_name,
-            )
-        os.remove(output_file_path)
-        if os.path.exists(path_to_modified_file):
-            os.remove(path_to_modified_file)
+            with open(output_file_path, "rb") as data_file:
+                st.download_button(
+                    label="Download compressed file locally",
+                    data=data_file,
+                    file_name=compressed_file_name,
+                )
+            os.remove(output_file_path)
+            if os.path.exists(path_to_modified_file):
+                os.remove(path_to_modified_file)

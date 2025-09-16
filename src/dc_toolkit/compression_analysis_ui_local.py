@@ -14,12 +14,10 @@ import os
 import subprocess
 import tempfile
 
-from PyQt6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout,
-    QPushButton, QFileDialog, QComboBox, QProgressBar, QTextEdit, QLabel,
-    QSpinBox, QFormLayout
-)
 from PyQt6.QtCore import QThread, pyqtSignal
+from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
+                             QPushButton, QLabel, QComboBox, QProgressBar, QTextEdit, QFormLayout,
+                             QSpinBox, QToolButton, QFrame, QFileDialog, QMessageBox)
 
 import xarray as xr
 
@@ -173,7 +171,6 @@ class CompressorThread(QThread):
         self.cmd = cmd
 
     def run(self):
-        current_max = 0
         with subprocess.Popen(
             self.cmd,
             stdout=subprocess.PIPE,
@@ -221,9 +218,42 @@ class CompressionAnalysisUI(QMainWindow):
         self.file_label = QLabel("No file selected")
         self.main_layout.addWidget(self.file_label)
 
-        self.var_combo = QComboBox()
+        self.field_selection = QComboBox()
         self.main_layout.addWidget(QLabel("Select field to compress:"))
-        self.main_layout.addWidget(self.var_combo)
+        self.main_layout.addWidget(self.field_selection)
+
+        self.toggle_button = QToolButton(self)
+        self.toggle_button.setText("Advanced Options")
+        self.toggle_button.setCheckable(True)
+        self.main_layout.addWidget(self.toggle_button)
+
+        self.panel_frame = QFrame(self)
+        self.panel_frame.setVisible(False)
+        self.panel_layout = QVBoxLayout(self.panel_frame)
+        self.panel_layout.setContentsMargins(0, 0, 0, 0)
+
+        self.panel_layout.addWidget(QLabel("Choose a compressor:"))
+        self.options_compressor = QComboBox()
+        self.options_compressor.addItems(["", "Blosc", "LZ4", "Zstd", "Zlib", "GZip", "BZ2", "LZMA", "None"])
+        self.panel_layout.addWidget(self.options_compressor)
+
+        self.panel_layout.addWidget(QLabel("Choose a filter:"))
+        self.options_filter = QComboBox()
+        self.options_filter.addItems(["", "Delta", "BitRound", "Quantize", "Asinh", "FixedOffsetScale", "None"])
+        self.panel_layout.addWidget(self.options_filter)
+
+        self.panel_layout.addWidget(QLabel("Choose a serializer:"))
+        self.options_serializer = QComboBox()
+        self.options_serializer.addItems(["", "PCodec", "ZFPY", "EBCCZarrFilter", "Zfp", "Sperr", "Sz3", "None"])
+        self.panel_layout.addWidget(self.options_serializer)
+
+        self.panel_layout.addWidget(QLabel("Set max L1 error:"))
+        self.options_l1_error = QComboBox()
+        self.options_l1_error.addItems(["Pre-defined", range(0, 1, 0.1)])
+        self.panel_layout.addWidget(self.options_l1_error)
+
+        self.main_layout.addWidget(self.panel_frame)
+        self.toggle_button.toggled.connect(self.toggle_compression)
 
         self.analyze_button = QPushButton("Analyze Compressors")
         self.analyze_button.clicked.connect(self.analyze_compressors)
@@ -240,15 +270,15 @@ class CompressionAnalysisUI(QMainWindow):
         form_layout = QFormLayout()
 
         self.comp_idx_spin = QSpinBox()
-        self.comp_idx_spin.setRange(0, 78)
+        self.comp_idx_spin.setRange(0, 79)
         self.comp_idx_spin.setValue(10)
 
         self.filt_idx_spin = QSpinBox()
-        self.filt_idx_spin.setRange(0, 15)
+        self.filt_idx_spin.setRange(0, 16)
         self.filt_idx_spin.setValue(10)
 
         self.ser_idx_spin = QSpinBox()
-        self.ser_idx_spin.setRange(0, 33)
+        self.ser_idx_spin.setRange(0, 34)
         self.ser_idx_spin.setValue(10)
 
         form_layout.addRow("Compression index:", self.comp_idx_spin)
@@ -265,6 +295,14 @@ class CompressionAnalysisUI(QMainWindow):
         self.modified_file_path = None
         self.thread = None
         self.file_name = None
+
+    def set_advanced_option_max(self, advnced_option_input, func):
+        selected_field = self.field_selection.currentText()
+        da = xr.open_dataset(self.file_path)[selected_field]
+        return len(func(da, advnced_option_input))
+
+    def toggle_compression(self, checked):
+        self.panel_frame.setVisible(checked)
 
     def retrieve_file(self):
         with tempfile.NamedTemporaryFile(suffix=".nc", delete=False) as tmp:
@@ -285,9 +323,9 @@ class CompressionAnalysisUI(QMainWindow):
             self.file_name = os.path.basename(self.file_path)
             variables = list(ds.data_vars.keys())
             ds.close()
-            self.var_combo.clear()
+            self.field_selection.clear()
             if variables:
-                self.var_combo.addItems(variables)
+                self.field_selection.addItems(variables)
                 self.analyze_button.setEnabled(True)
                 self.compress_button.setEnabled(True)
             else:
@@ -296,12 +334,18 @@ class CompressionAnalysisUI(QMainWindow):
                 self.compress_button.setEnabled(False)
 
     def analyze_compressors(self):
-        selected_var = self.var_combo.currentText()
+        selected_var = self.field_selection.currentText()
         self.retrieve_file()
         ds = load_and_resize_netcdf(xr.open_dataset(self.file_path), self.file_path)
         with tempfile.NamedTemporaryFile(suffix=".nc", delete=False) as tmp:
             path_to_modified_file = tmp.name
             ds.to_netcdf(path_to_modified_file)
+
+        compressor_class = self.options_compressor.currentText()
+        filter_class = self.options_filter.currentText()
+        serializer_class = self.options_serializer.currentText()
+        l1_error_class = "" if self.options_l1_error.currentText() == "Pre-defined" else self.options_l1_error.currentText()
+
 
         cmd = [
             "mpirun",
@@ -311,12 +355,17 @@ class CompressionAnalysisUI(QMainWindow):
             "evaluate_combos",
             self.modified_file_path,
             os.getcwd(),
-            "--field-to-compress="+selected_var
+            "--field-to-compress=" + selected_var,
+            "--compressor-class=" + compressor_class,
+            "--filter-class=" + filter_class,
+            "--serializer-class=" + serializer_class,
+            "--override-existing-l1-error=" + l1_error_class
         ]
 
         self.thread = CompressorThread(cmd)
         self.thread.progress.connect(self.update_progress)
         self.thread.log.connect(self.log.append)
+        self.main_dir_files = os.listdir(os.getcwd())
         self.thread.finished.connect(self.analysis_finished)
         self.thread.start()
 
@@ -330,56 +379,104 @@ class CompressionAnalysisUI(QMainWindow):
 
     def analysis_finished(self):
         self.log.append("Analysis finished.")
+        new_files = set(os.listdir(os.getcwd())) - set(self.main_dir_files)
+        for file in new_files:
+            if "scored_results" not in file:
+                os.remove(file)
+        self.main_dir_files = new_files
         self.analyze_button.setEnabled(True)
         self.compress_button.setEnabled(True)
 
+    def show_popup(self, param, input_value, max_value):
+        msg_box = QMessageBox(self)
+        msg_box.setText(f"{param} input value {input_value} is higher than the max allowed {max_value}")
+        msg_box.setIcon(QMessageBox.Icon.Information)
+        msg_box.setStandardButtons(QMessageBox.StandardButton.Ok)
+        msg_box.exec()
+
     def compress_file(self):
         self.retrieve_file()
+        max_compressor_value = self.set_advanced_option_max(self.options_compressor.currentText(), utils.compressor_space)
+        check_compx_val = self.comp_idx_spin.value() <= max_compressor_value
 
-        selected_var = self.var_combo.currentText()
+        max_filter_value = self.set_advanced_option_max(self.options_filter.currentText(), utils.filter_space)
+        check_filter_val = self.filt_idx_spin.value() <= max_filter_value
 
-        comp_idx = self.comp_idx_spin.value()
-        filt_idx = self.filt_idx_spin.value()
-        ser_idx = self.ser_idx_spin.value()
-        temp_dir = os.path.dirname(self.modified_file_path)
+        max_serializer_value = self.set_advanced_option_max(self.options_serializer.currentText(), utils.serializer_space)
+        check_serializer_val = self.ser_idx_spin.value() <= max_serializer_value
 
-        cmd = [
-            "dc_toolkit",
-            "compress_with_optimal",
-            self.modified_file_path,
-            temp_dir,
-            selected_var,
-            str(comp_idx), str(filt_idx), str(ser_idx)
-        ]
+        if not check_compx_val:
+            param = "Compressor"
+            self.show_popup(param, self.comp_idx_spin.value(), max_compressor_value)
+        elif not check_filter_val:
+            param = "Filter"
+            self.show_popup(param, self.filt_idx_spin.value(), max_filter_value)
+        elif not check_serializer_val:
+            param = "Serializer"
+            self.show_popup(param, self.ser_idx_spin.value(), max_serializer_value)
+        else:
+            selected_field = self.field_selection.currentText()
 
-        self.log.append(f"Running compression with parameters: comp_idx={comp_idx}, filt_idx={filt_idx}, ser_idx={ser_idx}")
-        before = set(os.listdir(temp_dir))
-        try:
-            subprocess.run(cmd, capture_output=True, text=True, check=True)
-            self.log.append("Compression completed successfully.")
+            da = xr.open_dataset(self.modified_file_path)[selected_field]
 
-            after = set(os.listdir(temp_dir))
-            generated_files = list(after - before)
-            output_file = os.path.join(temp_dir, generated_files[0])
+            compressor_class = self.options_compressor.currentText()
+            filter_class = self.options_filter.currentText()
+            serializer_class = self.options_serializer.currentText()
 
-            split_tmp_name = os.path.basename(output_file).split(".=.", 1)
-            compressed_file_name = f"{self.file_name}.=.{split_tmp_name[1]}"
-            self.log.append(f"Generated file: {compressed_file_name}")
+            compressors = utils.compressor_space(da, compressor_class)
+            filters = utils.filter_space(da, filter_class)
+            serializers = utils.serializer_space(da, serializer_class)
+            self.max_value = len(compressors)
+            self.comp_idx_spin.setMaximum(len(compressors))
+            self.filt_idx_spin.setMaximum(len(filters))
+            self.ser_idx_spin.setMaximum(len(serializers))
 
-            save_path, _ = QFileDialog.getSaveFileName(
-                self,
-                "save as zip file",
-                compressed_file_name,
-                "ZIP Archives (*.zip);;All Files (*)"
-            )
+            comp_idx = self.comp_idx_spin.value()
+            filt_idx = self.filt_idx_spin.value()
+            ser_idx = self.ser_idx_spin.value()
 
-            with zipfile.ZipFile(save_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
-                zipf.write(output_file, arcname=os.path.basename(output_file))
-            self.log.append(f"zip file saved to: {save_path}")
-            os.remove(output_file)
+            temp_dir = os.path.dirname(self.modified_file_path)
 
-        except subprocess.CalledProcessError as e:
-            self.log.append(f"Compression failed:\n{e.stderr}")
+            cmd = [
+                "dc_toolkit",
+                "compress_with_optimal",
+                self.modified_file_path,
+                temp_dir,
+                selected_field,
+                str(comp_idx), str(filt_idx), str(ser_idx),
+                "--compressor-class=" + compressor_class,
+                "--filter-class=" + filter_class,
+                "--serializer-class=" + serializer_class
+
+            ]
+
+            self.log.append(f"Running compression with parameters: comp_idx={comp_idx}, filt_idx={filt_idx}, ser_idx={ser_idx}")
+            before = set(os.listdir(temp_dir))
+            try:
+                subprocess.run(cmd, capture_output=True, text=True, check=True)
+                self.log.append("Compression completed successfully.")
+                after = set(os.listdir(temp_dir))
+                generated_files = list(after - before)
+                output_file = os.path.join(temp_dir, generated_files[0])
+
+                split_tmp_name = os.path.basename(output_file).split(".=.", 1)
+                compressed_file_name = f"{self.file_name}.=.{split_tmp_name[1]}"
+                self.log.append(f"Generated file: {compressed_file_name}")
+
+                save_path, _ = QFileDialog.getSaveFileName(
+                    self,
+                    "save as zip file",
+                    compressed_file_name,
+                    "ZIP Archives (*.zip);;All Files (*)"
+                )
+
+                with zipfile.ZipFile(save_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+                    zipf.write(output_file, arcname=os.path.basename(output_file))
+                self.log.append(f"zip file saved to: {save_path}")
+                os.remove(output_file)
+
+            except subprocess.CalledProcessError as e:
+                self.log.append(f"Compression failed:\n{e.stderr}")
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
