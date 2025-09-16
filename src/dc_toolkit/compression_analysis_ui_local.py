@@ -249,7 +249,7 @@ class CompressionAnalysisUI(QMainWindow):
 
         self.panel_layout.addWidget(QLabel("Set max L1 error:"))
         self.options_l1_error = QComboBox()
-        self.options_l1_error.addItems(["Pre-defined", range(0, 1, 0.1)])
+        self.options_l1_error.addItems(["Pre-defined"] + [str(x) for x in np.arange(0., 1., 0.1)])
         self.panel_layout.addWidget(self.options_l1_error)
 
         self.main_layout.addWidget(self.panel_frame)
