@@ -232,7 +232,7 @@ if uploaded_file is not None and uploaded_file.name.endswith(".nc"):
             options=options_serializer,
         )
 
-        options_l1_error = ["Pre-defined"] + [str(x) for x in np.arange(0., 1., 0.1)]
+        options_l1_error = ["Pre-defined"] + [str(round(x, 1)) for x in np.arange(0., 1., 0.1)]
         l1_error_class = st.selectbox(
             "Set max L1 error:",
             options=options_l1_error,
