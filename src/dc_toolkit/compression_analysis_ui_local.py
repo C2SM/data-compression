@@ -344,23 +344,36 @@ class CompressionAnalysisUI(QMainWindow):
         compressor_class = self.options_compressor.currentText()
         filter_class = self.options_filter.currentText()
         serializer_class = self.options_serializer.currentText()
-        l1_error_class = "" if self.options_l1_error.currentText() == "Pre-defined" else self.options_l1_error.currentText()
 
-
-        cmd = [
-            "mpirun",
-            "-n",
-            "8",
-            "dc_toolkit",
-            "evaluate_combos",
-            self.modified_file_path,
-            os.getcwd(),
-            "--field-to-compress=" + selected_var,
-            "--compressor-class=" + compressor_class,
-            "--filter-class=" + filter_class,
-            "--serializer-class=" + serializer_class,
-            "--override-existing-l1-error=" + l1_error_class
-        ]
+        if self.options_l1_error.currentText() == "Pre-defined":
+            cmd = [
+                "mpirun",
+                "-n",
+                "8",
+                "dc_toolkit",
+                "evaluate_combos",
+                self.modified_file_path,
+                os.getcwd(),
+                "--field-to-compress=" + selected_var,
+                "--compressor-class=" + compressor_class,
+                "--filter-class=" + filter_class,
+                "--serializer-class=" + serializer_class,
+            ]
+        else:
+            cmd = [
+                "mpirun",
+                "-n",
+                "8",
+                "dc_toolkit",
+                "evaluate_combos",
+                self.modified_file_path,
+                os.getcwd(),
+                "--field-to-compress=" + selected_var,
+                "--compressor-class=" + compressor_class,
+                "--filter-class=" + filter_class,
+                "--serializer-class=" + serializer_class,
+                "--override-existing-l1-error=" + self.options_l1_error.currentText()
+            ]
 
         self.thread = CompressorThread(cmd)
         self.thread.progress.connect(self.update_progress)

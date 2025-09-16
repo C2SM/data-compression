@@ -250,40 +250,75 @@ if uploaded_file is not None and uploaded_file.name.endswith(".nc"):
 
     if st.button("Analyze compressors"):
         if "santis" in where_am_i.stdout.strip():
-            cmd_compress = [
-                "srun",
-                "-A", parse_args().user_account,
-                "--time", parse_args().time,
-                "--nodes", parse_args().nodes,
-                "--ntasks-per-node", parse_args().ntasks_per_node,
-                "--uenv=prgenv-gnu/25.06:rc5",
-                "--view=default",
-                "--partition=debug",
-                "dc_toolkit",
-                "evaluate_combos",
-                parse_args().uploaded_file,
-                os.getcwd(),
-                "--field-to-compress=" + field_to_compress,
-                "--compressor-class=" + compressor_class,
-                "--filter-class=" + filter_class,
-                "--serializer-class=" + serializer_class,
-                "--override-existing-l1-error=" + l1_error_class
-            ]
+            if l1_error_class == "Pre-defined":
+                cmd_compress = [
+                    "srun",
+                    "-A", parse_args().user_account,
+                    "--time", parse_args().time,
+                    "--nodes", parse_args().nodes,
+                    "--ntasks-per-node", parse_args().ntasks_per_node,
+                    "--uenv=prgenv-gnu/25.06:rc5",
+                    "--view=default",
+                    "--partition=debug",
+                    "dc_toolkit",
+                    "evaluate_combos",
+                    parse_args().uploaded_file,
+                    os.getcwd(),
+                    "--field-to-compress=" + field_to_compress,
+                    "--compressor-class=" + compressor_class,
+                    "--filter-class=" + filter_class,
+                    "--serializer-class=" + serializer_class,
+                ]
+            else:
+                cmd_compress = [
+                    "srun",
+                    "-A", parse_args().user_account,
+                    "--time", parse_args().time,
+                    "--nodes", parse_args().nodes,
+                    "--ntasks-per-node", parse_args().ntasks_per_node,
+                    "--uenv=prgenv-gnu/25.06:rc5",
+                    "--view=default",
+                    "--partition=debug",
+                    "dc_toolkit",
+                    "evaluate_combos",
+                    parse_args().uploaded_file,
+                    os.getcwd(),
+                    "--field-to-compress=" + field_to_compress,
+                    "--compressor-class=" + compressor_class,
+                    "--filter-class=" + filter_class,
+                    "--serializer-class=" + serializer_class,
+                    "--override-existing-l1-error=" + l1_error_class
+                ]
         else:
-            cmd_compress = [
-                "mpirun",
-                "-n",
-                "8",
-                "dc_toolkit",
-                "evaluate_combos",
-                path_to_modified_file,
-                os.getcwd(),
-                "--field-to-compress="+field_to_compress,
-                "--compressor-class="+compressor_class,
-                "--filter-class="+filter_class,
-                "--serializer-class="+serializer_class,
-                "--override-existing-l1-error=" + l1_error_class
-            ]
+            if l1_error_class == "Pre-defined":
+                cmd_compress = [
+                    "mpirun",
+                    "-n",
+                    "8",
+                    "dc_toolkit",
+                    "evaluate_combos",
+                    path_to_modified_file,
+                    os.getcwd(),
+                    "--field-to-compress="+field_to_compress,
+                    "--compressor-class="+compressor_class,
+                    "--filter-class="+filter_class,
+                    "--serializer-class="+serializer_class,
+                ]
+            else:
+                cmd_compress = [
+                    "mpirun",
+                    "-n",
+                    "8",
+                    "dc_toolkit",
+                    "evaluate_combos",
+                    path_to_modified_file,
+                    os.getcwd(),
+                    "--field-to-compress=" + field_to_compress,
+                    "--compressor-class=" + compressor_class,
+                    "--filter-class=" + filter_class,
+                    "--serializer-class=" + serializer_class,
+                    "--override-existing-l1-error=" + l1_error_class
+                ]
 
         st.info("Analyzing compressors...")
         progress_text = st.empty()
