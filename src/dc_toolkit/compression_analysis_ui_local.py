@@ -35,8 +35,8 @@ from dc_toolkit import utils
 import zipfile
 
 
-def load_scored_results(file_name: str):
-    return np.load(file_name + "_scored_results_with_names.npy", allow_pickle=True)
+def load_scored_results(file_name: str, params_str: list[str]):
+    return np.load(file_name + params_str + "_scored_results_with_names.npy", allow_pickle=True)
 
 def create_cluster_plots(clean_arr_l1, clean_arr_l2, clean_arr_linf, n_clusters):
     kmeans = KMeans(n_clusters=n_clusters, random_state=0, n_init="auto")
@@ -169,9 +169,13 @@ class CompressorThread(QThread):
     log = pyqtSignal(str)
     finished = pyqtSignal()
 
-    def __init__(self, cmd):
+    def __init__(self, cmd, field_to_compress, compressor_class, filter_class, serializer_class):
         super().__init__()
         self.cmd = cmd
+        self.field_to_compress = field_to_compress
+        self.compressor_class = compressor_class
+        self.filter_class = filter_class
+        self.serializer_class = serializer_class
 
     def run(self):
         with subprocess.Popen(
@@ -187,10 +191,13 @@ class CompressorThread(QThread):
 
         where_am_i = subprocess.run(["uname", "-a"], capture_output=True, text=True)
         file_name = self.cmd[3] if "santis" in where_am_i.stdout.strip() else self.cmd[5]
-        scored_results = load_scored_results(os.path.basename(file_name))
+        score_results_file_name = [c for c in (self.field_to_compress, self.compressor_class, self.filter_class, self.serializer_class) if
+                                   c != ""]
+        params_str = '_' + '_'.join(score_results_file_name)
+        scored_results = load_scored_results(os.path.basename(file_name), params_str)
         scored_results_pd = pd.DataFrame(scored_results)
-        max_n_rows = 42976
-        max_nclusters = 5
+        max_n_rows, max_nclusters = 42976, 5
+
         adjusted_n_clusters = math.ceil(max_nclusters*len(scored_results_pd)/max_n_rows)
 
         numeric_cols = scored_results_pd.select_dtypes(include=[np.number]).columns
@@ -208,8 +215,8 @@ class CompressorThread(QThread):
         self.finished.emit()
 
 class ScientificSpinBox(QDoubleSpinBox):
-    def __init__(self, parent=None):
-        super(ScientificSpinBox, self).__init__(parent)
+    def __init__(self):
+        super(ScientificSpinBox, self).__init__(None)
         self.setLocale(QLocale(QLocale.Language.English, QLocale.Country.UnitedStates))
         self.setDecimals(10)
         self.setMinimum(0e0)
@@ -407,7 +414,12 @@ class CompressionAnalysisUI(QMainWindow):
                 "--override-existing-l1-error=" + str(self.options_l1_error.value())
             ]
 
-        self.thread = CompressorThread(cmd)
+        self.thread = CompressorThread(cmd,
+                                       field_to_compress=selected_var,
+                                       compressor_class=compressor_class,
+                                       filter_class=filter_class,
+                                       serializer_class=serializer_class
+                                       )
         self.thread.progress.connect(self.update_progress)
         self.thread.log.connect(self.log.append)
         self.main_dir_files = os.listdir(os.getcwd())

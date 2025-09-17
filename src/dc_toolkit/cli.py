@@ -225,8 +225,9 @@ def evaluate_combos(dataset_file: str, where_to_write: str,
             raw_values_explicit_with_names_gather = list(itertools.chain.from_iterable(raw_values_explicit_with_names_gather))
 
             # Needed for clustering
-            np.save(os.path.basename(dataset_file) + '_scored_results_raw.npy', np.asarray(pd.DataFrame(raw_values_explicit_gather)))
-            np.save(os.path.basename(dataset_file) + '_scored_results_with_names.npy', np.asarray(pd.DataFrame(raw_values_explicit_with_names_gather)))
+            score_results_file_name = [c for c in (field_to_compress, compressor_class, filter_class, serializer_class) if c != ""]
+            np.save(os.path.basename(dataset_file) + '_' + '_'.join(score_results_file_name) + '_scored_results_raw.npy', np.asarray(pd.DataFrame(raw_values_explicit_gather)))
+            np.save(os.path.basename(dataset_file) + '_' + '_'.join(score_results_file_name) + '_scored_results_with_names.npy', np.asarray(pd.DataFrame(raw_values_explicit_with_names_gather)))
 
             best_combo = max(results_gather, key=lambda x: x[1])
             msg = (

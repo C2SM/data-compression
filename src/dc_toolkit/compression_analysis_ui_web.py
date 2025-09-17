@@ -5,6 +5,7 @@
 #
 # Please, refer to the LICENSE file in the root directory.
 # SPDX-License-Identifier: BSD-3-Clause
+import math
 import os
 import subprocess
 import tempfile
@@ -52,13 +53,13 @@ def find_file(base_path, file_name):
     return None
 
 @st.cache_data
-def load_scored_results(uploaded_file_name: str):
-    return np.load(uploaded_file_name + "_scored_results_with_names.npy", allow_pickle=True)
+def load_scored_results(file_name: str, params_str: list[str]):
+    return np.load(file_name + params_str + "_scored_results_with_names.npy", allow_pickle=True)
 
 
 @st.cache_resource
-def create_cluster_plots(clean_arr_l1, clean_arr_l2, clean_arr_linf):
-    kmeans = KMeans(n_clusters=5, random_state=0, n_init="auto")
+def create_cluster_plots(clean_arr_l1, clean_arr_l2, clean_arr_linf, n_clusters):
+    kmeans = KMeans(n_clusters=n_clusters, random_state=0, n_init="auto")
 
     fig = make_subplots(rows=3, cols=1,
                         subplot_titles=[
@@ -332,9 +333,12 @@ if uploaded_file is not None and uploaded_file.name.endswith(".nc"):
 
         
         path_to_modified_file = display_file_name if "santis" in where_am_i.stdout.strip() else path_to_modified_file
-        scored_results = load_scored_results(os.path.basename(path_to_modified_file))
-
+        score_results_file_name = [c for c in (field_to_compress, compressor_class, filter_class, serializer_class) if c != ""]
+        params_str = '_' + '_'.join(score_results_file_name)
+        scored_results = load_scored_results(os.path.basename(path_to_modified_file), params_str)
         scored_results_pd = pd.DataFrame(scored_results)
+        max_n_rows, max_nclusters = 42976, 5
+        adjusted_n_clusters = math.ceil(max_nclusters*len(scored_results_pd)/max_n_rows)
 
         numeric_cols = scored_results_pd.select_dtypes(include=[np.number]).columns
         mask = np.isfinite(scored_results_pd[numeric_cols]).all(axis=1)
@@ -351,11 +355,11 @@ if uploaded_file is not None and uploaded_file.name.endswith(".nc"):
         }
 
         fig_to_save = create_cluster_plots(
-            clean_arr_l1, clean_arr_l2, clean_arr_linf
+            clean_arr_l1, clean_arr_l2, clean_arr_linf, adjusted_n_clusters
         )
 
         temp_dir = tempfile.gettempdir()
-        temp_html_path = os.path.join(temp_dir, f"cluster_plots_{os.getpid()}.html")
+        temp_html_path = os.path.join(temp_dir, f"cluster_plots_{os.getpid()}{params_str}.html")
         os.makedirs(os.path.dirname(temp_html_path), exist_ok=True)
         fig_to_save.write_html(temp_html_path, full_html=True, include_plotlyjs='cdn')
 
@@ -366,12 +370,15 @@ if uploaded_file is not None and uploaded_file.name.endswith(".nc"):
 
     if st.session_state.analysis_performed and st.session_state.temp_plot_file:
         plot_file_path = st.session_state.temp_plot_file
+        score_results_file_name = [c for c in (field_to_compress, compressor_class, filter_class, serializer_class) if
+                                   c != ""]
+        params_str = '_' + '_'.join(score_results_file_name)
 
         with open(plot_file_path, "rb") as f:
             st.download_button(
                 label="Download Plots as HTML",
                 data=f,
-                file_name="cluster_plots.html",
+                file_name=f"cluster_plots{params_str}.html",
                 mime="text/html",
             )
 
