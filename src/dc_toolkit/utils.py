@@ -13,6 +13,7 @@ import math
 import zipfile
 import click
 import humanize
+from pathlib import Path
 import numpy as np
 import dask
 import dask.array
@@ -45,8 +46,17 @@ _WITH_NUMCODECS_WASM = os.getenv("WITH_NUMCODECS_WASM", "true").lower() in ("1",
 _WITH_EBCC = os.getenv("WITH_EBCC", "true").lower() in ("1", "true", "yes")
 
 
-def open_netcdf(netcdf_file: str, field_to_compress: str | None = None, field_percentage_to_compress: float | None = None, rank: int = 0):
-    ds = xr.open_dataset(netcdf_file, chunks="auto")  # auto for Dask backend
+def open_dataset(dataset_file: str, field_to_compress: str | None = None, field_percentage_to_compress: float | None = None, rank: int = 0):
+    dataset_filepath = Path(dataset_file)    
+    if dataset_filepath.suffix == ".nc":
+        ds = xr.open_dataset(dataset_file, chunks="auto")  # auto for Dask backend
+    elif dataset_filepath.suffix == ".grib":
+        ds = xr.open_dataset(dataset_file, chunks="auto", engine="cfgrib", backend_kwargs={"indexpath": ""})
+    else:
+        if rank == 0:
+            click.echo(f"Unsupported file format: {dataset_filepath.suffix}. Only .nc and .grib are supported.")
+            click.echo("Aborting...")
+        sys.exit(1)
 
     if field_to_compress is not None and field_to_compress not in ds.data_vars:
         if rank == 0:
@@ -56,7 +66,7 @@ def open_netcdf(netcdf_file: str, field_to_compress: str | None = None, field_pe
         sys.exit(1)
 
     if rank == 0:
-        click.echo(f"netcdf_file.nbytes = {humanize.naturalsize(ds.nbytes, binary=True)}")
+        click.echo(f"dataset_file.nbytes = {humanize.naturalsize(ds.nbytes, binary=True)}")
         if field_to_compress is not None:
             nbytes = ds[field_to_compress].nbytes * (field_percentage_to_compress / 100) if field_percentage_to_compress else ds[field_to_compress].nbytes
             click.echo(f"field_to_compress.nbytes = {humanize.naturalsize(nbytes, binary=True)}")
@@ -69,10 +79,10 @@ def open_zarr_zipstore(zarr_zipstore_file: str):
     return zarr.open_group(store, mode='r'), store
 
 
-def compress_with_zarr(data, netcdf_file, field_to_compress, where_to_write, filters, compressors, serializer, verbose=True, rank=0):
+def compress_with_zarr(data, dataset_file, field_to_compress, where_to_write, filters, compressors, serializer, verbose=True, rank=0):
     assert isinstance(data.data, dask.array.Array)
 
-    basename = os.path.basename(netcdf_file)
+    basename = os.path.basename(dataset_file)
     zarr_file = os.path.join(where_to_write, basename)
     zarr_file = f"{zarr_file}.=.field_{field_to_compress}.=.rank_{rank}.zarr.zip"
 

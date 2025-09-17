@@ -51,7 +51,7 @@ def cli():
 
 
 @cli.command("evaluate_combos")
-@click.argument("netcdf_file", type=click.Path(exists=True, dir_okay=False))
+@click.argument("dataset_file", type=click.Path(exists=True, dir_okay=False))
 @click.argument("where_to_write", type=click.Path(dir_okay=True, file_okay=False, exists=False))
 @click.option("--field-to-compress", default=None, help="Field to compress [if not given, all fields will be compressed].")
 @click.option("--field-percentage-to-compress", default=None, callback=utils.validate_percentage, help="Compress a percentage of the field [1-99%]. If not given, the whole field will be compressed.")
@@ -61,7 +61,7 @@ def cli():
 @click.option("--override-existing-l1-error", type=float, default=None,
               help="Override the existing L1 error threshold from the lookup table. "
                    "If provided, this value will be used instead of the spreadsheet value.")
-def evaluate_combos(netcdf_file: str, where_to_write: str, 
+def evaluate_combos(dataset_file: str, where_to_write: str, 
                     field_to_compress: str | None = None, field_percentage_to_compress: str | None = None, 
                     compressor_class: str | None = None, filter_class: str | None = None, serializer_class: str | None = None,
                     override_existing_l1_error: float | None = None):
@@ -74,7 +74,7 @@ def evaluate_combos(netcdf_file: str, where_to_write: str,
 
     \b
     Args:
-        netcdf_file (str): Path to the input NetCDF file.
+        dataset_file (str): Path to the input dataset file.
         where_to_write (str): Directory where the output files will be written.
         field_to_compress (str | None, optional): Name of the field to compress. If None, all fields will be compressed. Defaults to None.
         field_percentage_to_compress (str | None, optional): Percentage of the field to compress [1-99%]. If not given, the whole field will be compressed. Defaults to None.
@@ -114,7 +114,7 @@ def evaluate_combos(netcdf_file: str, where_to_write: str,
         thresholds = pd.read_parquet(buffer)
 
     # This is opened by all MPI processes -lazy evaluation with Dask backend-
-    ds = utils.open_netcdf(netcdf_file, field_to_compress, field_percentage_to_compress, rank=rank)
+    ds = utils.open_dataset(dataset_file, field_to_compress, field_percentage_to_compress, rank=rank)
 
     for var in ds.data_vars:
         if field_to_compress is not None and field_to_compress != var:
@@ -182,7 +182,7 @@ def evaluate_combos(netcdf_file: str, where_to_write: str,
             try:
                 compression_ratio, errors, euclidean_distance = utils.compress_with_zarr(
                     data_to_compress,
-                    netcdf_file,
+                    dataset_file,
                     var,
                     where_to_write,
                     filters=filters_,
@@ -225,8 +225,8 @@ def evaluate_combos(netcdf_file: str, where_to_write: str,
             raw_values_explicit_with_names_gather = list(itertools.chain.from_iterable(raw_values_explicit_with_names_gather))
 
             # Needed for clustering
-            np.save(os.path.basename(netcdf_file) + '_scored_results_raw.npy', np.asarray(pd.DataFrame(raw_values_explicit_gather)))
-            np.save(os.path.basename(netcdf_file) + '_scored_results_with_names.npy', np.asarray(pd.DataFrame(raw_values_explicit_with_names_gather)))
+            np.save(os.path.basename(dataset_file) + '_scored_results_raw.npy', np.asarray(pd.DataFrame(raw_values_explicit_gather)))
+            np.save(os.path.basename(dataset_file) + '_scored_results_with_names.npy', np.asarray(pd.DataFrame(raw_values_explicit_with_names_gather)))
 
             best_combo = max(results_gather, key=lambda x: x[1])
             msg = (
@@ -240,7 +240,7 @@ def evaluate_combos(netcdf_file: str, where_to_write: str,
 
 
 @cli.command("compress_with_optimal")
-@click.argument("netcdf_file", type=click.Path(exists=True, dir_okay=False))
+@click.argument("dataset_file", type=click.Path(exists=True, dir_okay=False))
 @click.argument("where_to_write", type=click.Path(dir_okay=True, file_okay=False, exists=False))
 @click.argument("field_to_compress")
 @click.argument("comp_idx", type=int)
@@ -249,7 +249,7 @@ def evaluate_combos(netcdf_file: str, where_to_write: str,
 @click.option("--compressor-class", default=None, help="Same as in evaluate_combos.")
 @click.option("--filter-class", default=None, help="Same as in evaluate_combos.")
 @click.option("--serializer-class", default=None, help="Same as in evaluate_combos.")
-def compress_with_optimal(netcdf_file, where_to_write, field_to_compress, 
+def compress_with_optimal(dataset_file, where_to_write, field_to_compress, 
                           comp_idx, filt_idx, ser_idx, 
                           compressor_class: str | None = None, filter_class: str | None = None, serializer_class: str | None = None):
     """
@@ -261,7 +261,7 @@ def compress_with_optimal(netcdf_file, where_to_write, field_to_compress,
 
     \b
     Args:
-        netcdf_file (str): Path to the input NetCDF file.
+        dataset_file (str): Path to the input dataset file.
         where_to_write (str): Directory where the compressed output will be written.
         field_to_compress (str): Name of the field to compress.
         comp_idx (int): Index of the compressor to use.
@@ -281,7 +281,7 @@ def compress_with_optimal(netcdf_file, where_to_write, field_to_compress,
 
     os.makedirs(where_to_write, exist_ok=True)
 
-    ds = utils.open_netcdf(netcdf_file, field_to_compress)
+    ds = utils.open_dataset(dataset_file, field_to_compress)
     da = ds[field_to_compress]
 
     compressors = utils.compressor_space(da, compressor_class)
@@ -326,7 +326,7 @@ def compress_with_optimal(netcdf_file, where_to_write, field_to_compress,
 
     compression_ratio, errors, euclidean_distance = utils.compress_with_zarr(
         da,
-        netcdf_file,
+        dataset_file,
         field_to_compress,
         where_to_write,
         filters=filters_,
@@ -346,15 +346,15 @@ def compress_with_optimal(netcdf_file, where_to_write, field_to_compress,
     click.echo(msg)
 
 @cli.command("merge_compressed_fields")
-@click.argument("netcdf_file", type=click.Path(exists=True, dir_okay=False))
+@click.argument("dataset_file", type=click.Path(exists=True, dir_okay=False))
 @click.argument("compressed_files_location", type=click.Path(dir_okay=True, file_okay=False, exists=False))
-def merge_compressed_fields(netcdf_file: str, compressed_files_location: str):
+def merge_compressed_fields(dataset_file: str, compressed_files_location: str):
     """
     Once all fields have been compressed, this command merges them into a single Zarr Zipped file.
 
     \b
     Args:
-        netcdf_file (str): Path to the input NetCDF file.
+        dataset_file (str): Path to the input dataset file.
         compressed_files_location (str): Directory where the compressed files are located.
     """
     comm = MPI.COMM_WORLD
@@ -366,14 +366,14 @@ def merge_compressed_fields(netcdf_file: str, compressed_files_location: str):
         sys.exit(1)
 
     # populate this folder with the compressed fields
-    netcdf_filename = Path(netcdf_file).name
-    merged_folder = Path(compressed_files_location) / f"{netcdf_filename}.zarr"
+    dataset_filename = Path(dataset_file).name
+    merged_folder = Path(compressed_files_location) / f"{dataset_filename}.zarr"
     if Path(merged_folder).exists():
         shutil.rmtree(merged_folder)
     os.makedirs(merged_folder)
 
-    for var in utils.open_netcdf(netcdf_file).data_vars:
-        compressed_field = f"{Path(compressed_files_location) / netcdf_filename}.=.field_{var}.=.rank_{rank}.zarr.zip"
+    for var in utils.open_dataset(dataset_file).data_vars:
+        compressed_field = f"{Path(compressed_files_location) / dataset_filename}.=.field_{var}.=.rank_{rank}.zarr.zip"
         if not Path(compressed_field).exists():
             click.echo("All fields must be compressed first.")
             sys.exit(1)
