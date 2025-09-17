@@ -1,5 +1,6 @@
 
 import importlib.util
+import math
 import subprocess
 import sys
 
@@ -37,8 +38,8 @@ import zipfile
 def load_scored_results(file_name: str):
     return np.load(file_name + "_scored_results_with_names.npy", allow_pickle=True)
 
-def create_cluster_plots(clean_arr_l1, clean_arr_l2, clean_arr_linf):
-    kmeans = KMeans(n_clusters=5, random_state=0, n_init="auto")
+def create_cluster_plots(clean_arr_l1, clean_arr_l2, clean_arr_linf, n_clusters):
+    kmeans = KMeans(n_clusters=n_clusters, random_state=0, n_init="auto")
 
     fig = make_subplots(rows=3, cols=1,
                         subplot_titles=[
@@ -188,6 +189,9 @@ class CompressorThread(QThread):
         file_name = self.cmd[3] if "santis" in where_am_i.stdout.strip() else self.cmd[5]
         scored_results = load_scored_results(os.path.basename(file_name))
         scored_results_pd = pd.DataFrame(scored_results)
+        max_n_rows = 42976
+        max_nclusters = 5
+        adjusted_n_clusters = math.ceil(max_nclusters*len(scored_results_pd)/max_n_rows)
 
         numeric_cols = scored_results_pd.select_dtypes(include=[np.number]).columns
         mask = np.isfinite(scored_results_pd[numeric_cols]).all(axis=1)
@@ -198,7 +202,7 @@ class CompressorThread(QThread):
         clean_arr_linf = utils.slice_array(scored_results_pd, [0, 3, 5, 6, 7])
 
         create_cluster_plots(
-            clean_arr_l1, clean_arr_l2, clean_arr_linf
+            clean_arr_l1, clean_arr_l2, clean_arr_linf, adjusted_n_clusters
         )
 
         self.finished.emit()
