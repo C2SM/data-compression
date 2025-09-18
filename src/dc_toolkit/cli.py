@@ -55,18 +55,18 @@ def cli():
 @click.argument("where_to_write", type=click.Path(dir_okay=True, file_okay=False, exists=False))
 @click.option("--field-to-compress", default=None, help="Field to compress [if not given, all fields will be compressed].")
 @click.option("--field-percentage-to-compress", default=None, callback=utils.validate_percentage, help="Compress a percentage of the field [1-99%]. If not given, the whole field will be compressed.")
-@click.option("--compressor-class", default=None, help="Compressor class to use, i.e. specified instead of the full list [`none` skips all compressors].")
-@click.option("--filter-class", default=None, help="Filter class to use, i.e. specified instead of the full list [`none` skips all filters].")
-@click.option("--serializer-class", default=None, help="Serializer class to use, i.e. specified instead of the full list [`none` skips all serializers].")
+@click.option("--compressor-class", default="all", help="Compressor class to use (case insensitive), i.e. specified one instead of the full list `all` [`none` skips all compressors].")
+@click.option("--filter-class", default="all", help="Filter class to use (case insensitive), i.e. specified one instead of the full list `all` [`none` skips all filters].")
+@click.option("--serializer-class", default="all", help="Serializer class to use (case insensitive), i.e. specified one instead of the full list `all` [`none` skips all serializers].")
 @click.option("--override-existing-l1-error", type=float, default=None,
               help="Override the existing L1 error threshold from the lookup table. "
                    "If provided, this value will be used instead of the spreadsheet value.")
 def evaluate_combos(dataset_file: str, where_to_write: str, 
-                    field_to_compress: str | None = None, field_percentage_to_compress: str | None = None, 
-                    compressor_class: str | None = None, filter_class: str | None = None, serializer_class: str | None = None,
+                    field_to_compress: str | None = None, field_percentage_to_compress: str | None = None,
+                    compressor_class: str = "all", filter_class: str = "all", serializer_class: str = "all",
                     override_existing_l1_error: float | None = None):
     """
-    Loop over combinations of compressors, filters, and serializers to find the optimal configuration for compressing a given field in a NetCDF file.
+    Loop over combinations of compressors, filters, and serializers to find the optimal configuration for compressing a given field in a dataset file.
 
     List of compressors : Blosc, LZ4, Zstd, Zlib, GZip, BZ2, LZMA \n
     List of filters     : Delta, BitRound, Quantize, Asinh, FixedOffsetScale \n
@@ -78,9 +78,10 @@ def evaluate_combos(dataset_file: str, where_to_write: str,
         where_to_write (str): Directory where the output files will be written.
         field_to_compress (str | None, optional): Name of the field to compress. If None, all fields will be compressed. Defaults to None.
         field_percentage_to_compress (str | None, optional): Percentage of the field to compress [1-99%]. If not given, the whole field will be compressed. Defaults to None.
-        compressor_class (str | None, optional): Compressor class to use, i.e. specified instead of the full list [`none` skips all compressors].
-        filter_class (str | None, optional): Filter class to use, i.e. specified instead of the full list [`none` skips all filters].
-        serializer_class (str | None, optional): Serializer class to use, i.e. specified instead of the full list [`none` skips all serializers].
+        compressor_class (str, optional): Compressor class to use (case insensitive), i.e. specified one instead of the full list `all` [`none` skips all compressors].
+        filter_class (str, optional): Filter class to use (case insensitive), i.e. specified one instead of the full list `all` [`none` skips all filters].
+        serializer_class (str, optional): Serializer class to use (case insensitive), i.e. specified one instead of the full list `all` [`none` skips all serializers].
+        override_existing_l1_error (float | None, optional): Override the existing L1 error threshold from the lookup table. If provided, this value will be used instead of the spreadsheet value.
     """
     dask.config.set(scheduler="single-threaded")
     dask.config.set(array__chunk_size="512MiB")
@@ -247,18 +248,21 @@ def evaluate_combos(dataset_file: str, where_to_write: str,
 @click.argument("comp_idx", type=int)
 @click.argument("filt_idx", type=int)
 @click.argument("ser_idx", type=int)
-@click.option("--compressor-class", default=None, help="Same as in evaluate_combos.")
-@click.option("--filter-class", default=None, help="Same as in evaluate_combos.")
-@click.option("--serializer-class", default=None, help="Same as in evaluate_combos.")
+@click.option("--compressor-class", default="all", help="Same as in evaluate_combos.")
+@click.option("--filter-class", default="all", help="Same as in evaluate_combos.")
+@click.option("--serializer-class", default="all", help="Same as in evaluate_combos.")
 def compress_with_optimal(dataset_file, where_to_write, field_to_compress, 
                           comp_idx, filt_idx, ser_idx, 
-                          compressor_class: str | None = None, filter_class: str | None = None, serializer_class: str | None = None):
+                          compressor_class: str = "all", filter_class: str = "all", serializer_class: str = "all"):
     """
     Compress a field with the optimal combination of 
     compressor, filter, and serializer as generated by the evaluate_combos command.
 
     Make sure to provide the same --[compressor/filter/serializer]-class and the same environment variables
     as in evaluate_combos to ensure consistency.
+    
+    Note on passing -1 as index:
+    dc_toolkit compress_with_optimal ... --compressor-class X --filter-class Y --serializer-class Z --- -1 -1 -1
 
     \b
     Args:
@@ -268,9 +272,9 @@ def compress_with_optimal(dataset_file, where_to_write, field_to_compress,
         comp_idx (int): Index of the compressor to use.
         filt_idx (int): Index of the filter to use.
         ser_idx (int): Index of the serializer to use.
-        compressor_class (str | None, optional): Look evaluate_combos.
-        filter_class (str | None, optional): Look evaluate_combos.
-        serializer_class (str | None, optional): Look evaluate_combos.
+        compressor_class (str, optional): Look evaluate_combos.
+        filter_class (str, optional): Look evaluate_combos.
+        serializer_class (str, optional): Look evaluate_combos.
     """
     comm = MPI.COMM_WORLD
     rank = comm.Get_rank()

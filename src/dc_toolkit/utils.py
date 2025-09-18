@@ -171,7 +171,7 @@ def compute_errors_distances(da_compressed, da):
     return "\n".join(f"{k:20s}: {v}" for k, v in errors_.items()), errors, euclidean_distance, normalized_euclidean_distance
 
 
-def compressor_space(da, compressor_class=None):
+def compressor_space(da, compressor_class="all"):
     # https://numcodecs.readthedocs.io/en/stable/zarr3.html#compressors-bytes-to-bytes-codecs
 
     compressor_space = []
@@ -179,11 +179,15 @@ def compressor_space(da, compressor_class=None):
     _COMPRESSORS = [numcodecs.zarr3.Blosc, numcodecs.zarr3.LZ4, numcodecs.zarr3.Zstd, numcodecs.zarr3.Zlib, numcodecs.zarr3.GZip, numcodecs.zarr3.BZ2, numcodecs.zarr3.LZMA]
     _COMPRESSOR_MAP = {cls.__name__.lower(): cls for cls in _COMPRESSORS}
 
-    if compressor_class and compressor_class.lower() in _COMPRESSOR_MAP:
+    if compressor_class.lower() == "all":
+        pass  # use all compressors
+    elif compressor_class.lower() in _COMPRESSOR_MAP:
         _COMPRESSORS = [_COMPRESSOR_MAP[compressor_class.lower()]]
-    elif compressor_class and compressor_class.lower() == "none":
+    elif compressor_class.lower() == "none":
         _COMPRESSORS = []
         compressor_space.append(None)
+    else:
+        pass  # use all compressors
 
     for compressor in _COMPRESSORS:
         if compressor == numcodecs.zarr3.Blosc:
@@ -213,7 +217,7 @@ def compressor_space(da, compressor_class=None):
     return list(zip(range(len(compressor_space)), compressor_space))
 
 
-def filter_space(da, filter_class=None):
+def filter_space(da, filter_class="all"):
     # https://numcodecs.readthedocs.io/en/stable/zarr3.html#filters-array-to-array-codecs
     # https://numcodecs-wasm.readthedocs.io/en/latest/
 
@@ -230,11 +234,15 @@ def filter_space(da, filter_class=None):
         _FILTERS = [numcodecs.zarr3.Delta]
 
     _FILTER_MAP = {cls.__name__.lower(): cls for cls in _FILTERS}
-    if filter_class and filter_class.lower() in _FILTER_MAP:
+    if filter_class.lower() == "all":
+        pass  # use all filters
+    elif filter_class.lower() in _FILTER_MAP:
         _FILTERS = [_FILTER_MAP[filter_class.lower()]]
-    elif filter_class and filter_class.lower() == "none":
+    elif filter_class.lower() == "none":
         _FILTERS = []
         filter_space.append(None)
+    else:
+        pass  # use all filters
 
     for filt in _FILTERS:
         if filt == numcodecs.zarr3.Delta:
@@ -279,7 +287,7 @@ def filter_space(da, filter_class=None):
     return list(zip(range(len(filter_space)), filter_space))
 
 
-def serializer_space(da, serializer_class=None):
+def serializer_space(da, serializer_class="all"):
     # https://numcodecs.readthedocs.io/en/stable/zarr3.html#serializers-array-to-bytes-codecs
     # https://numcodecs-wasm.readthedocs.io/en/latest/
     is_int = (da.dtype.kind == "i")
@@ -295,11 +303,15 @@ def serializer_space(da, serializer_class=None):
         _SERIALIZERS.append(Zfp)
 
     _SERIALIZER_MAP = {cls.__name__.lower(): cls for cls in _SERIALIZERS}
-    if serializer_class and serializer_class.lower() in _SERIALIZER_MAP:
+    if serializer_class.lower() == "all":
+        pass  # use all serializers
+    elif serializer_class.lower() in _SERIALIZER_MAP:
         _SERIALIZERS = [_SERIALIZER_MAP[serializer_class.lower()]]
-    elif serializer_class and serializer_class.lower() == "none":
+    elif serializer_class.lower() == "none":
         _SERIALIZERS = []
         serializer_space.append(None)
+    else:
+        pass  # use all serializers
 
     for serializer in _SERIALIZERS:
         if serializer == numcodecs.zarr3.PCodec:
