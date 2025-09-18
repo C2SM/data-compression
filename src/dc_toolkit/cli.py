@@ -289,25 +289,25 @@ def compress_with_optimal(dataset_file, where_to_write, field_to_compress,
     filters = utils.filter_space(da, filter_class)
     serializers = utils.serializer_space(da, serializer_class)
 
-    if 0 <= comp_idx < len(compressors):
+    if -1 <= comp_idx < len(compressors):
         pass
     else:
         click.echo(f"Invalid comp_idx: {comp_idx}")
         sys.exit(1)
-    if 0 <= filt_idx < len(filters):
+    if -1 <= filt_idx < len(filters):
         pass
     else:
         click.echo(f"Invalid filt_idx: {filt_idx}")
         sys.exit(1)
-    if 0 <= ser_idx < len(serializers):
+    if -1 <= ser_idx < len(serializers):
         pass
     else:
         click.echo(f"Invalid ser_idx: {ser_idx}")
         sys.exit(1)
 
-    optimal_compressor = compressors[comp_idx][1]
-    optimal_filter = filters[filt_idx][1]
-    optimal_serializer = serializers[ser_idx][1]
+    optimal_compressor = compressors[comp_idx][1] if comp_idx != -1 else None
+    optimal_filter = filters[filt_idx][1] if filt_idx != -1 else None
+    optimal_serializer = serializers[ser_idx][1] if ser_idx != -1 else None
 
     if isinstance(optimal_serializer, numcodecs.zarr3.ZFPY):
         da = da.stack(flat_dim=da.dims)
@@ -401,6 +401,14 @@ def open_zarr_zip_file_and_inspect(zarr_zip_file: str):
     Args:
         zarr_zip_file (str): Path to the Zarr file.
     """
+    comm = MPI.COMM_WORLD
+    rank = comm.Get_rank()
+    size = comm.Get_size()
+    if size > 1:
+        if rank == 0:
+            click.echo("This command is not meant to be run in parallel. Please run it with a single process.")
+        sys.exit(1)
+
     zarr_group, store = utils.open_zarr_zipstore(zarr_zip_file)
 
     click.echo(zarr_group.tree())
@@ -420,6 +428,14 @@ def open_zarr_zip_file_and_inspect(zarr_zip_file: str):
 @click.option("--out", "out_nc", type=click.Path(dir_okay=False), default=None,
               help="Output NetCDF file. Defaults to INPUT with .nc extension.")
 def from_zarr_zip_to_netcdf(zarr_zip_file: str, out_nc: str | None):
+    comm = MPI.COMM_WORLD
+    rank = comm.Get_rank()
+    size = comm.Get_size()
+    if size > 1:
+        if rank == 0:
+            click.echo("This command is not meant to be run in parallel. Please run it with a single process.")
+        sys.exit(1)
+
     if out_nc is None:
         out_nc = os.path.splitext(zarr_zip_file)[0] + ".nc"
 
