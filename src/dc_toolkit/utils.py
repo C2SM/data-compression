@@ -39,12 +39,6 @@ from numcodecs_wasm_zfp import Zfp
 
 os.environ["EBCC_LOG_LEVEL"] = "4"  # ERROR (suppress WARN and below)
 
-# By default, we enable lossy compressors/serializers/filters
-_WITH_LOSSY = os.getenv("WITH_LOSSY", "true").lower() in ("1", "true", "yes")
-
-_WITH_NUMCODECS_WASM = os.getenv("WITH_NUMCODECS_WASM", "true").lower() in ("1", "true", "yes")
-_WITH_EBCC = os.getenv("WITH_EBCC", "true").lower() in ("1", "true", "yes")
-
 
 def open_dataset(dataset_file: str, field_to_compress: str | None = None, field_percentage_to_compress: float | None = None, rank: int = 0):
     dataset_filepath = Path(dataset_file)    
@@ -171,7 +165,7 @@ def compute_errors_distances(da_compressed, da):
     return "\n".join(f"{k:20s}: {v}" for k, v in errors_.items()), errors, euclidean_distance, normalized_euclidean_distance
 
 
-def compressor_space(da, compressor_class="all"):
+def compressor_space(da, with_lossy=True, with_numcodecs_wasm=True, with_ebcc=True, compressor_class="all"):
     # https://numcodecs.readthedocs.io/en/stable/zarr3.html#compressors-bytes-to-bytes-codecs
 
     compressor_space = []
@@ -217,23 +211,24 @@ def compressor_space(da, compressor_class="all"):
     return list(zip(range(len(compressor_space)), compressor_space))
 
 
-def filter_space(da, filter_class="all"):
+def filter_space(da, with_lossy=True, with_numcodecs_wasm=True, with_ebcc=True, filter_class="all"):
     # https://numcodecs.readthedocs.io/en/stable/zarr3.html#filters-array-to-array-codecs
     # https://numcodecs-wasm.readthedocs.io/en/latest/
 
     filter_space = []
 
     _FILTERS = [numcodecs.zarr3.Delta]
-    if _WITH_LOSSY:
+    if with_lossy:
         _FILTERS += [numcodecs.zarr3.BitRound, numcodecs.zarr3.Quantize]
-    if _WITH_NUMCODECS_WASM:
-        if _WITH_LOSSY:
+    if with_numcodecs_wasm:
+        if with_lossy:
             _FILTERS.append(Asinh)
         _FILTERS.append(FixedOffsetScale)
     if da.dtype.kind == 'i':
         _FILTERS = [numcodecs.zarr3.Delta]
 
     _FILTER_MAP = {cls.__name__.lower(): cls for cls in _FILTERS}
+
     if filter_class.lower() == "all":
         pass  # use all filters
     elif filter_class.lower() in _FILTER_MAP:
@@ -287,7 +282,7 @@ def filter_space(da, filter_class="all"):
     return list(zip(range(len(filter_space)), filter_space))
 
 
-def serializer_space(da, serializer_class="all"):
+def serializer_space(da, with_lossy=True, with_numcodecs_wasm=True, with_ebcc=True, serializer_class="all"):
     # https://numcodecs.readthedocs.io/en/stable/zarr3.html#serializers-array-to-bytes-codecs
     # https://numcodecs-wasm.readthedocs.io/en/latest/
     is_int = (da.dtype.kind == "i")
@@ -295,14 +290,15 @@ def serializer_space(da, serializer_class="all"):
     serializer_space = []
 
     _SERIALIZERS = [numcodecs.zarr3.PCodec]
-    if _WITH_LOSSY:
+    if with_lossy:
         _SERIALIZERS.append(numcodecs.zarr3.ZFPY)
-    if _WITH_EBCC and _WITH_LOSSY:
+    if with_ebcc and with_lossy:
         _SERIALIZERS.append(EBCCZarrFilter)
-    if _WITH_NUMCODECS_WASM and _WITH_LOSSY:
+    if with_numcodecs_wasm and with_lossy:
         _SERIALIZERS.append(Zfp)
 
     _SERIALIZER_MAP = {cls.__name__.lower(): cls for cls in _SERIALIZERS}
+
     if serializer_class.lower() == "all":
         pass  # use all serializers
     elif serializer_class.lower() in _SERIALIZER_MAP:

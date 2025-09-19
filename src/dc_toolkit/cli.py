@@ -55,16 +55,17 @@ def cli():
 @click.argument("where_to_write", type=click.Path(dir_okay=True, file_okay=False, exists=False))
 @click.option("--field-to-compress", default=None, help="Field to compress [if not given, all fields will be compressed].")
 @click.option("--field-percentage-to-compress", default=None, callback=utils.validate_percentage, help="Compress a percentage of the field [1-99%]. If not given, the whole field will be compressed.")
+@click.option("--override-existing-l1-error", type=float, default=None, help="Override the existing L1 error threshold from the lookup table. If provided, this value will be used instead of the spreadsheet value.")
 @click.option("--compressor-class", default="all", help="Compressor class to use (case insensitive), i.e. specified one instead of the full list `all` [`none` skips all compressors].")
 @click.option("--filter-class", default="all", help="Filter class to use (case insensitive), i.e. specified one instead of the full list `all` [`none` skips all filters].")
 @click.option("--serializer-class", default="all", help="Serializer class to use (case insensitive), i.e. specified one instead of the full list `all` [`none` skips all serializers].")
-@click.option("--override-existing-l1-error", type=float, default=None,
-              help="Override the existing L1 error threshold from the lookup table. "
-                   "If provided, this value will be used instead of the spreadsheet value.")
+@click.option("--with-lossy/--without-lossy", default=True, show_default=True, help="Enable or disable lossy compressors/filters/serializers.")
+@click.option("--with-numcodecs-wasm/--without-numcodecs-wasm", default=True, show_default=True, help="Enable or disable Numcodecs-wasm codecs.")
+@click.option("--with-ebcc/--without-ebcc", default=True, show_default=True, help="Enable or disable EBCC serializer.")
 def evaluate_combos(dataset_file: str, where_to_write: str, 
-                    field_to_compress: str | None = None, field_percentage_to_compress: str | None = None,
+                    field_to_compress: str | None = None, field_percentage_to_compress: str | None = None, override_existing_l1_error: float | None = None,
                     compressor_class: str = "all", filter_class: str = "all", serializer_class: str = "all",
-                    override_existing_l1_error: float | None = None):
+                    with_lossy: bool = True, with_numcodecs_wasm: bool = True, with_ebcc: bool = True):
     """
     Loop over combinations of compressors, filters, and serializers to find the optimal configuration for compressing a given field in a dataset file.
 
@@ -78,10 +79,13 @@ def evaluate_combos(dataset_file: str, where_to_write: str,
         where_to_write (str): Directory where the output files will be written.
         field_to_compress (str | None, optional): Name of the field to compress. If None, all fields will be compressed. Defaults to None.
         field_percentage_to_compress (str | None, optional): Percentage of the field to compress [1-99%]. If not given, the whole field will be compressed. Defaults to None.
+        override_existing_l1_error (float | None, optional): Override the existing L1 error threshold from the lookup table. If provided, this value will be used instead of the spreadsheet value. Defaults to None.
         compressor_class (str, optional): Compressor class to use (case insensitive), i.e. specified one instead of the full list `all` [`none` skips all compressors].
         filter_class (str, optional): Filter class to use (case insensitive), i.e. specified one instead of the full list `all` [`none` skips all filters].
         serializer_class (str, optional): Serializer class to use (case insensitive), i.e. specified one instead of the full list `all` [`none` skips all serializers].
-        override_existing_l1_error (float | None, optional): Override the existing L1 error threshold from the lookup table. If provided, this value will be used instead of the spreadsheet value.
+        with_lossy (bool, optional): Enable or disable lossy compressors/filters/serializers. Defaults to True.
+        with_numcodecs_wasm (bool, optional): Enable or disable Numcodecs-wasm codecs. Defaults to True.
+        with_ebcc (bool, optional): Enable or disable EBCC serializer. Defaults to True.
     """
     dask.config.set(scheduler="single-threaded")
     dask.config.set(array__chunk_size="512MiB")
@@ -139,9 +143,9 @@ def evaluate_combos(dataset_file: str, where_to_write: str,
             slices = {dim: slice(0, max(1, int(size * (field_percentage_to_compress / 100)))) for dim, size in da.sizes.items()}
             da = da.isel(**slices)
 
-        compressors = utils.compressor_space(da, compressor_class)
-        filters = utils.filter_space(da, filter_class)
-        serializers = utils.serializer_space(da, serializer_class)
+        compressors = utils.compressor_space(da, with_lossy, with_numcodecs_wasm, with_ebcc, compressor_class)
+        filters = utils.filter_space(da, with_lossy, with_numcodecs_wasm, with_ebcc, filter_class)
+        serializers = utils.serializer_space(da, with_lossy, with_numcodecs_wasm, with_ebcc, serializer_class)
 
         num_compressors = len(compressors)
         num_filters = len(filters)
@@ -251,18 +255,22 @@ def evaluate_combos(dataset_file: str, where_to_write: str,
 @click.option("--compressor-class", default="all", help="Same as in evaluate_combos.")
 @click.option("--filter-class", default="all", help="Same as in evaluate_combos.")
 @click.option("--serializer-class", default="all", help="Same as in evaluate_combos.")
+@click.option("--with-lossy/--without-lossy", default=True, show_default=True, help="Same as in evaluate_combos.")
+@click.option("--with-numcodecs-wasm/--without-numcodecs-wasm", default=True, show_default=True, help="Same as in evaluate_combos.")
+@click.option("--with-ebcc/--without-ebcc", default=True, show_default=True, help="Same as in evaluate_combos.")
 def compress_with_optimal(dataset_file, where_to_write, field_to_compress, 
                           comp_idx, filt_idx, ser_idx, 
-                          compressor_class: str = "all", filter_class: str = "all", serializer_class: str = "all"):
+                          compressor_class: str = "all", filter_class: str = "all", serializer_class: str = "all",
+                          with_lossy: bool = True, with_numcodecs_wasm: bool = True, with_ebcc: bool = True):
     """
     Compress a field with the optimal combination of 
     compressor, filter, and serializer as generated by the evaluate_combos command.
 
-    Make sure to provide the same --[compressor/filter/serializer]-class and the same environment variables
-    as in evaluate_combos to ensure consistency.
+    Make sure to provide the same --[compressor/filter/serializer]-class and the same --with/without-[lossy/numcodecs-wasm/ebcc] flags as in evaluate_combos,
+    such that the same lists of instantiated objects are generated.
     
     Note on passing -1 as index:
-    dc_toolkit compress_with_optimal ... --compressor-class X --filter-class Y --serializer-class Z --- -1 -1 -1
+    dc_toolkit compress_with_optimal ... --compressor-class X ... --- -1 -1 -1
 
     \b
     Args:
@@ -275,6 +283,9 @@ def compress_with_optimal(dataset_file, where_to_write, field_to_compress,
         compressor_class (str, optional): Look evaluate_combos.
         filter_class (str, optional): Look evaluate_combos.
         serializer_class (str, optional): Look evaluate_combos.
+        with_lossy (bool, optional): Look evaluate_combos.
+        with_numcodecs_wasm (bool, optional): Look evaluate_combos.
+        with_ebcc (bool, optional): Look evaluate_combos.
     """
     comm = MPI.COMM_WORLD
     rank = comm.Get_rank()
@@ -289,9 +300,9 @@ def compress_with_optimal(dataset_file, where_to_write, field_to_compress,
     ds = utils.open_dataset(dataset_file, field_to_compress)
     da = ds[field_to_compress]
 
-    compressors = utils.compressor_space(da, compressor_class)
-    filters = utils.filter_space(da, filter_class)
-    serializers = utils.serializer_space(da, serializer_class)
+    compressors = utils.compressor_space(da, with_lossy, with_numcodecs_wasm, with_ebcc, compressor_class)
+    filters = utils.filter_space(da, with_lossy, with_numcodecs_wasm, with_ebcc, filter_class)
+    serializers = utils.serializer_space(da, with_lossy, with_numcodecs_wasm, with_ebcc, serializer_class)
 
     if -1 <= comp_idx < len(compressors):
         pass
