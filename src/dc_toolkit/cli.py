@@ -71,7 +71,7 @@ def evaluate_combos(dataset_file: str, where_to_write: str,
 
     List of compressors : Blosc, LZ4, Zstd, Zlib, GZip, BZ2, LZMA \n
     List of filters     : Delta, BitRound, Quantize, Asinh, FixedOffsetScale \n
-    List of serializers : PCodec, ZFPY, EBCCZarrFilter, Zfp, Sperr, Sz3
+    List of serializers : PCodec, ZFPY, EBCCZarrFilter, Zfp
 
     \b
     Args:
