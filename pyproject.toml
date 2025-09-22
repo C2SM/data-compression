@@ -19,7 +19,7 @@ dependencies = [
     "dask[complete]",
     "h5py >=3.11",
     "zarr >=3.1.1, <3.1.3",
-    "numcodecs",
+    "numcodecs <0.16.3",
     "zarr-any-numcodecs >=0.1.3",
     "json5",
     "rich",
