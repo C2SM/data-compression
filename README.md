@@ -29,7 +29,7 @@ once the above is complete (just for Santis, locally it is not needed):
 git clone git@github.com:C2SM/data-compression.git
 python -m venv venv
 source venv/bin/activate
-bash install_data_compression.sh
+bash install_dc_toolkit.sh
 ```
 
 ## Usage
