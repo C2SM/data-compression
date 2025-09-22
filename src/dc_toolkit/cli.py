@@ -77,15 +77,15 @@ def evaluate_combos(dataset_file: str, where_to_write: str,
     Args:
         dataset_file (str): Path to the input dataset file.
         where_to_write (str): Directory where the output files will be written.
-        field_to_compress (str | None, optional): Name of the field to compress. If None, all fields will be compressed. Defaults to None.
-        field_percentage_to_compress (str | None, optional): Percentage of the field to compress [1-99%]. If not given, the whole field will be compressed. Defaults to None.
-        override_existing_l1_error (float | None, optional): Override the existing L1 error threshold from the lookup table. If provided, this value will be used instead of the spreadsheet value. Defaults to None.
-        compressor_class (str, optional): Compressor class to use (case insensitive), i.e. specified one instead of the full list `all` [`none` skips all compressors].
-        filter_class (str, optional): Filter class to use (case insensitive), i.e. specified one instead of the full list `all` [`none` skips all filters].
-        serializer_class (str, optional): Serializer class to use (case insensitive), i.e. specified one instead of the full list `all` [`none` skips all serializers].
-        with_lossy (bool, optional): Enable or disable lossy compressors/filters/serializers. Defaults to True.
-        with_numcodecs_wasm (bool, optional): Enable or disable Numcodecs-wasm codecs. Defaults to True.
-        with_ebcc (bool, optional): Enable or disable EBCC serializer. Defaults to True.
+        field_to_compress: --field-to-compress
+        field_percentage_to_compress: --field-percentage-to-compress
+        override_existing_l1_error: --override-existing-l1-error
+        compressor_class: --compressor-class
+        filter_class: --filter-class
+        serializer_class: --serializer-class
+        with_lossy: --with-lossy/--without-lossy
+        with_numcodecs_wasm: --with-numcodecs-wasm/--without-numcodecs-wasm
+        with_ebcc: --with-ebcc/--without-ebcc
     """
     dask.config.set(scheduler="single-threaded")
     dask.config.set(array__chunk_size="512MiB")
@@ -279,12 +279,12 @@ def compress_with_optimal(dataset_file, where_to_write, field_to_compress,
         comp_idx (int): Index of the compressor to use.
         filt_idx (int): Index of the filter to use.
         ser_idx (int): Index of the serializer to use.
-        compressor_class (str, optional): Look evaluate_combos.
-        filter_class (str, optional): Look evaluate_combos.
-        serializer_class (str, optional): Look evaluate_combos.
-        with_lossy (bool, optional): Look evaluate_combos.
-        with_numcodecs_wasm (bool, optional): Look evaluate_combos.
-        with_ebcc (bool, optional): Look evaluate_combos.
+        compressor_class: --compressor-class
+        filter_class: --filter-class
+        serializer_class: --serializer-class
+        with_lossy: --with-lossy/--without-lossy
+        with_numcodecs_wasm: --with-numcodecs-wasm/--without-numcodecs-wasm
+        with_ebcc: --with-ebcc/--without-ebcc
     """
     comm = MPI.COMM_WORLD
     rank = comm.Get_rank()
