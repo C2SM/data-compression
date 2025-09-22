@@ -530,22 +530,26 @@ def analyze_clustering(npy_file: str):
     # Plot Error and Similarity Metrics VS Ratio
     kmeans = KMeans(n_clusters=5, random_state=0, n_init="auto")
 
-    fig = make_subplots(rows=2, cols=2,
+    fig = make_subplots(rows=3, cols=1,
                         subplot_titles=[
                             "L1 VS Ratio KMeans Clustering", "L2 VS Ratio KMeans Clustering",
-                            "LInf VS Ratio KMeans Clustering", "DWT VS Ratio KMeans Clustering"
+                            "LInf VS Ratio KMeans Clustering"
                         ])
 
     # L1 clustering
     clean_arr_l1_filtered = np.column_stack((clean_arr_l1[:, 0].astype(float), clean_arr_l1[:, 1].astype(float)))
-    y_kmeans = kmeans.fit_predict(clean_arr_l1_filtered)
+
     df_l1 = pd.DataFrame(clean_arr_l1_filtered, columns=["Ratio", "L1"])
     df_l1["compressor"] = clean_arr_l1[:, 2]
     df_l1["filter"] = clean_arr_l1[:, 3]
     df_l1["serializer"] = clean_arr_l1[:, 4]
-    fig_l1 = px.scatter(df_l1, x="Ratio", y="L1", color=y_kmeans,
-                     title="L1 VS Ratio KMeans Clustering",
-                     hover_data=["compressor", "filter", "serializer"])
+
+    y_kmeans = kmeans.fit_predict(pd.DataFrame(df_l1, columns=["Ratio", "L1"]))
+    color = np.ones(y_kmeans.shape) if len(np.unique(y_kmeans)) == 1 else y_kmeans
+
+    fig_l1 = px.scatter(df_l1, x="Ratio", y="L1", color=color,
+                        title="L1 VS Ratio KMeans Clustering",
+                        hover_data=["compressor", "filter", "serializer"])
 
     fig.add_trace(
         go.Scatter(
@@ -560,91 +564,82 @@ def analyze_clustering(npy_file: str):
         row=1,
         col=1
     )
+    fig.update_xaxes(title_text="Ratio", row=1, col=1)
+    fig.update_yaxes(title_text="L1", row=1, col=1)
+
     for trace in fig_l1.data:
         fig.add_trace(trace, row=1, col=1)
 
-    # L2 clustering
-    clean_arr_l2_filtered = np.column_stack((clean_arr_l2[:, 0].astype(float), clean_arr_l2[:, 1].astype(float)))
-    y_kmeans = kmeans.fit_predict(clean_arr_l2_filtered)
-    df_l2 = pd.DataFrame(clean_arr_l2_filtered, columns=["Ratio", "L2"])
-    df_l2["compressor"] = clean_arr_l2[:, 2]
-    df_l2["filter"] = clean_arr_l2[:, 3]
-    df_l2["serializer"] = clean_arr_l2[:, 4]
-    fig_l2 = px.scatter(df_l2, x="Ratio", y="L2", color=y_kmeans,
-                     title="L2 VS Ratio KMeans Clustering",
-                     hover_data=["compressor", "filter", "serializer"])
+        # L2 clustering
+        clean_arr_l2_filtered = np.column_stack((clean_arr_l2[:, 0].astype(float), clean_arr_l2[:, 1].astype(float)))
 
-    fig.add_trace(
-        go.Scatter(
-            x=kmeans.cluster_centers_[:, 0],
-            y=kmeans.cluster_centers_[:, 1],
-            mode="markers+text",
-            marker=dict(color="black", size=12, symbol="x"),
-            textposition="top center",
-            name="Centroids",
-            showlegend=False
-        ),
-        row=1,
-        col=2
-    )
-    for trace in fig_l2.data:
-        fig.add_trace(trace, row=1, col=2)
+        df_l2 = pd.DataFrame(clean_arr_l2_filtered, columns=["Ratio", "L2"])
+        df_l2["compressor"] = clean_arr_l2[:, 2]
+        df_l2["filter"] = clean_arr_l2[:, 3]
+        df_l2["serializer"] = clean_arr_l2[:, 4]
 
+        y_kmeans = kmeans.fit_predict(pd.DataFrame(df_l2, columns=["Ratio", "L2"]))
+        color = np.ones(y_kmeans.shape) if len(np.unique(y_kmeans)) == 1 else y_kmeans
 
-    # LInf clustering
-    clean_arr_linf_filtered = np.column_stack((clean_arr_linf[:, 0].astype(float), clean_arr_linf[:, 1].astype(float)))
-    y_kmeans = kmeans.fit_predict(clean_arr_linf_filtered)
-    df_linf = pd.DataFrame(clean_arr_linf_filtered, columns=["Ratio", "LInf"])
-    df_linf["compressor"] = clean_arr_linf[:, 2]
-    df_linf["filter"] = clean_arr_linf[:, 3]
-    df_linf["serializer"] = clean_arr_linf[:, 4]
-    fig_linf = px.scatter(df_linf, x="Ratio", y="LInf", color=y_kmeans,
-                     title="LInf VS Ratio KMeans Clustering",
-                     hover_data=["compressor", "filter", "serializer"])
+        fig_l2 = px.scatter(df_l2, x="Ratio", y="L2", color=color,
+                            title="L2 VS Ratio KMeans Clustering",
+                            hover_data=["compressor", "filter", "serializer"])
 
-    fig.add_trace(
-        go.Scatter(
-            x=kmeans.cluster_centers_[:, 0],
-            y=kmeans.cluster_centers_[:, 1],
-            mode="markers+text",
-            marker=dict(color="black", size=12, symbol="x"),
-            textposition="top center",
-            name="Centroids",
-            showlegend=False
-        ),
-        row=2,
-        col=1
-    )
-    for trace in fig_linf.data:
-        fig.add_trace(trace, row=2, col=1)
+        fig.add_trace(
+            go.Scatter(
+                x=kmeans.cluster_centers_[:, 0],
+                y=kmeans.cluster_centers_[:, 1],
+                mode="markers+text",
+                marker=dict(color="black", size=12, symbol="x"),
+                textposition="top center",
+                name="Centroids",
+                showlegend=False
+            ),
+            row=2,
+            col=1
+        )
+        fig.update_xaxes(title_text="Ratio", row=2, col=1)
+        fig.update_yaxes(title_text="L2", row=2, col=1)
+        for trace in fig_l2.data:
+            fig.add_trace(trace, row=2, col=1)
 
+        # LInf clustering
+        clean_arr_linf_filtered = np.column_stack(
+            (clean_arr_linf[:, 0].astype(float), clean_arr_linf[:, 1].astype(float)))
 
-    # DWT clustering
-    clean_arr_dwt_filtered = np.column_stack((clean_arr_dwt[:, 0].astype(float), clean_arr_dwt[:, 1].astype(float)))
-    y_kmeans = kmeans.fit_predict(clean_arr_dwt_filtered)
-    df_dwt = pd.DataFrame(clean_arr_dwt_filtered, columns=["Ratio", "DWT"])
-    df_dwt["compressor"] = clean_arr_dwt[:, 2]
-    df_dwt["filter"] = clean_arr_dwt[:, 3]
-    df_dwt["serializer"] = clean_arr_dwt[:, 4]
-    fig_dwt = px.scatter(df_dwt, x="Ratio", y="DWT", color=y_kmeans,
-                     title="DWT VS Ratio KMeans Clustering",
-                     hover_data=["compressor", "filter", "serializer"])
+        df_linf = pd.DataFrame(clean_arr_linf_filtered, columns=["Ratio", "LInf"])
+        df_linf["compressor"] = clean_arr_linf[:, 2]
+        df_linf["filter"] = clean_arr_linf[:, 3]
+        df_linf["serializer"] = clean_arr_linf[:, 4]
+        df_linf["compressor_idx"] = utils.get_indexes(clean_arr_linf[:, 2], config_idxs['0'])
+        df_linf["filter_idx"] = utils.get_indexes(clean_arr_linf[:, 3], config_idxs['1'])
+        df_linf["serializer_idx"] = utils.get_indexes(clean_arr_linf[:, 4], config_idxs['2'])
 
-    fig.add_trace(
-        go.Scatter(
-            x=kmeans.cluster_centers_[:, 0],
-            y=kmeans.cluster_centers_[:, 1],
-            mode="markers+text",
-            marker=dict(color="black", size=12, symbol="x"),
-            textposition="top center",
-            name="Centroids",
-            showlegend=False
-        ),
-        row=2,
-        col=2
-    )
-    for trace in fig_dwt.data:
-        fig.add_trace(trace, row=2, col=2)
+        y_kmeans = kmeans.fit_predict(pd.DataFrame(df_linf, columns=["Ratio", "LInf"]))
+        color = np.ones(y_kmeans.shape) if len(np.unique(y_kmeans)) == 1 else y_kmeans
+
+        fig_linf = px.scatter(df_linf, x="Ratio", y="LInf", color=color,
+                              title="LInf VS Ratio KMeans Clustering",
+                              hover_data=["compressor", "filter", "serializer", "compressor_idx", "filter_idx",
+                                          "serializer_idx"])
+
+        fig.add_trace(
+            go.Scatter(
+                x=kmeans.cluster_centers_[:, 0],
+                y=kmeans.cluster_centers_[:, 1],
+                mode="markers+text",
+                marker=dict(color="black", size=12, symbol="x"),
+                textposition="top center",
+                name="Centroids",
+                showlegend=False
+            ),
+            row=3,
+            col=1
+        )
+        fig.update_xaxes(title_text="Ratio", row=3, col=1)
+        fig.update_yaxes(title_text="LInf", row=3, col=1)
+        for trace in fig_linf.data:
+            fig.add_trace(trace, row=3, col=1)
 
     fig.update_layout(
         title="",
