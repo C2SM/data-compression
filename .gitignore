@@ -6,3 +6,4 @@ EBCC/
 *.nc
 venv/
 out-*
+*.csv
