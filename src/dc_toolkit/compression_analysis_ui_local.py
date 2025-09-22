@@ -57,6 +57,8 @@ def create_cluster_plots(clean_arr_l1, clean_arr_l2, clean_arr_linf, n_clusters)
     df_l1["compressor_idx"] = utils.get_indexes(clean_arr_l1[:, 2], config_idxs['0'])
     df_l1["filter_idx"] = utils.get_indexes(clean_arr_l1[:, 3], config_idxs['1'])
     df_l1["serializer_idx"] = utils.get_indexes(clean_arr_l1[:, 4], config_idxs['2'])
+    # To account for overlapping cases
+    df_l1["Ratio"] = df_l1["Ratio"] + np.random.normal(0, 0.00001, size=len(df_l1))
 
     y_kmeans = kmeans.fit_predict(pd.DataFrame(df_l1, columns=["Ratio", "L1"]))
     color = np.ones(y_kmeans.shape) if len(np.unique(y_kmeans)) == 1 else y_kmeans
@@ -92,6 +94,8 @@ def create_cluster_plots(clean_arr_l1, clean_arr_l2, clean_arr_linf, n_clusters)
     df_l2["compressor_idx"] = utils.get_indexes(clean_arr_l2[:, 2], config_idxs['0'])
     df_l2["filter_idx"] = utils.get_indexes(clean_arr_l2[:, 3], config_idxs['1'])
     df_l2["serializer_idx"] = utils.get_indexes(clean_arr_l2[:, 4], config_idxs['2'])
+    # To account for overlapping cases
+    df_l2["Ratio"] = df_l2["Ratio"] + np.random.normal(0, 0.00001, size=len(df_l2))
 
     y_kmeans = kmeans.fit_predict(pd.DataFrame(df_l2, columns=["Ratio", "L2"]))
     color = np.ones(y_kmeans.shape) if len(np.unique(y_kmeans)) == 1 else y_kmeans
@@ -127,6 +131,8 @@ def create_cluster_plots(clean_arr_l1, clean_arr_l2, clean_arr_linf, n_clusters)
     df_linf["compressor_idx"] = utils.get_indexes(clean_arr_linf[:, 2], config_idxs['0'])
     df_linf["filter_idx"] = utils.get_indexes(clean_arr_linf[:, 3], config_idxs['1'])
     df_linf["serializer_idx"] = utils.get_indexes(clean_arr_linf[:, 4], config_idxs['2'])
+    # To account for overlapping cases
+    df_linf["Ratio"] = df_linf["Ratio"] + np.random.normal(0, 0.00001, size=len(df_linf))
 
     y_kmeans = kmeans.fit_predict(pd.DataFrame(df_linf, columns=["Ratio", "LInf"]))
     color = np.ones(y_kmeans.shape) if len(np.unique(y_kmeans)) == 1 else y_kmeans
@@ -336,15 +342,15 @@ class CompressionAnalysisUI(QMainWindow):
         form_layout = QFormLayout()
 
         self.comp_idx_spin = QSpinBox()
-        self.comp_idx_spin.setRange(-1, 79)
+        self.comp_idx_spin.setRange(0, 79)
         self.comp_idx_spin.setValue(10)
 
         self.filt_idx_spin = QSpinBox()
-        self.filt_idx_spin.setRange(-1, 16)
+        self.filt_idx_spin.setRange(0, 16)
         self.filt_idx_spin.setValue(10)
 
         self.ser_idx_spin = QSpinBox()
-        self.ser_idx_spin.setRange(-1, 34)
+        self.ser_idx_spin.setRange(0, 34)
         self.ser_idx_spin.setValue(10)
 
         form_layout.addRow("Compressor index:", self.comp_idx_spin)

@@ -79,6 +79,8 @@ def create_cluster_plots(clean_arr_l1, clean_arr_l2, clean_arr_linf, n_clusters)
     df_l1["compressor_idx"] = utils.get_indexes(clean_arr_l1[:, 2], config_idxs['0'])
     df_l1["filter_idx"] = utils.get_indexes(clean_arr_l1[:, 3], config_idxs['1'])
     df_l1["serializer_idx"] = utils.get_indexes(clean_arr_l1[:, 4], config_idxs['2'])
+    # To account for overlapping cases
+    df_l1["Ratio"] = df_l1["Ratio"] + np.random.normal(0, 0.00001, size=len(df_l1))
 
     y_kmeans = kmeans.fit_predict(pd.DataFrame(df_l1, columns=["Ratio", "L1"]))
     color = np.ones(y_kmeans.shape) if len(np.unique(y_kmeans)) == 1 else y_kmeans
@@ -115,6 +117,8 @@ def create_cluster_plots(clean_arr_l1, clean_arr_l2, clean_arr_linf, n_clusters)
     df_l2["compressor_idx"] = utils.get_indexes(clean_arr_l2[:, 2], config_idxs['0'])
     df_l2["filter_idx"] = utils.get_indexes(clean_arr_l2[:, 3], config_idxs['1'])
     df_l2["serializer_idx"] = utils.get_indexes(clean_arr_l2[:, 4], config_idxs['2'])
+    # To account for overlapping cases
+    df_l2["Ratio"] = df_l2["Ratio"] + np.random.normal(0, 0.00001, size=len(df_l2))
 
     y_kmeans = kmeans.fit_predict(pd.DataFrame(df_l2, columns=["Ratio", "L2"]))
     color = np.ones(y_kmeans.shape) if len(np.unique(y_kmeans)) == 1 else y_kmeans
@@ -151,6 +155,8 @@ def create_cluster_plots(clean_arr_l1, clean_arr_l2, clean_arr_linf, n_clusters)
     df_linf["compressor_idx"] = utils.get_indexes(clean_arr_linf[:, 2], config_idxs['0'])
     df_linf["filter_idx"] = utils.get_indexes(clean_arr_linf[:, 3], config_idxs['1'])
     df_linf["serializer_idx"] = utils.get_indexes(clean_arr_linf[:, 4], config_idxs['2'])
+    # To account for overlapping cases
+    df_linf["Ratio"] = df_linf["Ratio"] + np.random.normal(0, 0.00001, size=len(df_linf))
 
     y_kmeans = kmeans.fit_predict(pd.DataFrame(df_linf, columns=["Ratio", "LInf"]))
     color = np.ones(y_kmeans.shape) if len(np.unique(y_kmeans)) == 1 else y_kmeans
@@ -277,11 +283,10 @@ if uploaded_file is not None and uploaded_file.name.endswith(".nc"):
         st.session_state.analysis_performed = False
         st.session_state.temp_plot_file = None
 
+    with_lossy_option = "--with-lossy" if lossy_class == "with" else "--without-lossy"
+    with_numcodecs_option = "--with-numcodecs-wasm" if numcodecs_wasm_class == "with" else "--without-numcodecs-wasm"
+    with_ebcc_option = "--with-ebcc" if ebcc_class == "with" else "--without-ebcc"
     if st.button("Analyze compressors"):
-        with_options_ls = []
-        with_options_ls.append("--with-lossy") if lossy_class == "with" else with_options_ls.append("--without-lossy")
-        with_options_ls.append("--with-numcodecs-wasm") if numcodecs_wasm_class == "with" else with_options_ls.append("--without-numcodecs-wasm")
-        with_options_ls.append("--with-ebcc") if ebcc_class == "with" else with_options_ls.append("--without-ebcc")
         if "santis" in where_am_i.stdout.strip():
             if predefined_l1:
                 cmd_compress = [
@@ -301,7 +306,7 @@ if uploaded_file is not None and uploaded_file.name.endswith(".nc"):
                     "--compressor-class=" + compressor_class,
                     "--filter-class=" + filter_class,
                     "--serializer-class=" + serializer_class,
-                    *with_options_ls
+                    *[with_lossy_option, with_numcodecs_option, with_ebcc_option]
                 ]
             else:
                 cmd_compress = [
@@ -322,7 +327,7 @@ if uploaded_file is not None and uploaded_file.name.endswith(".nc"):
                     "--filter-class=" + filter_class,
                     "--serializer-class=" + serializer_class,
                     "--override-existing-l1-error=" + str(l1_error_class),
-                    *with_options_ls
+                    *[with_lossy_option, with_numcodecs_option, with_ebcc_option]
                 ]
         else:
             if predefined_l1:
@@ -338,7 +343,7 @@ if uploaded_file is not None and uploaded_file.name.endswith(".nc"):
                     "--compressor-class="+compressor_class,
                     "--filter-class="+filter_class,
                     "--serializer-class="+serializer_class,
-                    *with_options_ls
+                    *[with_lossy_option, with_numcodecs_option, with_ebcc_option]
                 ]
             else:
                 cmd_compress = [
@@ -354,7 +359,7 @@ if uploaded_file is not None and uploaded_file.name.endswith(".nc"):
                     "--filter-class=" + filter_class,
                     "--serializer-class=" + serializer_class,
                     "--override-existing-l1-error=" + str(l1_error_class),
-                    *with_options_ls
+                    *[with_lossy_option, with_numcodecs_option, with_ebcc_option]
                 ]
 
         st.info("Analyzing compressors...")
@@ -374,9 +379,9 @@ if uploaded_file is not None and uploaded_file.name.endswith(".nc"):
         path_to_modified_file = display_file_name if "santis" in where_am_i.stdout.strip() else path_to_modified_file
 
         pattern = r'--.*?-?'
-        with_lossy = re.sub(pattern, '', with_options_ls[0], count=1)
-        with_numcodesc_wasm = re.sub(pattern, '', with_options_ls[1], count=1)
-        with_ebcc = re.sub(pattern, '', with_options_ls[2], count=1)
+        with_lossy = re.sub(pattern, '', with_lossy_option, count=1)
+        with_numcodesc_wasm = re.sub(pattern, '', with_numcodecs_option, count=1)
+        with_ebcc = re.sub(pattern, '', with_ebcc_option, count=1)
 
         score_results_file_name = [field_to_compress, compressor_class, filter_class, serializer_class, with_lossy, with_numcodesc_wasm, with_ebcc]
         params_str = '_' + '_'.join(score_results_file_name)
@@ -427,9 +432,9 @@ if uploaded_file is not None and uploaded_file.name.endswith(".nc"):
                 mime="text/html",
             )
 
-    comp_idx = st.number_input('comp_idx', min_value=-1, max_value=79, value=10)
-    filt_idx = st.number_input('filt_idx', min_value=-1, max_value=16, value=10)
-    ser_idx = st.number_input('ser_idx', min_value=-1, max_value=34, value=10)
+    comp_idx = st.number_input('comp_idx', min_value=0, max_value=79, value=10)
+    filt_idx = st.number_input('filt_idx', min_value=0, max_value=16, value=10)
+    ser_idx = st.number_input('ser_idx', min_value=0, max_value=34, value=10)
 
     if st.button("Compress file"):
         da = xarray.open_dataset(path_to_modified_file)[field_to_compress]
@@ -454,12 +459,6 @@ if uploaded_file is not None and uploaded_file.name.endswith(".nc"):
 
         max_serializer_value = len(serializers_options)
         check_serializer_val = ser_idx <= max_serializer_value
-
-        with_options_ls = []
-        with_options_ls.append("--with-lossy") if with_lossy else with_options_ls.append("--without-lossy")
-        with_options_ls.append("--with-numcodecs-wasm") if with_numcodecs_wasm else with_options_ls.append(
-            "--without-numcodecs-wasm")
-        with_options_ls.append("--with-ebcc") if with_ebcc == "with" else with_options_ls.append("--without-ebcc")
 
         if not check_compx_val:
             placeholder = st.empty()
@@ -512,7 +511,7 @@ if uploaded_file is not None and uploaded_file.name.endswith(".nc"):
                     os.getcwd(),
                     field_to_compress,
                     str(comp_idx), str(filt_idx), str(ser_idx),
-                    *with_options_ls
+                    *[with_lossy_option, with_numcodecs_option, with_ebcc_option]
                 ]
             else:
                 temp_dir = os.path.dirname(path_to_modified_file)
@@ -526,7 +525,7 @@ if uploaded_file is not None and uploaded_file.name.endswith(".nc"):
                     temp_dir,
                     field_to_compress,
                     str(comp_idx), str(filt_idx), str(ser_idx),
-                    *with_options_ls
+                    *[with_lossy_option, with_numcodecs_option, with_ebcc_option]
                 ]
 
             before = set(os.listdir(temp_dir))

@@ -54,6 +54,8 @@ def get_indexes(arr, indices):
             if "EBCC" in item:
                 fetch_new_idx = [value for key, value in codec_id_dict.items() if "EBCC" in key][0]
                 id_ls.append(fetch_new_idx)
+            else:
+                return IndexError(f'{item} not in list {list(codec_id_dict.keys())}')
     return np.asarray(id_ls)
 
 def open_dataset(dataset_file: str, field_to_compress: str | None = None, field_percentage_to_compress: float | None = None, rank: int = 0):
