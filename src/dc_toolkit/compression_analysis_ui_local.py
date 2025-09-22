@@ -1,10 +1,10 @@
 
 import importlib.util
 import math
+import re
 import subprocess
 import sys
 
-from PyQt6.QtGui import QValidator
 
 # PyQt6 might encounter issues when installed from pyproject.toml
 print("Installing PyQt6")
@@ -20,7 +20,8 @@ import tempfile
 from PyQt6.QtCore import QThread, pyqtSignal, QLocale
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QPushButton, QLabel, QComboBox, QProgressBar, QTextEdit, QFormLayout,
-                             QSpinBox, QToolButton, QFrame, QFileDialog, QMessageBox, QCheckBox, QDoubleSpinBox)
+                             QSpinBox, QToolButton, QFrame, QFileDialog, QMessageBox, QCheckBox, QDoubleSpinBox,
+                             QGridLayout)
 
 import xarray as xr
 
@@ -34,11 +35,11 @@ from plotly.subplots import make_subplots
 from dc_toolkit import utils
 import zipfile
 
-
 def load_scored_results(file_name: str, params_str: list[str]):
     return np.load(file_name + params_str + "_scored_results_with_names.npy", allow_pickle=True)
 
 def create_cluster_plots(clean_arr_l1, clean_arr_l2, clean_arr_linf, n_clusters):
+    config_idxs = pd.read_csv("config_space.csv")
     kmeans = KMeans(n_clusters=n_clusters, random_state=0, n_init="auto")
 
     fig = make_subplots(rows=3, cols=1,
@@ -49,16 +50,18 @@ def create_cluster_plots(clean_arr_l1, clean_arr_l2, clean_arr_linf, n_clusters)
 
     # L1 clustering
     clean_arr_l1_filtered = np.column_stack((clean_arr_l1[:, 0].astype(float), clean_arr_l1[:, 1].astype(float)))
-    y_kmeans = kmeans.fit_predict(clean_arr_l1_filtered)
     df_l1 = pd.DataFrame(clean_arr_l1_filtered, columns=["Ratio", "L1"])
     df_l1["compressor"] = clean_arr_l1[:, 2]
     df_l1["filter"] = clean_arr_l1[:, 3]
     df_l1["serializer"] = clean_arr_l1[:, 4]
-    df_l1["compressor_idx"] = np.arange(len(clean_arr_l1[:, 2]))
-    df_l1["filter_idx"] = np.arange(len(clean_arr_l1[:, 3]))
-    df_l1["serializer_idx"] = np.arange(len(clean_arr_l1[:, 4]))
+    df_l1["compressor_idx"] = utils.get_indexes(clean_arr_l1[:, 2], config_idxs['0'])
+    df_l1["filter_idx"] = utils.get_indexes(clean_arr_l1[:, 3], config_idxs['1'])
+    df_l1["serializer_idx"] = utils.get_indexes(clean_arr_l1[:, 4], config_idxs['2'])
 
-    fig_l1 = px.scatter(df_l1, x="Ratio", y="L1", color=y_kmeans,
+    y_kmeans = kmeans.fit_predict(pd.DataFrame(df_l1, columns=["Ratio", "L1"]))
+    color = np.ones(y_kmeans.shape) if len(np.unique(y_kmeans)) == 1 else y_kmeans
+
+    fig_l1 = px.scatter(df_l1, x="Ratio", y="L1", color=color,
                         title="L1 VS Ratio KMeans Clustering", hover_data=["compressor", "filter", "serializer", "compressor_idx", "filter_idx", "serializer_idx"])
 
     fig.add_trace(
@@ -82,16 +85,18 @@ def create_cluster_plots(clean_arr_l1, clean_arr_l2, clean_arr_linf, n_clusters)
 
     # L2 clustering
     clean_arr_l2_filtered = np.column_stack((clean_arr_l2[:, 0].astype(float), clean_arr_l2[:, 1].astype(float)))
-    y_kmeans = kmeans.fit_predict(clean_arr_l2_filtered)
     df_l2 = pd.DataFrame(clean_arr_l2_filtered, columns=["Ratio", "L2"])
     df_l2["compressor"] = clean_arr_l2[:, 2]
     df_l2["filter"] = clean_arr_l2[:, 3]
     df_l2["serializer"] = clean_arr_l2[:, 4]
-    df_l2["compressor_idx"] = np.arange(len(clean_arr_l2[:, 2]))
-    df_l2["filter_idx"] = np.arange(len(clean_arr_l2[:, 3]))
-    df_l2["serializer_idx"] = np.arange(len(clean_arr_l2[:, 4]))
+    df_l2["compressor_idx"] = utils.get_indexes(clean_arr_l2[:, 2], config_idxs['0'])
+    df_l2["filter_idx"] = utils.get_indexes(clean_arr_l2[:, 3], config_idxs['1'])
+    df_l2["serializer_idx"] = utils.get_indexes(clean_arr_l2[:, 4], config_idxs['2'])
 
-    fig_l2 = px.scatter(df_l2, x="Ratio", y="L2", color=y_kmeans,
+    y_kmeans = kmeans.fit_predict(pd.DataFrame(df_l2, columns=["Ratio", "L2"]))
+    color = np.ones(y_kmeans.shape) if len(np.unique(y_kmeans)) == 1 else y_kmeans
+
+    fig_l2 = px.scatter(df_l2, x="Ratio", y="L2", color=color,
                         title="L2 VS Ratio KMeans Clustering", hover_data=["compressor", "filter", "serializer", "compressor_idx", "filter_idx", "serializer_idx"])
 
     fig.add_trace(
@@ -115,16 +120,18 @@ def create_cluster_plots(clean_arr_l1, clean_arr_l2, clean_arr_linf, n_clusters)
     # LInf clustering
     clean_arr_linf_filtered = np.column_stack(
         (clean_arr_linf[:, 0].astype(float), clean_arr_linf[:, 1].astype(float)))
-    y_kmeans = kmeans.fit_predict(clean_arr_linf_filtered)
     df_linf = pd.DataFrame(clean_arr_linf_filtered, columns=["Ratio", "LInf"])
     df_linf["compressor"] = clean_arr_linf[:, 2]
     df_linf["filter"] = clean_arr_linf[:, 3]
     df_linf["serializer"] = clean_arr_linf[:, 4]
-    df_linf["compressor_idx"] = np.arange(len(clean_arr_linf[:, 2]))
-    df_linf["filter_idx"] = np.arange(len(clean_arr_linf[:, 3]))
-    df_linf["serializer_idx"] = np.arange(len(clean_arr_linf[:, 4]))
+    df_linf["compressor_idx"] = utils.get_indexes(clean_arr_linf[:, 2], config_idxs['0'])
+    df_linf["filter_idx"] = utils.get_indexes(clean_arr_linf[:, 3], config_idxs['1'])
+    df_linf["serializer_idx"] = utils.get_indexes(clean_arr_linf[:, 4], config_idxs['2'])
 
-    fig_linf = px.scatter(df_linf, x="Ratio", y="LInf", color=y_kmeans,
+    y_kmeans = kmeans.fit_predict(pd.DataFrame(df_linf, columns=["Ratio", "LInf"]))
+    color = np.ones(y_kmeans.shape) if len(np.unique(y_kmeans)) == 1 else y_kmeans
+
+    fig_linf = px.scatter(df_linf, x="Ratio", y="LInf", color=color,
                           title="LInf VS Ratio KMeans Clustering", hover_data=["compressor", "filter", "serializer", "compressor_idx", "filter_idx", "serializer_idx"])
 
     fig.add_trace(
@@ -169,13 +176,17 @@ class CompressorThread(QThread):
     log = pyqtSignal(str)
     finished = pyqtSignal()
 
-    def __init__(self, cmd, field_to_compress, compressor_class, filter_class, serializer_class):
+    def __init__(self, cmd, field_to_compress, compressor_class, filter_class, serializer_class, with_lossy, with_numcodesc_wasm, with_ebcc):
         super().__init__()
         self.cmd = cmd
         self.field_to_compress = field_to_compress
         self.compressor_class = compressor_class
         self.filter_class = filter_class
         self.serializer_class = serializer_class
+        pattern = r'--.*?-?'
+        self.with_lossy = re.sub(pattern, '', with_lossy, count=1)
+        self.with_numcodesc_wasm = re.sub(pattern, '', with_numcodesc_wasm, count=1)
+        self.with_ebcc = re.sub(pattern, '', with_ebcc, count=1)
 
     def run(self):
         with subprocess.Popen(
@@ -191,8 +202,7 @@ class CompressorThread(QThread):
 
         where_am_i = subprocess.run(["uname", "-a"], capture_output=True, text=True)
         file_name = self.cmd[3] if "santis" in where_am_i.stdout.strip() else self.cmd[5]
-        score_results_file_name = [c for c in (self.field_to_compress, self.compressor_class, self.filter_class, self.serializer_class) if
-                                   c != ""]
+        score_results_file_name = [self.field_to_compress, self.compressor_class, self.filter_class, self.serializer_class, self.with_lossy, self.with_numcodesc_wasm, self.with_ebcc]
         params_str = '_' + '_'.join(score_results_file_name)
         scored_results = load_scored_results(os.path.basename(file_name), params_str)
         scored_results_pd = pd.DataFrame(scored_results)
@@ -203,7 +213,6 @@ class CompressorThread(QThread):
         numeric_cols = scored_results_pd.select_dtypes(include=[np.number]).columns
         mask = np.isfinite(scored_results_pd[numeric_cols]).all(axis=1)
         scored_results_pd = scored_results_pd[mask].dropna()
-
         clean_arr_l1 = utils.slice_array(scored_results_pd, [0, 1, 5, 6, 7])
         clean_arr_l2 = utils.slice_array(scored_results_pd, [0, 2, 5, 6, 7])
         clean_arr_linf = utils.slice_array(scored_results_pd, [0, 3, 5, 6, 7])
@@ -263,28 +272,49 @@ class CompressionAnalysisUI(QMainWindow):
         self.panel_layout = QVBoxLayout(self.panel_frame)
         self.panel_layout.setContentsMargins(0, 0, 0, 0)
 
-        self.panel_layout.addWidget(QLabel("Choose a compressor:"))
+        self.grid_layout = QGridLayout()
+
+        self.grid_layout.addWidget(QLabel("Choose a compressor:"), 0, 0)
         self.options_compressor = QComboBox()
-        self.options_compressor.addItems(["", "Blosc", "LZ4", "Zstd", "Zlib", "GZip", "BZ2", "LZMA", "None"])
-        self.panel_layout.addWidget(self.options_compressor)
+        self.options_compressor.addItems(["all", "Blosc", "LZ4", "Zstd", "Zlib", "GZip", "BZ2", "LZMA", "None"])
+        self.grid_layout.addWidget(self.options_compressor, 1, 0)
 
-        self.panel_layout.addWidget(QLabel("Choose a filter:"))
+        self.grid_layout.addWidget(QLabel("Choose a filter:"), 0, 1)
         self.options_filter = QComboBox()
-        self.options_filter.addItems(["", "Delta", "BitRound", "Quantize", "Asinh", "FixedOffsetScale", "None"])
-        self.panel_layout.addWidget(self.options_filter)
+        self.options_filter.addItems(["all", "Delta", "BitRound", "Quantize", "Asinh", "FixedOffsetScale", "None"])
+        self.grid_layout.addWidget(self.options_filter, 1, 1)
 
-        self.panel_layout.addWidget(QLabel("Choose a serializer:"))
+        self.grid_layout.addWidget(QLabel("Choose a serializer:"), 0, 2)
         self.options_serializer = QComboBox()
-        self.options_serializer.addItems(["", "PCodec", "ZFPY", "EBCCZarrFilter", "Zfp", "Sperr", "Sz3", "None"])
-        self.panel_layout.addWidget(self.options_serializer)
+        self.options_serializer.addItems(["all", "PCodec", "ZFPY", "EBCCZarrFilter", "Zfp", "Sperr", "Sz3", "None"])
+        self.grid_layout.addWidget(self.options_serializer, 1, 2)
 
-        self.predefined_l1 = QCheckBox("Use pre-defined l1 error")
+        self.grid_layout.addWidget(QLabel("Lossy:"), 2, 0)
+        self.options_lossy = QComboBox()
+        self.options_lossy.addItems(["with", "without"])
+        self.grid_layout.addWidget(self.options_lossy, 3, 0)
+
+        self.grid_layout.addWidget(QLabel("Numcodecs-wasm:"), 2, 1)
+        self.options_numcodecs_wasm = QComboBox()
+        self.options_numcodecs_wasm.addItems(["with", "without"])
+        self.grid_layout.addWidget(self.options_numcodecs_wasm, 3, 1)
+
+        self.grid_layout.addWidget(QLabel("EBCC:"), 2, 2)
+        self.options_ebcc = QComboBox()
+        self.options_ebcc.addItems(["with", "without"])
+        self.grid_layout.addWidget(self.options_ebcc, 3, 2)
+
+        self.panel_layout.addLayout(self.grid_layout)
+
+        self.predefined_l1 = QCheckBox("Use pre-defined L1 error")
+        self.predefined_l1.setChecked(True)
         self.predefined_l1.stateChanged.connect(self.toggle_spinbox_enabled)
         self.panel_layout.addWidget(self.predefined_l1)
 
         options_l1_error_label = QLabel("Set max L1 error:")
         self.options_l1_error = ScientificSpinBox()
         self.options_l1_error.setValue(0.0e0)
+        self.options_l1_error.setEnabled(False)
         self.panel_layout.addWidget(options_l1_error_label)
         self.panel_layout.addWidget(self.options_l1_error)
 
@@ -306,18 +336,18 @@ class CompressionAnalysisUI(QMainWindow):
         form_layout = QFormLayout()
 
         self.comp_idx_spin = QSpinBox()
-        self.comp_idx_spin.setRange(0, 79)
+        self.comp_idx_spin.setRange(-1, 79)
         self.comp_idx_spin.setValue(10)
 
         self.filt_idx_spin = QSpinBox()
-        self.filt_idx_spin.setRange(0, 16)
+        self.filt_idx_spin.setRange(-1, 16)
         self.filt_idx_spin.setValue(10)
 
         self.ser_idx_spin = QSpinBox()
-        self.ser_idx_spin.setRange(0, 34)
+        self.ser_idx_spin.setRange(-1, 34)
         self.ser_idx_spin.setValue(10)
 
-        form_layout.addRow("Compression index:", self.comp_idx_spin)
+        form_layout.addRow("Compressor index:", self.comp_idx_spin)
         form_layout.addRow("Filter index:", self.filt_idx_spin)
         form_layout.addRow("Serializer index:", self.ser_idx_spin)
         self.main_layout.addLayout(form_layout)
@@ -334,11 +364,6 @@ class CompressionAnalysisUI(QMainWindow):
 
     def toggle_spinbox_enabled(self, state):
         self.options_l1_error.setEnabled(not self.predefined_l1.isChecked())
-
-    def set_advanced_option_max(self, advnced_option_input, func):
-        selected_field = self.field_selection.currentText()
-        da = xr.open_dataset(self.file_path)[selected_field]
-        return len(func(da, advnced_option_input))
 
     def toggle_compression(self, checked):
         self.panel_frame.setVisible(checked)
@@ -383,6 +408,10 @@ class CompressionAnalysisUI(QMainWindow):
         compressor_class = self.options_compressor.currentText()
         filter_class = self.options_filter.currentText()
         serializer_class = self.options_serializer.currentText()
+        with_options_ls = []
+        with_options_ls.append("--with-lossy") if self.options_lossy.currentText() == "with" else with_options_ls.append("--without-lossy")
+        with_options_ls.append("--with-numcodecs-wasm") if self.options_numcodecs_wasm.currentText() == "with" else with_options_ls.append("--without-numcodecs-wasm")
+        with_options_ls.append("--with-ebcc") if self.options_ebcc.currentText() == "with" else with_options_ls.append("--without-ebcc")
 
         if self.predefined_l1.isChecked():
             cmd = [
@@ -397,6 +426,7 @@ class CompressionAnalysisUI(QMainWindow):
                 "--compressor-class=" + compressor_class,
                 "--filter-class=" + filter_class,
                 "--serializer-class=" + serializer_class,
+                *with_options_ls
             ]
         else:
             cmd = [
@@ -408,17 +438,19 @@ class CompressionAnalysisUI(QMainWindow):
                 self.modified_file_path,
                 os.getcwd(),
                 "--field-to-compress=" + selected_var,
+                "--override-existing-l1-error=" + str(self.options_l1_error.value()),
                 "--compressor-class=" + compressor_class,
                 "--filter-class=" + filter_class,
                 "--serializer-class=" + serializer_class,
-                "--override-existing-l1-error=" + str(self.options_l1_error.value())
+                *with_options_ls
             ]
 
         self.thread = CompressorThread(cmd,
                                        field_to_compress=selected_var,
                                        compressor_class=compressor_class,
                                        filter_class=filter_class,
-                                       serializer_class=serializer_class
+                                       serializer_class=serializer_class,
+                                       with_lossy=with_options_ls[0], with_numcodesc_wasm=with_options_ls[1], with_ebcc=with_options_ls[2]
                                        )
         self.thread.progress.connect(self.update_progress)
         self.thread.log.connect(self.log.append)
@@ -453,46 +485,42 @@ class CompressionAnalysisUI(QMainWindow):
 
     def compress_file(self):
         self.retrieve_file()
-        max_compressor_value = self.set_advanced_option_max(self.options_compressor.currentText(), utils.compressor_space)
-        check_compx_val = self.comp_idx_spin.value() <= max_compressor_value
+        selected_field = self.field_selection.currentText()
 
-        max_filter_value = self.set_advanced_option_max(self.options_filter.currentText(), utils.filter_space)
-        check_filter_val = self.filt_idx_spin.value() <= max_filter_value
+        da = xr.open_dataset(self.modified_file_path)[selected_field]
 
-        max_serializer_value = self.set_advanced_option_max(self.options_serializer.currentText(), utils.serializer_space)
-        check_serializer_val = self.ser_idx_spin.value() <= max_serializer_value
+        with_lossy = True if self.options_lossy.currentText() == "with" else False
+        with_numcodecs_wasm = True if self.options_numcodecs_wasm.currentText() == "with" else False
+        with_ebcc = True if self.options_ebcc.currentText() == "with" else False
 
-        if not check_compx_val:
+        compressors_options = len(utils.compressor_space(da=da, with_lossy=with_lossy,
+                                                     with_numcodecs_wasm=with_numcodecs_wasm, with_ebcc=with_ebcc,
+                                                     compressor_class=self.options_compressor.currentText()))
+        filters_options = len(utils.filter_space(da=da, with_lossy=with_lossy, with_numcodecs_wasm=with_numcodecs_wasm,
+                                             with_ebcc=with_ebcc, filter_class=self.options_filter.currentText()))
+        serializers_options = len(utils.serializer_space(da=da, with_lossy=with_lossy,
+                                                     with_numcodecs_wasm=with_numcodecs_wasm, with_ebcc=with_ebcc,
+                                                     serializer_class=self.options_serializer.currentText()))
+
+        if self.comp_idx_spin.value() > compressors_options:
             param = "Compressor"
-            self.show_popup(param, self.comp_idx_spin.value(), max_compressor_value)
-        elif not check_filter_val:
+            self.show_popup(param, self.comp_idx_spin.value(), compressors_options)
+        elif self.filt_idx_spin.value() > filters_options:
             param = "Filter"
-            self.show_popup(param, self.filt_idx_spin.value(), max_filter_value)
-        elif not check_serializer_val:
+            self.show_popup(param, self.filt_idx_spin.value(), filters_options)
+        elif self.ser_idx_spin.value() > serializers_options:
             param = "Serializer"
-            self.show_popup(param, self.ser_idx_spin.value(), max_serializer_value)
+            self.show_popup(param, self.ser_idx_spin.value(), serializers_options)
         else:
-            selected_field = self.field_selection.currentText()
-
-            da = xr.open_dataset(self.modified_file_path)[selected_field]
-
-            compressor_class = self.options_compressor.currentText()
-            filter_class = self.options_filter.currentText()
-            serializer_class = self.options_serializer.currentText()
-
-            compressors = utils.compressor_space(da, compressor_class)
-            filters = utils.filter_space(da, filter_class)
-            serializers = utils.serializer_space(da, serializer_class)
-            self.max_value = len(compressors)
-            self.comp_idx_spin.setMaximum(len(compressors))
-            self.filt_idx_spin.setMaximum(len(filters))
-            self.ser_idx_spin.setMaximum(len(serializers))
-
             comp_idx = self.comp_idx_spin.value()
             filt_idx = self.filt_idx_spin.value()
             ser_idx = self.ser_idx_spin.value()
 
             temp_dir = os.path.dirname(self.modified_file_path)
+            with_options_ls = []
+            with_options_ls.append("--with-lossy") if with_lossy else with_options_ls.append("--without-lossy")
+            with_options_ls.append("--with-numcodecs-wasm") if with_numcodecs_wasm else with_options_ls.append("--without-numcodecs-wasm")
+            with_options_ls.append("--with-ebcc") if with_ebcc else with_options_ls.append("--without-ebcc")
 
             cmd = [
                 "dc_toolkit",
@@ -501,9 +529,10 @@ class CompressionAnalysisUI(QMainWindow):
                 temp_dir,
                 selected_field,
                 str(comp_idx), str(filt_idx), str(ser_idx),
-                "--compressor-class=" + compressor_class,
-                "--filter-class=" + filter_class,
-                "--serializer-class=" + serializer_class
+                "--compressor-class=" + self.options_compressor.currentText(),
+                "--filter-class=" + self.options_filter.currentText(),
+                "--serializer-class=" + self.options_serializer.currentText(),
+                *with_options_ls
 
             ]
 

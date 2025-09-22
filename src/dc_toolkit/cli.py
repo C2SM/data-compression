@@ -159,9 +159,10 @@ def evaluate_combos(dataset_file: str, where_to_write: str,
         configs_for_rank = config_space[rank::size]
 
         results = []
-        raw_values_explicit = []
         raw_values_explicit_with_names = []
         total_configs = len(configs_for_rank)
+        if rank == 0:
+            pd.DataFrame(config_space).to_csv("config_space.csv", index=False)
         for i, ((comp_idx, compressor), (filt_idx, filt), (ser_idx, serializer)) in enumerate(configs_for_rank):
             data_to_compress = da
             if isinstance(serializer, numcodecs.zarr3.ZFPY):
@@ -200,9 +201,8 @@ def evaluate_combos(dataset_file: str, where_to_write: str,
                 l1_error_rel = errors["Relative_Error_L1"]
                 l2_error_rel = errors["Relative_Error_L2"]
                 linf_error_rel = errors["Relative_Error_Linf"]
-                raw_values_explicit.append((compression_ratio, l1_error_rel, l2_error_rel, linf_error_rel, euclidean_distance))
 
-                # TODO: refine criteria based on the thersholds table
+                # TODO: refine criteria based on the thresholds table
                 if existing_l1_error:
                     if l1_error_rel <= existing_l1_error:
                         results.append(((str(compressor), str(filt), str(serializer), comp_idx, filt_idx, ser_idx), compression_ratio, l1_error_rel, euclidean_distance))
@@ -219,21 +219,20 @@ def evaluate_combos(dataset_file: str, where_to_write: str,
             utils.progress_bar(i, total_configs, print_every=100)
 
         results_gather = comm.gather(results, root=0)
-        raw_values_explicit_gather = comm.gather(raw_values_explicit, root=0)
         raw_values_explicit_with_names_gather = comm.gather(raw_values_explicit_with_names, root=0)
 
         if rank == 0:
             click.echo("Compressors analysis completed. Writing files...")
             # Flatten list of lists
             results_gather = list(itertools.chain.from_iterable(results_gather))
-            raw_values_explicit_gather = list(itertools.chain.from_iterable(raw_values_explicit_gather))
             raw_values_explicit_with_names_gather = list(itertools.chain.from_iterable(raw_values_explicit_with_names_gather))
 
             # Needed for clustering
-            score_results_file_name = [c for c in (field_to_compress, compressor_class, filter_class, serializer_class) if c != ""]
-            np.save(os.path.basename(dataset_file) + '_' + '_'.join(score_results_file_name) + '_scored_results_raw.npy', np.asarray(pd.DataFrame(raw_values_explicit_gather)))
+            lossy_option = "with-lossy" if with_lossy else "without-lossy"
+            numcodecs_wasm_option = "with-numcodecs-wasm" if with_numcodecs_wasm else "without-numcodecs-wasm"
+            ebcc_option = "with-ebcc" if with_ebcc else "without-ebcc"
+            score_results_file_name = [field_to_compress, compressor_class, filter_class, serializer_class, lossy_option, numcodecs_wasm_option, ebcc_option]
             np.save(os.path.basename(dataset_file) + '_' + '_'.join(score_results_file_name) + '_scored_results_with_names.npy', np.asarray(pd.DataFrame(raw_values_explicit_with_names_gather)))
-
             best_combo = max(results_gather, key=lambda x: x[1])
             msg = (
                 "optimal combo: \n"

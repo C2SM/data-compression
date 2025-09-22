@@ -39,6 +39,22 @@ from numcodecs_wasm_zfp import Zfp
 
 os.environ["EBCC_LOG_LEVEL"] = "4"  # ERROR (suppress WARN and below)
 
+def get_indexes(arr, indices):
+    codec_to_id = []
+    for ind in indices:
+        codec_to_id.append(ind[1:-1].split(', ', 1))
+    id_ls = []
+    codec_id_dict = {key: val for val, key in codec_to_id}
+    for item in arr:
+        if item == "None":
+            id_ls.append(-1)
+        elif item in list(codec_id_dict.keys()):
+            id_ls.append(codec_id_dict[item])
+        else:
+            if "EBCC" in item:
+                fetch_new_idx = [value for key, value in codec_id_dict.items() if "EBCC" in key][0]
+                id_ls.append(fetch_new_idx)
+    return np.asarray(id_ls)
 
 def open_dataset(dataset_file: str, field_to_compress: str | None = None, field_percentage_to_compress: float | None = None, rank: int = 0):
     dataset_filepath = Path(dataset_file)    
