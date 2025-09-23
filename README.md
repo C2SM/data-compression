@@ -14,6 +14,7 @@ The tools use the following compression libraries:
 
 - C/C++ compiler toolchain (required to build mpi4py)
 - MPI implementation (required for mpi4py)
+- ecCodes library for GRIB files
 
 In Santis@ALPS:
 

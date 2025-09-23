@@ -42,6 +42,11 @@ warnings.filterwarnings(
     category=UserWarning,
     module="numcodecs.zarr3"
 )
+warnings.filterwarnings(
+    "ignore",
+    message="Engine 'cfgrib' loading failed",
+    category=RuntimeWarning,
+)
 warnings.filterwarnings("ignore", message="overflow encountered in square")
 
 
