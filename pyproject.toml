@@ -17,9 +17,9 @@ dependencies = [
     "scipy",
     "PyWavelets",
     "dask[complete]",
-    "h5py",
-    "zarr >=3.1.1",
-    "numcodecs",
+    "h5py >=3.11",
+    "zarr >=3.1.1, <3.1.3",
+    "numcodecs <0.16.3",
     "zarr-any-numcodecs >=0.1.3",
     "json5",
     "rich",
@@ -30,6 +30,7 @@ dependencies = [
     "netCDF4",
     "h5netcdf",
     "plotly",
+    "cfgrib",
     "numcodecs_wasm",
     "numcodecs_combinators",
     "numcodecs_observers",
@@ -50,13 +51,13 @@ dependencies = [
     "numcodecs_wasm_zfp",
 ]
 description = 'Data compression tool for Weather and Climate data'
-name = 'data_compression_cscs_exclaim'
+name = 'dc_toolkit'
 readme = {file = 'README.md', content-type = 'text/markdown'}
 requires-python = '>=3.11'
 version = '0.0'
 
 [project.scripts]
-data_compression_cscs_exclaim = 'data_compression_cscs_exclaim.cli:cli'
+dc_toolkit = 'dc_toolkit.cli:cli'
 model_eval_cscs_exclaim = 'model_eval_cscs_exclaim.cli:cli'
 
 [tool.setuptools]

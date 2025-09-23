@@ -1,33 +1,39 @@
 #!/bin/bash
 
 #SBATCH --account=...
-#SBATCH --uenv=prgenv-gnu/25.06:rc5
+#SBATCH --uenv=prgenv-gnu/24.11:v2
 #SBATCH --view=default
-#SBATCH --partition=normal
+#SBATCH --partition=debug
 #SBATCH --ntasks-per-node=32
-#SBATCH --nodes=2
-#SBATCH --time=01:00:00
+#SBATCH --nodes=1
+#SBATCH --time=00:30:00
 #SBATCH --output=out-%j.out
 #SBATCH --error=out-%j.out
 
+export PYTHONUNBUFFERED=1
 source venv/bin/activate
 
-# ("1", "true", "yes") -> any other value is treated as "false"
-export WITH_NUMCODECS_WASM=no
-export WITH_EBCC=no
-
-srun data_compression_cscs_exclaim \
-     summarize_compression \
+srun dc_toolkit \
+     evaluate_combos \
      /capstor/store/cscs/userlab/cwp03/ppothapa/Data_Dyamond_PostProcessed/DYAMOND_R02B10L120_main/out_15/temp_20200410T000000Z.nc \
-     ./netCDF_files \
+     ./res_folder \
      --field-to-compress temp \
-     --field-percentage-to-compress 1 \
-     2>&1 | grep -v "wasmtime"
+     --field-percentage-to-compress 10 \
+     --override-existing-l1-error 0.002 \
+     --compressor-class Zlib \
+     --serializer-class PCodec \
+     --without-lossy \
+     --without-numcodecs-wasm \
+     --without-ebcc
 
-# srun data_compression_cscs_exclaim \
+# srun -n 1 dc_toolkit \
 #      compress_with_optimal \
 #      /capstor/store/cscs/userlab/cwp03/ppothapa/Data_Dyamond_PostProcessed/DYAMOND_R02B10L120_main/out_15/temp_20200410T000000Z.nc \
-#      ./netCDF_files \
+#      ./res_folder \
 #      temp \
-#      60 2 1 \
-#      2>&1 | grep -v "wasmtime"
+#      2 0 9 \
+#      --compressor-class Zlib \
+#      --serializer-class PCodec \
+#      --without-lossy \
+#      --without-numcodecs-wasm \
+#      --without-ebcc
