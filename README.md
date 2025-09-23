@@ -1,6 +1,4 @@
-<img src="./data-compression_logo.png" alt="Logo" width="250"/> 
-
-# Data Compression Project 
+<img src="./data-compression_logo.png" alt="Logo" width="250"/>
 
 Set of tools for compressing netCDF files with Zarr. 
 
