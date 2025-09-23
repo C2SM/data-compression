@@ -57,14 +57,9 @@ dc_toolkit \ # CLI-tool
 Two User Interfaces have been implemented to make the file compression process more user-friendly.
 Both UIs provide functionlaities for compressors similarity metrics and file compression.
 
-compression_analysis_ui_web.py is the web app.
-Outside of the mutual UI functionalities, this UI allows users to download similarity metrics plots and tweak parameters more dynamically, though it is a bit slower.
+Outside of the mutual UI functionalities, this UI allows users to download similarity metrics plots and tweak parameters more dynamically.
 
-```
-streamlit run ./src/dc_toolkit/compression_analysis_ui_web.py [OPTIONAL] --server.maxUploadSize=FILE_SIZE_MB --server.maxMessageSize=FILE_SIZE_MB
-
-```
-if launched from santis, make sure to ssh correctly:
+If launched from santis, make sure to ssh correctly:
 ```
 ssh -L 8501:localhost:8501 santis
 ```

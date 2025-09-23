@@ -420,9 +420,11 @@ if uploaded_file is not None and uploaded_file.name.endswith(".nc"):
 
     if st.session_state.analysis_performed and st.session_state.temp_plot_file:
         plot_file_path = st.session_state.temp_plot_file
-        score_results_file_name = [c for c in (field_to_compress, compressor_class, filter_class, serializer_class) if
-                                   c != ""]
-        params_str = '_' + '_'.join(score_results_file_name)
+        with_lossy = "with_lossy" if lossy_class == "with" else "without_lossy"
+        with_numcodecs_wasm = "with_numcodecs_wasm" if numcodecs_wasm_class == "with" else "without_numcodecs_wasm"
+        with_ebcc = "with_ebcc" if ebcc_class == "with" else "without_ebcc"
+        cluster_results_file_name = [c for c in (field_to_compress, compressor_class, filter_class, serializer_class, with_lossy, with_numcodecs_wasm, with_ebcc)]
+        params_str = '_' + '_'.join(cluster_results_file_name)
 
         with open(plot_file_path, "rb") as f:
             st.download_button(
