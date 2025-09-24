@@ -91,6 +91,11 @@ def open_zarr_zipstore(zarr_zipstore_file: str):
     return zarr.open_group(store, mode='r'), store
 
 
+def open_zarr_memstore():
+    store = zarr.storage.MemoryStore()
+    return store
+
+
 def compress_with_zarr(data, dataset_file, field_to_compress, where_to_write, filters, compressors, serializer, verbose=True, rank=0):
     assert isinstance(data.data, dask.array.Array)
 
