@@ -692,7 +692,7 @@ def plot_compression_errors(dataset_file: str, where_to_write: str, field_to_com
     os.makedirs(where_to_write, exist_ok=True)
 
     ds = utils.open_dataset(dataset_file, field_to_compress)
-    da = ds[field_to_compress][1, 1, :, :]
+    da = ds[field_to_compress].squeeze()
 
     if not utils.is_lat_lon(da):
         click.echo(f"Field {field_to_compress} should be in lat-lon form, i.e. dimensions (lat, lon)! It currently has dimensions: {da.dims}.")
