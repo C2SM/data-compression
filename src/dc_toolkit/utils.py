@@ -380,9 +380,10 @@ def serializer_space(da, with_lossy=True, with_numcodecs_wasm=True, with_ebcc=Tr
             data = da.squeeze()  # TODO: add more checks on the shape of the data
             for atol in [1e-2, 1e-3, 1e-6, 1e-9]:
                 ebcc_filter = EBCC_Filter(
-                        base_cr=2, 
-                        height=data.shape[0],
-                        width=data.shape[1],
+                        base_cr=4,
+                        height=data.shape[0] / 4,
+                        width=data.shape[1] / 4,
+                        data_dim=len(data.shape),
                         residual_opt=("max_error_target", atol)
                     )
                 zarr_filter = serializer(ebcc_filter.hdf_filter_opts)
