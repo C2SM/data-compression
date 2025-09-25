@@ -212,7 +212,7 @@ class CompressorThread(QThread):
         params_str = '_' + '_'.join(score_results_file_name)
         scored_results = load_scored_results(os.path.basename(file_name), params_str)
         scored_results_pd = pd.DataFrame(scored_results)
-        max_n_rows, max_nclusters = 42976, 5
+        max_n_rows, max_nclusters = 42976, 6
 
         adjusted_n_clusters = math.ceil(max_nclusters*len(scored_results_pd)/max_n_rows)
 

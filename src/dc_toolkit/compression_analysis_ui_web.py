@@ -387,7 +387,7 @@ if uploaded_file is not None and uploaded_file.name.endswith(".nc"):
         params_str = '_' + '_'.join(score_results_file_name)
         scored_results = load_scored_results(os.path.basename(path_to_modified_file), params_str)
         scored_results_pd = pd.DataFrame(scored_results)
-        max_n_rows, max_nclusters = 42976, 5
+        max_n_rows, max_nclusters = 42976, 6
         adjusted_n_clusters = math.ceil(max_nclusters*len(scored_results_pd)/max_n_rows)
 
         numeric_cols = scored_results_pd.select_dtypes(include=[np.number]).columns

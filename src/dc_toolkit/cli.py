@@ -477,7 +477,14 @@ def from_zarr_zip_to_netcdf(zarr_zip_file: str, out_nc: str | None):
 
 @cli.command("perform_clustering")
 @click.argument("npy_file", type=click.Path(exists=True, dir_okay=False))
-def perform_clustering(npy_file: str):
+@click.argument("l_error", type=str)
+def perform_clustering(npy_file: str, l_error: str):
+    """
+    Perform clustering on L-error file
+    :param npy_file:
+    :param L-error: choose between: ["L1", "L2", "LInf"]
+    :return:
+    """
     scored_results = np.load(npy_file, allow_pickle=True)
 
     scored_results_pd = pd.DataFrame(scored_results)
@@ -485,7 +492,9 @@ def perform_clustering(npy_file: str):
     numeric_cols = scored_results_pd.select_dtypes(include=[np.number]).columns
     mask = np.isfinite(scored_results_pd[numeric_cols]).all(axis=1)
     scored_results_pd = scored_results_pd[mask].dropna()
-    clean_arr_inf = np.hstack((np.asarray(scored_results_pd[[0]]), np.asarray(scored_results_pd[[2]])))
+    l_options = ["L1", "L2", "LInf"]
+    error_index = [i_l+1 for i_l, l in enumerate(l_options) if l_error == l]
+    clean_arr_inf = np.hstack((np.asarray(scored_results_pd[[0]]), np.asarray(scored_results_pd[[error_index[0]]])))
 
     k_values = range(3, 10)
     inertias = []
@@ -499,7 +508,7 @@ def perform_clustering(npy_file: str):
 
     # Plot Elbow Curve
     plt.figure(figsize=(12, 5))
-    plt.suptitle("LInf")
+    plt.suptitle(l_error, fontsize=20)
     plt.subplot(1, 2, 1)
     plt.plot(k_values, inertias, 'bo-')
     plt.xlabel('Number of Clusters (k)')
@@ -518,6 +527,7 @@ def perform_clustering(npy_file: str):
 @cli.command("analyze_clustering")
 @click.argument("npy_file", type=click.Path(exists=True, dir_okay=False))
 def analyze_clustering(npy_file: str):
+    config_idxs = pd.read_csv("config_space.csv")
     scored_results = np.load(str(npy_file), allow_pickle=True)
 
     scored_results_pd = pd.DataFrame(scored_results)
@@ -529,11 +539,10 @@ def analyze_clustering(npy_file: str):
     clean_arr_l1 = utils.slice_array(scored_results_pd, [0, 1, 5, 6, 7])
     clean_arr_l2 = utils.slice_array(scored_results_pd, [0, 2, 5, 6, 7])
     clean_arr_linf = utils.slice_array(scored_results_pd, [0, 3, 5, 6, 7])
-    clean_arr_dwt = utils.slice_array(scored_results_pd, [0, 4, 5, 6, 7])
 
 
     # Plot Error and Similarity Metrics VS Ratio
-    kmeans = KMeans(n_clusters=5, random_state=0, n_init="auto")
+    kmeans = KMeans(n_clusters=6, random_state=0, n_init="auto")
 
     fig = make_subplots(rows=3, cols=1,
                         subplot_titles=[
