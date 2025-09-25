@@ -1,9 +1,7 @@
  
 <div align="center">
-  <img src="./data-compression_logo.png" alt="Logo" width="250"/>
+  <img src="./data-compression_logo.png" alt="Logo" width="300"/>
 </div>
-
-# Data Compression Project 
 
 Set of tools for compressing netCDF files with Zarr. 
 
