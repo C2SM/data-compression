@@ -775,26 +775,16 @@ def plot_compression_errors(dataset_file: str, where_to_write: str, field_to_com
 
     units = da.attrs["units"]
 
-    np_data = da.to_numpy()
-    np_data_shape = np_data.shape
+    lon_dim = da.dims[1]
+    half_idx = da.sizes[lon_dim] // 2
 
-    print("Shape of {}: {}".format(field_to_compress, np_data_shape))
-
-    shifted_np_data = np.empty(np_data_shape, dtype=np_data.dtype)
-
-    half_idx = math.floor(0.5 * np_data_shape[1])
-    shifted_np_data[:, :(np_data_shape[1]-half_idx)] = np_data[:, half_idx:]
-    shifted_np_data[:, (np_data_shape[1]-half_idx):] = np_data[:, :half_idx]
-
-    shifted_np_data_backshifted = np.empty(np_data_shape, dtype=np_data.dtype)
-
-    shifted_np_data_backshifted[:, half_idx:] = shifted_np_data[:, :(np_data_shape[1]-half_idx)]
-    shifted_np_data_backshifted[:, :half_idx] = shifted_np_data[:, (np_data_shape[1]-half_idx):]
+    shifted_da = da.roll({lon_dim: -half_idx}, roll_coords=False)
+    shifted_da_backshifted = shifted_da.roll({lon_dim: half_idx}, roll_coords=False)
 
     # Flatten data for ZFPY serializer
     if isinstance(selected_serializer, numcodecs.zarr3.ZFPY):
-        np_data = np_data.reshape(-1)
-        shifted_np_data = shifted_np_data.reshape(-1)
+        da = da.stack(flat_dim=da.dims)
+        shifted_da = shifted_da.stack(flat_dim=da.dims)
 
     ############
     # COMPRESS #
@@ -802,10 +792,10 @@ def plot_compression_errors(dataset_file: str, where_to_write: str, field_to_com
 
     # Normal compression
     store = utils.open_zarr_memstore()
-    np_data_compressed = zarr.create_array(
+    da_compressed = zarr.create_array(
         store=store,
         name=field_to_compress,
-        data=np_data[:],
+        data=da,
         chunks='auto',
         filters=filters_,
         compressors=compressors_,
@@ -814,10 +804,10 @@ def plot_compression_errors(dataset_file: str, where_to_write: str, field_to_com
 
     # Shifted compression
     shifted_store = utils.open_zarr_memstore()
-    shifted_np_data_compressed = zarr.create_array(
+    shifted_da_compressed = zarr.create_array(
         store=shifted_store,
         name=field_to_compress,
-        data=shifted_np_data[:],
+        data=shifted_da,
         chunks='auto',
         filters=filters_,
         compressors=compressors_,
@@ -829,22 +819,19 @@ def plot_compression_errors(dataset_file: str, where_to_write: str, field_to_com
     ##############
 
     # Normal
-    np_data_decompressed = np_data_compressed[:]
+    da_decompressed = xr.DataArray(da_compressed[:], dims=da.dims, coords=da.coords)
 
     # Shifted
-    shifted_np_data_decompressed = shifted_np_data_compressed[:]
+    shifted_da_decompressed = xr.DataArray(shifted_da_compressed[:], dims=da.dims, coords=da.coords)
 
     # Reshape the data to its original dimensions for ZFPY serializer
     if isinstance(selected_serializer, numcodecs.zarr3.ZFPY):
-        np_data = np_data.reshape(np_data_shape)
-        shifted_np_data = shifted_np_data.reshape(np_data_shape)
-        np_data_decompressed = np_data_decompressed.reshape(np_data_shape)
-        shifted_np_data_decompressed = shifted_np_data_decompressed.reshape(np_data_shape)
+        da = da.unstack("flat_dim")
+        shifted_da = shifted_da.unstack("flat_dim")
+        da_decompressed = da_decompressed.unstack("flat_dim")
+        shifted_da_decompressed = shifted_da_decompressed.unstack("flat_dim")
 
-    shifted_np_data_decompressed_backshifted = np.empty(np_data_shape, dtype=np_data.dtype)
-
-    shifted_np_data_decompressed_backshifted[:, half_idx:] = shifted_np_data_decompressed[:, :(np_data_shape[1]-half_idx)]
-    shifted_np_data_decompressed_backshifted[:, :half_idx] = shifted_np_data_decompressed[:, (np_data_shape[1]-half_idx):]
+    shifted_da_decompressed_backshifted = shifted_da_decompressed.roll({lon_dim: half_idx}, roll_coords=False)
 
     store.close()
     shifted_store.close()
@@ -859,43 +846,43 @@ def plot_compression_errors(dataset_file: str, where_to_write: str, field_to_com
     fig.suptitle(f"Compression errors for variable {field_to_compress} ({units})", fontsize=16)
 
     ax1.set_title("Original", fontsize=10)
-    tmp = ax1.imshow(np_data, interpolation='none')
+    tmp = ax1.imshow(da, interpolation='none')
     fig.colorbar(tmp, ax=ax1, shrink=0.7)
 
     ax2.set_title("Original compressed&decompressed", fontsize=10)
-    tmp = ax2.imshow(np_data_decompressed, interpolation='none')
+    tmp = ax2.imshow(da_decompressed, interpolation='none')
     fig.colorbar(tmp, ax=ax2, shrink=0.7)
 
     ax3.set_title("Absolute error [original - original c&d]", fontsize=10)
-    absolute_error = np.abs(np_data - np_data_decompressed)
+    absolute_error = np.abs(da - da_decompressed)
     tmp = ax3.imshow(absolute_error, interpolation='none', cmap='binary')
     fig.colorbar(tmp, ax=ax3, shrink=0.7)
 
     ax4.set_title("Shifted (by +180 deg)", fontsize=10)
-    tmp = ax4.imshow(shifted_np_data, interpolation='none')
+    tmp = ax4.imshow(shifted_da, interpolation='none')
     fig.colorbar(tmp, ax=ax4, shrink=0.7)
 
     ax5.set_title("Shifted compressed&decompressed", fontsize=10)
-    tmp = ax5.imshow(shifted_np_data_decompressed, interpolation='none')
+    tmp = ax5.imshow(shifted_da_decompressed, interpolation='none')
     fig.colorbar(tmp, ax=ax5, shrink=0.7)
 
     ax6.set_title("Absolute error [shifted - shifted c&d]", fontsize=10)
-    absolute_error = np.abs(shifted_np_data - shifted_np_data_decompressed)
+    absolute_error = np.abs(shifted_da - shifted_da_decompressed)
     tmp = ax6.imshow(absolute_error, interpolation='none', cmap='binary')
     fig.colorbar(tmp, ax=ax6, shrink=0.7)
 
     ax7.set_title("Absolute error [original - (shifted-180)]", fontsize=10)
-    absolute_error = np.abs(np_data - shifted_np_data_backshifted) / (np.abs(np_data) + 1e-20)
+    absolute_error = np.abs(da - shifted_da_backshifted) / (np.abs(da) + 1e-20)
     tmp = ax7.imshow(absolute_error, interpolation='none', cmap='binary')
     fig.colorbar(tmp, ax=ax7, shrink=0.7)
 
     ax8.set_title("Absolute error [original c&d - (shifted c&d-180)]", fontsize=10)
-    absolute_error = np.abs(np_data_decompressed - shifted_np_data_decompressed_backshifted)
+    absolute_error = np.abs(da_decompressed - shifted_da_decompressed_backshifted)
     tmp = ax8.imshow(absolute_error, interpolation='none', cmap='binary')
     fig.colorbar(tmp, ax=ax8, shrink=0.7)
 
     ax9.set_title("Absolute error [original - (shifted c&d-180)]", fontsize=10)
-    absolute_error = np.abs(np_data - shifted_np_data_decompressed_backshifted)
+    absolute_error = np.abs(da - shifted_da_decompressed_backshifted)
     tmp = ax9.imshow(absolute_error, interpolation='none', cmap='binary')
     fig.colorbar(tmp, ax=ax9, shrink=0.7)
 
