@@ -756,7 +756,7 @@ def plot_compression_errors(dataset_file: str, where_to_write: str, field_to_com
     selected_serializer = serializers[ser_idx][1] if ser_idx != -1 else None
 
     if isinstance(selected_serializer, AnyNumcodecsArrayBytesCodec) and isinstance(selected_serializer.codec, EBCCZarrFilter):
-        da = da.squeeze().astype("float32")
+        da = da.astype("float32")
 
     filters_ = [selected_filter,]
     compressors_ = [selected_compressor,]
