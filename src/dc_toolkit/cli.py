@@ -36,6 +36,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import subprocess
+import humanize
 
 import warnings
 warnings.filterwarnings(
@@ -727,8 +728,17 @@ def plot_compression_errors(dataset_file: str, where_to_write: str, field_to_com
     ds = utils.open_dataset(dataset_file, field_to_compress)
     da = ds[field_to_compress].squeeze()
 
+    da_memsize = da.nbytes
+    click.echo(f"Squeezed (lat, lon) field_to_compress.nbytes = {humanize.naturalsize(da_memsize, binary=True)}")
+
     if not utils.is_lat_lon(da):
         click.echo(f"Field {field_to_compress} should be in lat-lon form, i.e. dimensions (lat, lon)! It currently has dimensions: {da.dims}.")
+        sys.exit(1)
+
+    threshold = 2.5  # GiB
+    if da_memsize / (1024 ** 3) > threshold:
+        click.echo(f"Field {field_to_compress} is too large ({humanize.naturalsize(da_memsize, binary=True)}). "
+                   f"To avoid high memory usage we only support fields up to {threshold} GiB.")
         sys.exit(1)
 
     compressors = utils.compressor_space(da, with_lossy, with_numcodecs_wasm, with_ebcc, compressor_class)
