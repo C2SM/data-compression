@@ -676,6 +676,39 @@ def plot_compression_errors(dataset_file: str, where_to_write: str, field_to_com
                             comp_idx: int, filt_idx: int, ser_idx: int, 
                             compressor_class: str = "all", filter_class: str = "all", serializer_class: str = "all",
                             with_lossy: bool = True, with_numcodecs_wasm: bool = True, with_ebcc: bool = True):
+    """
+    Plot the absolute errors arising from compression+decompression of a field
+    with the desired combination of compressor, filter, and serializer.
+    Additionally, plot the difference between a normal compression+decompression
+    process and one using a version of the data shifted by 180 degrees
+    longitudinally. This should show if the selected combination takes the
+    periodicity of the data into account.
+
+    Make sure to provide the field to compress in (lat, lon) format. Additional
+    dimensions are not supported or removed if they have a single level.
+
+    Make sure to provide the same --[compressor/filter/serializer]-class and the
+    same --with/without-[lossy/numcodecs-wasm/ebcc] flags as in evaluate_combos,
+    such that the same lists of instantiated objects are generated.
+    
+    Note on passing -1 as index:
+    dc_toolkit plot_compression_errors ... --compressor-class X ... --- -1 -1 -1
+
+    \b
+    Args:
+        dataset_file (str): Path to the input dataset file.
+        where_to_write (str): Directory where the file containing the plots will be writtsaved.
+        field_to_compress (str): Name of the field to compress/analyze.
+        comp_idx (int): Index of the compressor to use.
+        filt_idx (int): Index of the filter to use.
+        ser_idx (int): Index of the serializer to use.
+        compressor_class: --compressor-class
+        filter_class: --filter-class
+        serializer_class: --serializer-class
+        with_lossy: --with-lossy/--without-lossy
+        with_numcodecs_wasm: --with-numcodecs-wasm/--without-numcodecs-wasm
+        with_ebcc: --with-ebcc/--without-ebcc
+    """
 
     #############
     # GET COMBO #
