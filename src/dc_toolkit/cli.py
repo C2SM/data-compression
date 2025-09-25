@@ -783,7 +783,7 @@ def plot_compression_errors(dataset_file: str, where_to_write: str, field_to_com
     # PROCESS DATA #
     ################
 
-    print(f"Shape of {field_to_compress}: {da.shape}")
+    click.echo(f"Shape of {field_to_compress}: {da.shape}")
 
     units = da.attrs["units"]
 
