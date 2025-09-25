@@ -780,8 +780,8 @@ def plot_compression_errors(dataset_file: str, where_to_write: str, field_to_com
     lon_dim = da.dims[1]
     half_idx = da.sizes[lon_dim] // 2
 
-    shifted_da = da.roll({lon_dim: -half_idx}, roll_coords=True)
-    shifted_da_backshifted = shifted_da.roll({lon_dim: half_idx}, roll_coords=True)
+    shifted_da = da.roll({lon_dim: -half_idx}, roll_coords=False)
+    shifted_da_backshifted = shifted_da.roll({lon_dim: half_idx}, roll_coords=False)
 
     # Flatten data for ZFPY serializer
     if isinstance(selected_serializer, numcodecs.zarr3.ZFPY):
@@ -833,7 +833,7 @@ def plot_compression_errors(dataset_file: str, where_to_write: str, field_to_com
         da_decompressed = da_decompressed.unstack("flat_dim")
         shifted_da_decompressed = shifted_da_decompressed.unstack("flat_dim")
 
-    shifted_da_decompressed_backshifted = shifted_da_decompressed.roll({lon_dim: half_idx}, roll_coords=True)
+    shifted_da_decompressed_backshifted = shifted_da_decompressed.roll({lon_dim: half_idx}, roll_coords=False)
 
     store.close()
     shifted_store.close()
