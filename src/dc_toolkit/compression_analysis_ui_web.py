@@ -28,6 +28,21 @@ from dc_toolkit import utils
 
 where_am_i = subprocess.run(["uname", "-a"], capture_output=True, text=True)
 
+def find_latest_file(folder_path, filename_prefix):
+    latest_file = None
+    latest_mtime = -1
+
+    for filename in os.listdir(folder_path):
+        if filename.startswith(filename_prefix):
+            full_path = os.path.join(folder_path, filename)
+            if os.path.isfile(full_path):
+                mtime = os.path.getmtime(full_path)
+                if mtime > latest_mtime:
+                    latest_mtime = mtime
+                    latest_file = full_path
+
+    return latest_file
+
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--input_file', type=str, default='default.csv')
@@ -214,14 +229,14 @@ if uploaded_file is not None and uploaded_file.name.endswith(".nc"):
     netcdf_file_xr, display_file_name = load_and_resize_netcdf(file_content, uploaded_file.name)
 
     options_field = [var for var in netcdf_file_xr.data_vars]
-    if "selected_column" not in st.session_state:
-        st.session_state.selected_column = options_field[0]
+    if "selected_column_to_compress" not in st.session_state:
+        st.session_state.selected_column_to_compress = options_field[0]
 
     field_to_compress = st.selectbox(
         "Choose a field:",
         options=options_field,
-        index=options_field.index(st.session_state.selected_column),
-        key="selected_column",
+        index=options_field.index(st.session_state.selected_column_to_compress),
+        key="selected_column_to_compress",
     )
 
     compressor_class = ""
@@ -300,7 +315,7 @@ if uploaded_file is not None and uploaded_file.name.endswith(".nc"):
                     "--partition=debug",
                     "dc_toolkit",
                     "evaluate_combos",
-                    parse_args().uploaded_file,
+                    display_file_name,
                     os.getcwd(),
                     "--field-to-compress=" + field_to_compress,
                     "--compressor-class=" + compressor_class,
@@ -337,7 +352,7 @@ if uploaded_file is not None and uploaded_file.name.endswith(".nc"):
                     "8",
                     "dc_toolkit",
                     "evaluate_combos",
-                    path_to_modified_file,
+                    display_file_name,
                     os.getcwd(),
                     "--field-to-compress="+field_to_compress,
                     "--compressor-class="+compressor_class,
@@ -501,7 +516,7 @@ if uploaded_file is not None and uploaded_file.name.endswith(".nc"):
                 cmd_compress = [
                     "srun",
                     "-A", parse_args().user_account,
-                    "--time", parse_args().t,
+                    "--time", parse_args().time,
                     "--nodes", parse_args().nodes,
                     "--ntasks-per-node", parse_args().ntasks_per_node,
                     "--uenv=prgenv-gnu/24.11:v2",
@@ -509,7 +524,7 @@ if uploaded_file is not None and uploaded_file.name.endswith(".nc"):
                     "--partition=debug",
                     "dc_toolkit",
                     "compress_with_optimal",
-                    path_to_modified_file,
+                    display_file_name,
                     os.getcwd(),
                     field_to_compress,
                     str(comp_idx), str(filt_idx), str(ser_idx),
@@ -535,14 +550,11 @@ if uploaded_file is not None and uploaded_file.name.endswith(".nc"):
             status.info("Compressing file...")
             subprocess.run(cmd_compress)
             status.empty()
-            st.success(f"Compression completed successfully. File saved in {os.getcwd()}")
+            st.success(f"Compression completed successfully.")
             if "santis" in where_am_i.stdout.strip():
-                after = set(os.listdir(temp_dir))
-                output_file_path = os.path.join(temp_dir, list(after - before)[0])
-                dest_path = os.path.join(temp_dir, list(after - before)[0])
-                shutil.copy(output_file_path, dest_path)
-                split_tmp_name = os.path.basename(output_file_path).split(".=.", 1)
-                compressed_file_name = f"{uploaded_file.name}.=.{split_tmp_name[1]}"
+                output_file_path = find_latest_file(os.getcwd(), os.path.basename(display_file_name))
+                split_tmp_name = os.path.basename(display_file_name).split(".=.", 1)
+                compressed_file_name = f"{os.path.basename(uploaded_file.name)}.=.{split_tmp_name[0]}"
             else:
                 split_tmp_name = os.path.basename(path_to_modified_file).split(".=.", 1)
                 compressed_file_name = f"{uploaded_file.name}.=.{split_tmp_name[0]}"
