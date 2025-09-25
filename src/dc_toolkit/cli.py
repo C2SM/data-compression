@@ -13,8 +13,8 @@ import traceback
 import click
 from tqdm import tqdm
 from pathlib import Path
-from math import floor
-from zarr import create_array
+import math
+import zarr
 import shutil
 import itertools
 import numcodecs
@@ -749,7 +749,7 @@ def plot_compression_errors(dataset_file: str, where_to_write: str, field_to_com
 
     shifted_np_data = np.empty(np_data_shape, dtype=np_data.dtype)
 
-    half_idx = floor(0.5 * np_data_shape[1])
+    half_idx = math.floor(0.5 * np_data_shape[1])
     shifted_np_data[:, :(np_data_shape[1]-half_idx)] = np_data[:, half_idx:]
     shifted_np_data[:, (np_data_shape[1]-half_idx):] = np_data[:, :half_idx]
 
@@ -769,7 +769,7 @@ def plot_compression_errors(dataset_file: str, where_to_write: str, field_to_com
 
     # Normal compression
     store = utils.open_zarr_memstore()
-    np_data_compressed = create_array(
+    np_data_compressed = zarr.create_array(
         store=store,
         name=field_to_compress,
         data=np_data[:],
@@ -781,7 +781,7 @@ def plot_compression_errors(dataset_file: str, where_to_write: str, field_to_com
 
     # Shifted compression
     shifted_store = utils.open_zarr_memstore()
-    shifted_np_data_compressed = create_array(
+    shifted_np_data_compressed = zarr.create_array(
         store=shifted_store,
         name=field_to_compress,
         data=shifted_np_data[:],
