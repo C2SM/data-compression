@@ -30,6 +30,7 @@ from mpi4py import MPI
 import time
 from collections import defaultdict
 import atexit
+import re
 
 # numcodecs-wasm filters
 from numcodecs_wasm_asinh import Asinh
@@ -86,9 +87,27 @@ def open_dataset(dataset_file: str, field_to_compress: str | None = None, field_
     return ds
 
 
+def is_lat_lon(da):
+
+    lat_pattern = r'lat'
+    lon_pattern = r'lon'
+
+    dims = da.dims
+
+    if len(dims) == 2 and re.search(lat_pattern, dims[0]) and re.search(lon_pattern, dims[1]):
+        return True
+
+    return False
+
+
 def open_zarr_zipstore(zarr_zipstore_file: str):
     store = zarr.storage.ZipStore(zarr_zipstore_file, read_only=True)
     return zarr.open_group(store, mode='r'), store
+
+
+def open_zarr_memstore():
+    store = zarr.storage.MemoryStore()
+    return store
 
 
 def compress_with_zarr(data, dataset_file, field_to_compress, where_to_write, filters, compressors, serializer, verbose=True, rank=0):
@@ -361,9 +380,10 @@ def serializer_space(da, with_lossy=True, with_numcodecs_wasm=True, with_ebcc=Tr
             data = da.squeeze()  # TODO: add more checks on the shape of the data
             for atol in [1e-2, 1e-3, 1e-6, 1e-9]:
                 ebcc_filter = EBCC_Filter(
-                        base_cr=2, 
+                        base_cr=2,
                         height=data.shape[0],
                         width=data.shape[1],
+                        data_dim=len(data.shape),
                         residual_opt=("max_error_target", atol)
                     )
                 zarr_filter = serializer(ebcc_filter.hdf_filter_opts)

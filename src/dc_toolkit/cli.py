@@ -13,6 +13,8 @@ import traceback
 import click
 from tqdm import tqdm
 from pathlib import Path
+import math
+import zarr
 import shutil
 import itertools
 import numcodecs
@@ -34,6 +36,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import subprocess
+import humanize
 
 import warnings
 warnings.filterwarnings(
@@ -700,6 +703,248 @@ def analyze_clustering(npy_file: str):
     )
     pio.renderers.default = "browser"
     fig.show()
+
+
+@cli.command("plot_compression_errors")
+@click.argument("dataset_file", type=click.Path(exists=True, dir_okay=False))
+@click.argument("where_to_write", type=click.Path(dir_okay=True, file_okay=False, exists=False))
+@click.argument("field_to_compress")
+@click.argument("comp_idx", type=int)
+@click.argument("filt_idx", type=int)
+@click.argument("ser_idx", type=int)
+@click.option("--compressor-class", default="all", help="Same as in evaluate_combos.")
+@click.option("--filter-class", default="all", help="Same as in evaluate_combos.")
+@click.option("--serializer-class", default="all", help="Same as in evaluate_combos.")
+@click.option("--with-lossy/--without-lossy", default=True, show_default=True, help="Same as in evaluate_combos.")
+@click.option("--with-numcodecs-wasm/--without-numcodecs-wasm", default=True, show_default=True, help="Same as in evaluate_combos.")
+@click.option("--with-ebcc/--without-ebcc", default=True, show_default=True, help="Same as in evaluate_combos.")
+def plot_compression_errors(dataset_file: str, where_to_write: str, field_to_compress: str,
+                            comp_idx: int, filt_idx: int, ser_idx: int, 
+                            compressor_class: str = "all", filter_class: str = "all", serializer_class: str = "all",
+                            with_lossy: bool = True, with_numcodecs_wasm: bool = True, with_ebcc: bool = True):
+    """
+    Plot the absolute errors arising from compression+decompression of a field
+    with the desired combination of compressor, filter, and serializer.
+    Additionally, plot the difference between a normal compression+decompression
+    process and one using a version of the data shifted by 180 degrees
+    longitudinally. This should show if the selected combination takes the
+    periodicity of the data into account.
+
+    Make sure to provide the field to compress in (lat, lon) format. Additional
+    dimensions are not supported or removed if they have a single level.
+
+    Make sure to provide the same --[compressor/filter/serializer]-class and the
+    same --with/without-[lossy/numcodecs-wasm/ebcc] flags as in evaluate_combos,
+    such that the same lists of instantiated objects are generated.
+    
+    Note on passing -1 as index:
+    dc_toolkit plot_compression_errors ... --compressor-class X ... --- -1 -1 -1
+
+    \b
+    Args:
+        dataset_file (str): Path to the input dataset file.
+        where_to_write (str): Directory where the file containing the plots will be writtsaved.
+        field_to_compress (str): Name of the field to compress/analyze.
+        comp_idx (int): Index of the compressor to use.
+        filt_idx (int): Index of the filter to use.
+        ser_idx (int): Index of the serializer to use.
+        compressor_class: --compressor-class
+        filter_class: --filter-class
+        serializer_class: --serializer-class
+        with_lossy: --with-lossy/--without-lossy
+        with_numcodecs_wasm: --with-numcodecs-wasm/--without-numcodecs-wasm
+        with_ebcc: --with-ebcc/--without-ebcc
+    """
+
+    #############
+    # GET COMBO #
+    #############
+
+    comm = MPI.COMM_WORLD
+    rank = comm.Get_rank()
+    size = comm.Get_size()
+    if size > 1:
+        if rank == 0:
+            click.echo("This command is not meant to be run in parallel. Please run it with a single process.")
+        sys.exit(1)
+
+    os.makedirs(where_to_write, exist_ok=True)
+
+    ds = utils.open_dataset(dataset_file, field_to_compress)
+    da = ds[field_to_compress].squeeze()
+
+    da_memsize = da.nbytes
+    click.echo(f"Squeezed (lat, lon) field_to_compress.nbytes = {humanize.naturalsize(da_memsize, binary=True)}")
+
+    if not utils.is_lat_lon(da):
+        click.echo(f"Field {field_to_compress} should be in lat-lon form, i.e. dimensions (lat, lon)! It currently has dimensions: {da.dims}.")
+        sys.exit(1)
+
+    threshold = 2.5  # GiB
+    if da_memsize / (1024 ** 3) > threshold:
+        click.echo(f"Field {field_to_compress} is too large ({humanize.naturalsize(da_memsize, binary=True)}). "
+                   f"To avoid high memory usage we only support fields up to {threshold} GiB.")
+        sys.exit(1)
+
+    compressors = utils.compressor_space(da, with_lossy, with_numcodecs_wasm, with_ebcc, compressor_class)
+    filters = utils.filter_space(da, with_lossy, with_numcodecs_wasm, with_ebcc, filter_class)
+    serializers = utils.serializer_space(da, with_lossy, with_numcodecs_wasm, with_ebcc, serializer_class)
+
+    if -1 <= comp_idx < len(compressors):
+        pass
+    else:
+        click.echo(f"Invalid comp_idx: {comp_idx}")
+        sys.exit(1)
+    if -1 <= filt_idx < len(filters):
+        pass
+    else:
+        click.echo(f"Invalid filt_idx: {filt_idx}")
+        sys.exit(1)
+    if -1 <= ser_idx < len(serializers):
+        pass
+    else:
+        click.echo(f"Invalid ser_idx: {ser_idx}")
+        sys.exit(1)
+
+    selected_compressor = compressors[comp_idx][1] if comp_idx != -1 else None
+    selected_filter = filters[filt_idx][1] if filt_idx != -1 else None
+    selected_serializer = serializers[ser_idx][1] if ser_idx != -1 else None
+
+    if isinstance(selected_serializer, AnyNumcodecsArrayBytesCodec) and isinstance(selected_serializer.codec, EBCCZarrFilter):
+        da = da.astype("float32")
+
+    filters_ = [selected_filter,]
+    compressors_ = [selected_compressor,]
+    serializer_ = selected_serializer
+
+    if isinstance(serializer_, AnyNumcodecsArrayBytesCodec) or selected_filter is None:
+        filters_ = None
+    if selected_compressor is None:
+        compressors_ = None
+    if selected_serializer is None:
+        serializer_ = "auto"
+
+    ################
+    # PROCESS DATA #
+    ################
+
+    click.echo(f"Shape of {field_to_compress}: {da.shape}")
+
+    units = da.attrs["units"]
+
+    lon_dim = da.dims[1]
+    half_idx = da.sizes[lon_dim] // 2
+
+    shifted_da = da.roll({lon_dim: -half_idx}, roll_coords=False)
+    shifted_da_backshifted = shifted_da.roll({lon_dim: half_idx}, roll_coords=False)
+
+    # Flatten data for ZFPY serializer
+    if isinstance(selected_serializer, numcodecs.zarr3.ZFPY):
+        da = da.stack(flat_dim=da.dims)
+        shifted_da = shifted_da.stack(flat_dim=da.dims)
+
+    ############
+    # COMPRESS #
+    ############
+
+    # Normal compression
+    store = utils.open_zarr_memstore()
+    da_compressed = zarr.create_array(
+        store=store,
+        name=field_to_compress,
+        data=da,
+        chunks='auto',
+        filters=filters_,
+        compressors=compressors_,
+        serializer=serializer_
+    )
+
+    # Shifted compression
+    shifted_store = utils.open_zarr_memstore()
+    shifted_da_compressed = zarr.create_array(
+        store=shifted_store,
+        name=field_to_compress,
+        data=shifted_da,
+        chunks='auto',
+        filters=filters_,
+        compressors=compressors_,
+        serializer=serializer_
+    )
+
+    ##############
+    # DECOMPRESS #
+    ##############
+
+    # Normal
+    da_decompressed = xr.DataArray(da_compressed[:], dims=da.dims, coords=da.coords)
+
+    # Shifted
+    shifted_da_decompressed = xr.DataArray(shifted_da_compressed[:], dims=da.dims, coords=da.coords)
+
+    # Reshape the data to its original dimensions for ZFPY serializer
+    if isinstance(selected_serializer, numcodecs.zarr3.ZFPY):
+        da = da.unstack("flat_dim")
+        shifted_da = shifted_da.unstack("flat_dim")
+        da_decompressed = da_decompressed.unstack("flat_dim")
+        shifted_da_decompressed = shifted_da_decompressed.unstack("flat_dim")
+
+    shifted_da_decompressed_backshifted = shifted_da_decompressed.roll({lon_dim: half_idx}, roll_coords=False)
+
+    store.close()
+    shifted_store.close()
+
+    #########
+    # PLOTS #
+    #########
+
+    fig, axes = plt.subplots(3, 3, layout='constrained', figsize=(16, 9))
+    ax1, ax2, ax3, ax4, ax5, ax6, ax7, ax8, ax9 = axes.flatten()
+
+    fig.suptitle(f"Compression errors for variable {field_to_compress} ({units})", fontsize=16)
+
+    ax1.set_title("Original", fontsize=10)
+    tmp = ax1.imshow(da, interpolation='none')
+    fig.colorbar(tmp, ax=ax1, shrink=0.7)
+
+    ax2.set_title("Original compressed&decompressed", fontsize=10)
+    tmp = ax2.imshow(da_decompressed, interpolation='none')
+    fig.colorbar(tmp, ax=ax2, shrink=0.7)
+
+    ax3.set_title("Absolute error [original - original c&d]", fontsize=10)
+    absolute_error = np.abs(da - da_decompressed)
+    tmp = ax3.imshow(absolute_error, interpolation='none', cmap='binary')
+    fig.colorbar(tmp, ax=ax3, shrink=0.7)
+
+    ax4.set_title("Shifted (by +180 deg)", fontsize=10)
+    tmp = ax4.imshow(shifted_da, interpolation='none')
+    fig.colorbar(tmp, ax=ax4, shrink=0.7)
+
+    ax5.set_title("Shifted compressed&decompressed", fontsize=10)
+    tmp = ax5.imshow(shifted_da_decompressed, interpolation='none')
+    fig.colorbar(tmp, ax=ax5, shrink=0.7)
+
+    ax6.set_title("Absolute error [shifted - shifted c&d]", fontsize=10)
+    absolute_error = np.abs(shifted_da - shifted_da_decompressed)
+    tmp = ax6.imshow(absolute_error, interpolation='none', cmap='binary')
+    fig.colorbar(tmp, ax=ax6, shrink=0.7)
+
+    ax7.set_title("Absolute error [original - (shifted-180)]", fontsize=10)
+    absolute_error = np.abs(da - shifted_da_backshifted) / (np.abs(da) + 1e-20)
+    tmp = ax7.imshow(absolute_error, interpolation='none', cmap='binary')
+    fig.colorbar(tmp, ax=ax7, shrink=0.7)
+
+    ax8.set_title("Absolute error [original c&d - (shifted c&d-180)]", fontsize=10)
+    absolute_error = np.abs(da_decompressed - shifted_da_decompressed_backshifted)
+    tmp = ax8.imshow(absolute_error, interpolation='none', cmap='binary')
+    fig.colorbar(tmp, ax=ax8, shrink=0.7)
+
+    ax9.set_title("Absolute error [original - (shifted c&d-180)]", fontsize=10)
+    absolute_error = np.abs(da - shifted_da_decompressed_backshifted)
+    tmp = ax9.imshow(absolute_error, interpolation='none', cmap='binary')
+    fig.colorbar(tmp, ax=ax9, shrink=0.7)
+
+    fig.savefig(os.path.join(where_to_write, f'{field_to_compress}_compression_errors.pdf'), bbox_inches='tight')
+    plt.close(fig)
 
 
 @cli.command("run_web_ui_santis")
