@@ -5,7 +5,7 @@
 #
 # Please, refer to the LICENSE file in the root directory.
 # SPDX-License-Identifier: BSD-3-Clause
-
+import math
 import os
 import sys
 import io
@@ -447,6 +447,14 @@ def open_zarr_zip_file_and_inspect(zarr_zip_file: str):
 @click.option("--out", "out_nc", type=click.Path(dir_okay=False), default=None,
               help="Output NetCDF file. Defaults to INPUT with .nc extension.")
 def from_zarr_zip_to_netcdf(zarr_zip_file: str, out_nc: str | None):
+    """
+    Convert a Zarr Zipped file to netcdf.
+
+    \b
+    Args:
+        zarr_zip_file (str): Path to the Zarr file.
+        out_nc (str): Output NetCDF file.
+    """
     comm = MPI.COMM_WORLD
     rank = comm.Get_rank()
     size = comm.Get_size()
@@ -480,10 +488,17 @@ def from_zarr_zip_to_netcdf(zarr_zip_file: str, out_nc: str | None):
 @click.argument("l_error", type=str)
 def perform_clustering(npy_file: str, l_error: str):
     """
-    Perform clustering on L-error file
-    :param npy_file:
-    :param L-error: choose between: ["L1", "L2", "LInf"]
-    :return:
+    Calculates Elbow and Silhouette scores for compression Ratio VS chosen L-error over clusters ranging from 3 to 10.
+    It can be executed only after evaluate_combos.
+
+    Returns 2 plots for chosen L-error:
+      - Elbow method VS Number of clusters
+      - Silhouette score VS Number of clusters
+
+    \b
+    Args:
+        npy_file (str): npy file with L-errors and compression ratios results for each combination of compressor, filter, and serializer
+        l_error (str): choose between "L1", "L2", "LInf" to generate the plot
     """
     scored_results = np.load(npy_file, allow_pickle=True)
 
@@ -527,6 +542,19 @@ def perform_clustering(npy_file: str, l_error: str):
 @cli.command("analyze_clustering")
 @click.argument("npy_file", type=click.Path(exists=True, dir_okay=False))
 def analyze_clustering(npy_file: str):
+    """
+    Performs clustering on all 3 L-errors, can be executed only after evaluate_combos.
+    It can be executed only after evaluate_combos.
+
+    Returns 3 plots for chosen L-error:
+      - L1 VS Compression Ratio
+      - L2 VS Compression Ratio
+      - LInf VS Compression Ratio
+
+    \b
+    Args:
+        npy_file (str): npy file with L-errors and compression ratios results for each combination of compressor, filter, and serializer
+    """
     config_idxs = pd.read_csv("config_space.csv")
     scored_results = np.load(str(npy_file), allow_pickle=True)
 
@@ -540,9 +568,11 @@ def analyze_clustering(npy_file: str):
     clean_arr_l2 = utils.slice_array(scored_results_pd, [0, 2, 5, 6, 7])
     clean_arr_linf = utils.slice_array(scored_results_pd, [0, 3, 5, 6, 7])
 
+    max_n_rows, max_nclusters = 42976, 6
+    adjusted_n_clusters = math.ceil(max_nclusters * len(scored_results_pd) / max_n_rows)
 
     # Plot Error and Similarity Metrics VS Ratio
-    kmeans = KMeans(n_clusters=6, random_state=0, n_init="auto")
+    kmeans = KMeans(n_clusters=adjusted_n_clusters, random_state=0, n_init="auto")
 
     fig = make_subplots(rows=3, cols=1,
                         subplot_titles=[
@@ -557,13 +587,16 @@ def analyze_clustering(npy_file: str):
     df_l1["compressor"] = clean_arr_l1[:, 2]
     df_l1["filter"] = clean_arr_l1[:, 3]
     df_l1["serializer"] = clean_arr_l1[:, 4]
+    df_l1["compressor_idx"] = utils.get_indexes(clean_arr_l1[:, 2], config_idxs['0'])
+    df_l1["filter_idx"] = utils.get_indexes(clean_arr_l1[:, 3], config_idxs['1'])
+    df_l1["serializer_idx"] = utils.get_indexes(clean_arr_l1[:, 4], config_idxs['2'])
 
     y_kmeans = kmeans.fit_predict(pd.DataFrame(df_l1, columns=["Ratio", "L1"]))
     color = np.ones(y_kmeans.shape) if len(np.unique(y_kmeans)) == 1 else y_kmeans
 
     fig_l1 = px.scatter(df_l1, x="Ratio", y="L1", color=color,
                         title="L1 VS Ratio KMeans Clustering",
-                        hover_data=["compressor", "filter", "serializer"])
+                        hover_data=["compressor", "filter", "serializer", "compressor_idx", "filter_idx", "serializer_idx"])
 
     fig.add_trace(
         go.Scatter(
@@ -591,13 +624,16 @@ def analyze_clustering(npy_file: str):
         df_l2["compressor"] = clean_arr_l2[:, 2]
         df_l2["filter"] = clean_arr_l2[:, 3]
         df_l2["serializer"] = clean_arr_l2[:, 4]
+        df_l2["compressor_idx"] = utils.get_indexes(clean_arr_l2[:, 2], config_idxs['0'])
+        df_l2["filter_idx"] = utils.get_indexes(clean_arr_l2[:, 3], config_idxs['1'])
+        df_l2["serializer_idx"] = utils.get_indexes(clean_arr_l2[:, 4], config_idxs['2'])
 
         y_kmeans = kmeans.fit_predict(pd.DataFrame(df_l2, columns=["Ratio", "L2"]))
         color = np.ones(y_kmeans.shape) if len(np.unique(y_kmeans)) == 1 else y_kmeans
 
         fig_l2 = px.scatter(df_l2, x="Ratio", y="L2", color=color,
                             title="L2 VS Ratio KMeans Clustering",
-                            hover_data=["compressor", "filter", "serializer"])
+                            hover_data=["compressor", "filter", "serializer", "compressor_idx", "filter_idx", "serializer_idx"])
 
         fig.add_trace(
             go.Scatter(
@@ -673,6 +709,17 @@ def analyze_clustering(npy_file: str):
 @click.option("--nodes", type=str, default="", help="Number of nodes")
 @click.option("--ntasks-per-node", type=str, default="", help="Number of tasks per node")
 def run_web_ui_santis(user_account: str = None, uploaded_file: str = "", time: str = "", nodes: str = "", ntasks_per_node: str = ""):
+    """
+    Web UI for data clustering, analysis, and compression to be launched from santis.
+
+    \b
+    Args:
+        user_account (str): santis user id
+        uploaded_file (str): path to file to use for analysis
+        time (str): UI time limit
+        nodes (str): number of nodes
+        ntasks_per_node (str): number of tasks per node
+    """
     current_dir = os.path.dirname(os.path.abspath(__file__))
     cmd_web_ui_santis = [
         "streamlit", "run", str(current_dir) + "/compression_analysis_ui_web.py", "--", "--user_account", user_account,
@@ -680,16 +727,24 @@ def run_web_ui_santis(user_account: str = None, uploaded_file: str = "", time: s
     ]
     subprocess.run(cmd_web_ui_santis)
 
+
 @cli.command("run_web_ui")
 def run_web_ui():
+    """
+    Web UI for data clustering, analysis, and compression to be launched from local terminal.
+    """
     current_dir = os.path.dirname(os.path.abspath(__file__))
     cmd_web_ui = [
         "streamlit", "run", str(current_dir) + "/compression_analysis_ui_web.py"
     ]
     subprocess.run(cmd_web_ui)
 
+
 @cli.command("run_local_ui")
 def run_local_ui():
+    """
+    Local UI for data clustering, analysis, and compression to be launched from local terminal.
+    """
     current_dir = os.path.dirname(os.path.abspath(__file__))
     cmd_local_ui = [
         "python", str(current_dir) + "/compression_analysis_ui_local.py"
