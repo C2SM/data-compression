@@ -202,6 +202,49 @@ def compute_errors_distances(da_compressed, da):
     return "\n".join(f"{k:20s}: {v}" for k, v in errors_.items()), errors, euclidean_distance, normalized_euclidean_distance
 
 
+def compute_chunks(data, min_height=0, max_height=None, min_width=0, max_width=None):
+    lat_dim = data.shape[0]
+    lon_dim = data.shape[1]
+    height = lat_dim
+    width = lon_dim
+
+    if max_height is None: max_height = lat_dim
+    if max_width is None: max_width = lat_dim
+
+    keep_searching_height = True
+    keep_searching_width = True
+
+    for n in [2, 3, 5]:
+        for m in range(10):
+            d = n * (m+1)
+            for p in range(7, -1, -1):
+
+                if keep_searching_height or keep_searching_width:
+
+                    if keep_searching_height:
+                        n_chunks_height = d**p
+
+                        if height % n_chunks_height == 0:
+                            new_height = height / n_chunks_height
+
+                            if (new_height >= min_height) and (new_height <= max_height):
+                                height = new_height
+                                keep_searching_height = False
+
+                    if keep_searching_width and p > 0:
+                        n_chunks_width = d**(p-1)
+
+                        if width % n_chunks_width == 0:
+                            new_width = width / n_chunks_width
+
+                            if (new_width >= min_width) and (new_width <= max_width):
+                                width = new_width
+                                keep_searching_width = False
+
+                else:
+                    return (height, width, n_chunks_height, n_chunks_width)
+
+
 def compressor_space(da, with_lossy=True, with_numcodecs_wasm=True, with_ebcc=True, compressor_class="all"):
     # https://numcodecs.readthedocs.io/en/stable/zarr3.html#compressors-bytes-to-bytes-codecs
 
@@ -378,11 +421,20 @@ def serializer_space(da, with_lossy=True, with_numcodecs_wasm=True, with_ebcc=Tr
         elif serializer == EBCCZarrFilter:
             # https://github.com/spcl/ebcc
             data = da.squeeze()  # TODO: add more checks on the shape of the data
+
+            height, width, n_chunks_height, n_chunks_width = compute_chunks( data,
+                                                                             min_height=32,
+                                                                             max_height=2047,
+                                                                             min_width=32,
+                                                                             max_width=2047 )
+
+            click.echo(f"Using (lat_chunks * lon_chunks) = ({n_chunks_height} * {n_chunks_width}) = {n_chunks_height*n_chunks_width} chunks for EBCC serializers.")
+
             for atol in [1e-2, 1e-3, 1e-6, 1e-9]:
                 ebcc_filter = EBCC_Filter(
                         base_cr=2,
-                        height=data.shape[0],
-                        width=data.shape[1],
+                        height=height,
+                        width=width,
                         data_dim=len(data.shape),
                         residual_opt=("max_error_target", atol)
                     )

@@ -780,10 +780,10 @@ def plot_compression_errors(dataset_file: str, where_to_write: str, field_to_com
         click.echo(f"Field {field_to_compress} should be in lat-lon form, i.e. dimensions (lat, lon)! It currently has dimensions: {da.dims}.")
         sys.exit(1)
 
-    threshold = 2.5  # GiB
-    if da_memsize / (1024 ** 3) > threshold:
+    mem_threshold = 2.5  # GiB
+    if da_memsize / (1024 ** 3) > mem_threshold:
         click.echo(f"Field {field_to_compress} is too large ({humanize.naturalsize(da_memsize, binary=True)}). "
-                   f"To avoid high memory usage we only support fields up to {threshold} GiB.")
+                   f"To avoid high memory usage we only support fields up to {mem_threshold} GiB.")
         sys.exit(1)
 
     compressors = utils.compressor_space(da, with_lossy, with_numcodecs_wasm, with_ebcc, compressor_class)
@@ -810,8 +810,13 @@ def plot_compression_errors(dataset_file: str, where_to_write: str, field_to_com
     selected_filter = filters[filt_idx][1] if filt_idx != -1 else None
     selected_serializer = serializers[ser_idx][1] if ser_idx != -1 else None
 
+    chunks_size = 'auto'
+
     if isinstance(selected_serializer, AnyNumcodecsArrayBytesCodec) and isinstance(selected_serializer.codec, EBCCZarrFilter):
         da = da.astype("float32")
+        chunks_height = int(selected_serializer.codec.arglist[0])
+        chunks_width = int(selected_serializer.codec.arglist[1])
+        chunks_size = (chunks_height, chunks_width)
 
     filters_ = [selected_filter,]
     compressors_ = [selected_compressor,]
@@ -853,7 +858,7 @@ def plot_compression_errors(dataset_file: str, where_to_write: str, field_to_com
         store=store,
         name=field_to_compress,
         data=da,
-        chunks='auto',
+        chunks=chunks_size,
         filters=filters_,
         compressors=compressors_,
         serializer=serializer_
@@ -865,7 +870,7 @@ def plot_compression_errors(dataset_file: str, where_to_write: str, field_to_com
         store=shifted_store,
         name=field_to_compress,
         data=shifted_da,
-        chunks='auto',
+        chunks=chunks_size,
         filters=filters_,
         compressors=compressors_,
         serializer=serializer_
