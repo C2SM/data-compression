@@ -358,7 +358,6 @@ def compress_with_optimal(dataset_file, where_to_write, field_to_compress,
         verbose=False,
     )
 
-    click.echo(f" | {(optimal_compressor, optimal_filter, optimal_serializer)} | --> Ratio: {compression_ratio:.3f} | Error: {errors['Relative_Error_L1']:.3e} | Euclidean Distance: {euclidean_distance:.3e}")
     msg = (
         "optimal combo: \n"
         f"compressor : {optimal_compressor}\nfilter     : {optimal_filter}\nserializer : {optimal_serializer}\n"
