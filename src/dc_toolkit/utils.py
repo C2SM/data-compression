@@ -365,6 +365,7 @@ def filter_space(da, with_lossy=True, with_numcodecs_wasm=True, with_ebcc=True, 
 def serializer_space(da, with_lossy=True, with_numcodecs_wasm=True, with_ebcc=True, serializer_class="all"):
     # https://numcodecs.readthedocs.io/en/stable/zarr3.html#serializers-array-to-bytes-codecs
     # https://numcodecs-wasm.readthedocs.io/en/latest/
+    rank = MPI.COMM_WORLD.Get_rank()
     is_int = (da.dtype.kind == "i")
 
     serializer_space = []
@@ -428,7 +429,8 @@ def serializer_space(da, with_lossy=True, with_numcodecs_wasm=True, with_ebcc=Tr
                                                                              min_width=32,
                                                                              max_width=2047 )
 
-            click.echo(f"Using (lat_chunks * lon_chunks) = ({n_chunks_height} * {n_chunks_width}) = {n_chunks_height*n_chunks_width} chunks for EBCC serializers.")
+            if rank == 0:
+                click.echo(f"Using (lat_chunks * lon_chunks) = ({n_chunks_height} * {n_chunks_width}) = {n_chunks_height*n_chunks_width} chunks for EBCC serializers.")
 
             for atol in [1e-2, 1e-3, 1e-6, 1e-9]:
                 ebcc_filter = EBCC_Filter(
