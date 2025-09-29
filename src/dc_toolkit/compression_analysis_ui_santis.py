@@ -28,6 +28,7 @@ from dc_toolkit import utils
 
 where_am_i = subprocess.run(["uname", "-a"], capture_output=True, text=True)
 
+
 def find_latest_file(folder_path, filename_prefix):
     latest_file = None
     latest_mtime = -1
@@ -43,6 +44,7 @@ def find_latest_file(folder_path, filename_prefix):
 
     return latest_file
 
+
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--input_file', type=str, default='default.csv')
@@ -54,19 +56,21 @@ def parse_args():
     parser.add_argument('--ntasks-per-node', type=str, default=None)
     return parser.parse_args()
 
-st.title("Upload a file and evaluate compressors")
 
+st.title("Upload a file and evaluate compressors")
 
 if parse_args().uploaded_file is None:
     uploaded_file = st.file_uploader("Choose a netcdf file")
 else:
     uploaded_file = open(parse_args().uploaded_file, "rb")
 
+
 def find_file(base_path, file_name):
     for root, dirs, files in os.walk(base_path):
         if file_name in files:
             return os.path.join(root, file_name)
     return None
+
 
 @st.cache_data
 def load_scored_results(file_name: str, params_str: list[str]):
@@ -101,7 +105,9 @@ def create_cluster_plots(clean_arr_l1, clean_arr_l2, clean_arr_linf, n_clusters)
     color = np.ones(y_kmeans.shape) if len(np.unique(y_kmeans)) == 1 else y_kmeans
 
     fig_l1 = px.scatter(df_l1, x="Ratio", y="L1", color=color,
-                        title="L1 VS Ratio KMeans Clustering", hover_data=["compressor", "filter", "serializer", "compressor_idx", "filter_idx", "serializer_idx"])
+                        title="L1 VS Ratio KMeans Clustering",
+                        hover_data=["compressor", "filter", "serializer", "compressor_idx", "filter_idx",
+                                    "serializer_idx"])
 
     fig.add_trace(
         go.Scatter(
@@ -139,7 +145,9 @@ def create_cluster_plots(clean_arr_l1, clean_arr_l2, clean_arr_linf, n_clusters)
     color = np.ones(y_kmeans.shape) if len(np.unique(y_kmeans)) == 1 else y_kmeans
 
     fig_l2 = px.scatter(df_l2, x="Ratio", y="L2", color=color,
-                        title="L2 VS Ratio KMeans Clustering", hover_data=["compressor", "filter", "serializer", "compressor_idx", "filter_idx", "serializer_idx"])
+                        title="L2 VS Ratio KMeans Clustering",
+                        hover_data=["compressor", "filter", "serializer", "compressor_idx", "filter_idx",
+                                    "serializer_idx"])
 
     fig.add_trace(
         go.Scatter(
@@ -177,7 +185,9 @@ def create_cluster_plots(clean_arr_l1, clean_arr_l2, clean_arr_linf, n_clusters)
     color = np.ones(y_kmeans.shape) if len(np.unique(y_kmeans)) == 1 else y_kmeans
 
     fig_linf = px.scatter(df_linf, x="Ratio", y="LInf", color=color,
-                          title="LInf VS Ratio KMeans Clustering", hover_data=["compressor", "filter", "serializer", "compressor_idx", "filter_idx", "serializer_idx"])
+                          title="LInf VS Ratio KMeans Clustering",
+                          hover_data=["compressor", "filter", "serializer", "compressor_idx", "filter_idx",
+                                      "serializer_idx"])
 
     fig.add_trace(
         go.Scatter(
@@ -284,9 +294,9 @@ if uploaded_file is not None and uploaded_file.name.endswith(".nc"):
                 options=options_with,
             )
 
-
         predefined_l1 = st.checkbox("Use pre-defined l1 error", value=True)
-        l1_error_class = st.number_input('l1_error_class', min_value=0.0, max_value=1.0, value=0.0, step=0.0000000001, format="%.10f", disabled=predefined_l1)
+        l1_error_class = st.number_input('l1_error_class', min_value=0.0, max_value=1.0, value=0.0, step=0.0000000001,
+                                         format="%.10f", disabled=predefined_l1)
 
     with tempfile.NamedTemporaryFile(suffix=".nc", delete=False) as tmp:
         path_to_modified_file = tmp.name
@@ -304,27 +314,37 @@ if uploaded_file is not None and uploaded_file.name.endswith(".nc"):
     if st.button("Analyze compressors"):
         if predefined_l1:
             cmd_compress = [
-                "mpirun",
-                "-n",
-                "8",
+                "srun",
+                "-A", parse_args().user_account,
+                "--time", parse_args().time,
+                "--nodes", parse_args().nodes,
+                "--ntasks-per-node", parse_args().ntasks_per_node,
+                "--uenv=prgenv-gnu/24.11:v2",
+                "--view=default",
+                "--partition=debug",
                 "dc_toolkit",
                 "evaluate_combos",
-                tmp.name,
+                display_file_name,
                 os.getcwd(),
-                "--field-to-compress="+field_to_compress,
-                "--compressor-class="+compressor_class,
-                "--filter-class="+filter_class,
-                "--serializer-class="+serializer_class,
+                "--field-to-compress=" + field_to_compress,
+                "--compressor-class=" + compressor_class,
+                "--filter-class=" + filter_class,
+                "--serializer-class=" + serializer_class,
                 *[with_lossy_option, with_numcodecs_option, with_ebcc_option]
             ]
         else:
             cmd_compress = [
-                "mpirun",
-                "-n",
-                "8",
+                "srun",
+                "-A", parse_args().user_account,
+                "--time", parse_args().time,
+                "--nodes", parse_args().nodes,
+                "--ntasks-per-node", parse_args().ntasks_per_node,
+                "--uenv=prgenv-gnu/24.11:v2",
+                "--view=default",
+                "--partition=debug",
                 "dc_toolkit",
                 "evaluate_combos",
-                tmp.name,
+                parse_args().uploaded_file,
                 os.getcwd(),
                 "--field-to-compress=" + field_to_compress,
                 "--compressor-class=" + compressor_class,
@@ -338,26 +358,29 @@ if uploaded_file is not None and uploaded_file.name.endswith(".nc"):
         progress_text = st.empty()
 
         with subprocess.Popen(
-            cmd_compress,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1
+                cmd_compress,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1
         ) as proc:
             for line in proc.stdout:
                 progress_text.text(f"{line}")
+
+        path_to_modified_file = display_file_name
 
         pattern = r'--.*?-?'
         with_lossy = re.sub(pattern, '', with_lossy_option, count=1)
         with_numcodesc_wasm = re.sub(pattern, '', with_numcodecs_option, count=1)
         with_ebcc = re.sub(pattern, '', with_ebcc_option, count=1)
 
-        score_results_file_name = [field_to_compress, compressor_class, filter_class, serializer_class, with_lossy, with_numcodesc_wasm, with_ebcc]
+        score_results_file_name = [field_to_compress, compressor_class, filter_class, serializer_class, with_lossy,
+                                   with_numcodesc_wasm, with_ebcc]
         params_str = '_' + '_'.join(score_results_file_name)
-        scored_results = load_scored_results(os.path.basename(tmp.name), params_str)
+        scored_results = load_scored_results(os.path.basename(path_to_modified_file), params_str)
         scored_results_pd = pd.DataFrame(scored_results)
         max_n_rows, max_nclusters = 42976, 6
-        adjusted_n_clusters = math.ceil(max_nclusters*len(scored_results_pd)/max_n_rows)
+        adjusted_n_clusters = math.ceil(max_nclusters * len(scored_results_pd) / max_n_rows)
 
         numeric_cols = scored_results_pd.select_dtypes(include=[np.number]).columns
         mask = np.isfinite(scored_results_pd[numeric_cols]).all(axis=1)
@@ -392,7 +415,9 @@ if uploaded_file is not None and uploaded_file.name.endswith(".nc"):
         with_lossy = "with_lossy" if lossy_class == "with" else "without_lossy"
         with_numcodecs_wasm = "with_numcodecs_wasm" if numcodecs_wasm_class == "with" else "without_numcodecs_wasm"
         with_ebcc = "with_ebcc" if ebcc_class == "with" else "without_ebcc"
-        cluster_results_file_name = [c for c in (field_to_compress, compressor_class, filter_class, serializer_class, with_lossy, with_numcodecs_wasm, with_ebcc)]
+        cluster_results_file_name = [c for c in
+                                     (field_to_compress, compressor_class, filter_class, serializer_class, with_lossy,
+                                      with_numcodecs_wasm, with_ebcc)]
         params_str = '_' + '_'.join(cluster_results_file_name)
 
         with open(plot_file_path, "rb") as f:
@@ -465,15 +490,20 @@ if uploaded_file is not None and uploaded_file.name.endswith(".nc"):
             time.sleep(4)
             placeholder.empty()
         else:
-            temp_dir = os.path.dirname(path_to_modified_file)
+            temp_dir = os.getcwd()
             cmd_compress = [
-                "mpirun",
-                "-n",
-                "8",
+                "srun",
+                "-A", parse_args().user_account,
+                "--time", parse_args().time,
+                "--nodes", parse_args().nodes,
+                "--ntasks-per-node", parse_args().ntasks_per_node,
+                "--uenv=prgenv-gnu/24.11:v2",
+                "--view=default",
+                "--partition=debug",
                 "dc_toolkit",
                 "compress_with_optimal",
-                path_to_modified_file,
-                temp_dir,
+                display_file_name,
+                os.getcwd(),
                 field_to_compress,
                 str(comp_idx), str(filt_idx), str(ser_idx),
                 *[with_lossy_option, with_numcodecs_option, with_ebcc_option]
@@ -486,10 +516,9 @@ if uploaded_file is not None and uploaded_file.name.endswith(".nc"):
             status.empty()
             st.success(f"Compression completed successfully.")
 
-            split_tmp_name = os.path.basename(path_to_modified_file).split(".=.", 1)
-            compressed_file_name = f"{uploaded_file.name}.=.{split_tmp_name[0]}"
-            shutil.copy(path_to_modified_file, os.getcwd())
-            output_file_path = os.path.basename(path_to_modified_file)
+            output_file_path = find_latest_file(os.getcwd(), os.path.basename(display_file_name))
+            split_tmp_name = os.path.basename(display_file_name).split(".=.", 1)
+            compressed_file_name = f"{os.path.basename(uploaded_file.name)}.=.{split_tmp_name[0]}"
 
             with open(output_file_path, "rb") as data_file:
                 st.download_button(
