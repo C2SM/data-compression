@@ -30,6 +30,7 @@ from mpi4py import MPI
 import time
 from collections import defaultdict
 import atexit
+import re
 
 # numcodecs-wasm filters
 from numcodecs_wasm_asinh import Asinh
@@ -86,9 +87,27 @@ def open_dataset(dataset_file: str, field_to_compress: str | None = None, field_
     return ds
 
 
+def is_lat_lon(da):
+
+    lat_pattern = r'lat'
+    lon_pattern = r'lon'
+
+    dims = da.dims
+
+    if len(dims) == 2 and re.search(lat_pattern, dims[0]) and re.search(lon_pattern, dims[1]):
+        return True
+
+    return False
+
+
 def open_zarr_zipstore(zarr_zipstore_file: str):
     store = zarr.storage.ZipStore(zarr_zipstore_file, read_only=True)
     return zarr.open_group(store, mode='r'), store
+
+
+def open_zarr_memstore():
+    store = zarr.storage.MemoryStore()
+    return store
 
 
 def compress_with_zarr(data, dataset_file, field_to_compress, where_to_write, filters, compressors, serializer, verbose=True, rank=0):
@@ -181,6 +200,49 @@ def compute_errors_distances(da_compressed, da):
 
     errors_ = {k: f"{v:.3e}" for k, v in errors.items()}
     return "\n".join(f"{k:20s}: {v}" for k, v in errors_.items()), errors, euclidean_distance, normalized_euclidean_distance
+
+
+def compute_chunks(data, min_height=0, max_height=None, min_width=0, max_width=None):
+    lat_dim = data.shape[0]
+    lon_dim = data.shape[1]
+    height = lat_dim
+    width = lon_dim
+
+    if max_height is None: max_height = lat_dim
+    if max_width is None: max_width = lat_dim
+
+    keep_searching_height = True
+    keep_searching_width = True
+
+    for n in [2, 3, 5]:
+        for m in range(10):
+            d = n * (m+1)
+            for p in range(7, -1, -1):
+
+                if keep_searching_height or keep_searching_width:
+
+                    if keep_searching_height:
+                        n_chunks_height = d**p
+
+                        if height % n_chunks_height == 0:
+                            new_height = height / n_chunks_height
+
+                            if (new_height >= min_height) and (new_height <= max_height):
+                                height = new_height
+                                keep_searching_height = False
+
+                    if keep_searching_width and p > 0:
+                        n_chunks_width = d**(p-1)
+
+                        if width % n_chunks_width == 0:
+                            new_width = width / n_chunks_width
+
+                            if (new_width >= min_width) and (new_width <= max_width):
+                                width = new_width
+                                keep_searching_width = False
+
+                else:
+                    return (height, width, n_chunks_height, n_chunks_width)
 
 
 def compressor_space(da, with_lossy=True, with_numcodecs_wasm=True, with_ebcc=True, compressor_class="all"):
@@ -303,6 +365,7 @@ def filter_space(da, with_lossy=True, with_numcodecs_wasm=True, with_ebcc=True, 
 def serializer_space(da, with_lossy=True, with_numcodecs_wasm=True, with_ebcc=True, serializer_class="all"):
     # https://numcodecs.readthedocs.io/en/stable/zarr3.html#serializers-array-to-bytes-codecs
     # https://numcodecs-wasm.readthedocs.io/en/latest/
+    rank = MPI.COMM_WORLD.Get_rank()
     is_int = (da.dtype.kind == "i")
 
     serializer_space = []
@@ -359,11 +422,22 @@ def serializer_space(da, with_lossy=True, with_numcodecs_wasm=True, with_ebcc=Tr
         elif serializer == EBCCZarrFilter:
             # https://github.com/spcl/ebcc
             data = da.squeeze()  # TODO: add more checks on the shape of the data
+
+            height, width, n_chunks_height, n_chunks_width = compute_chunks( data,
+                                                                             min_height=32,
+                                                                             max_height=2047,
+                                                                             min_width=32,
+                                                                             max_width=2047 )
+
+            if rank == 0:
+                click.echo(f"Using (lat_chunks * lon_chunks) = ({n_chunks_height} * {n_chunks_width}) = {n_chunks_height*n_chunks_width} chunks for EBCC serializers.")
+
             for atol in [1e-2, 1e-3, 1e-6, 1e-9]:
                 ebcc_filter = EBCC_Filter(
-                        base_cr=2, 
-                        height=data.shape[0],
-                        width=data.shape[1],
+                        base_cr=2,
+                        height=height,
+                        width=width,
+                        data_dim=len(data.shape),
                         residual_opt=("max_error_target", atol)
                     )
                 zarr_filter = serializer(ebcc_filter.hdf_filter_opts)
