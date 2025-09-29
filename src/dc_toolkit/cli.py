@@ -971,7 +971,7 @@ def run_web_ui_santis(user_account: str = None, uploaded_file: str = "", time: s
     """
     current_dir = os.path.dirname(os.path.abspath(__file__))
     cmd_web_ui_santis = [
-        "streamlit", "run", str(current_dir) + "/compression_analysis_ui_web.py", "--", "--user_account", user_account,
+        "streamlit", "run", str(current_dir) + "/compression_analysis_ui_santis.py", "--", "--user_account", user_account,
         "--uploaded_file", uploaded_file, "--time", time, "--nodes", nodes, "--ntasks-per-node", ntasks_per_node
     ]
     subprocess.run(cmd_web_ui_santis)
