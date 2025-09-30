@@ -59,7 +59,7 @@ def cli():
 
 
 @cli.command("evaluate_combos")
-@click.argument("dataset_file", type=click.Path(exists=True, dir_okay=False))
+@click.argument("dataset_file", type=click.Path(exists=True, dir_okay=True, file_okay=True))
 @click.argument("where_to_write", type=click.Path(dir_okay=True, file_okay=False, exists=False))
 @click.option("--field-to-compress", default=None, help="Field to compress [if not given, all fields will be compressed].")
 @click.option("--field-percentage-to-compress", default=None, callback=utils.validate_percentage, help="Compress a percentage of the field [1-99%]. If not given, the whole field will be compressed.")
@@ -253,7 +253,7 @@ def evaluate_combos(dataset_file: str, where_to_write: str,
 
 
 @cli.command("compress_with_optimal")
-@click.argument("dataset_file", type=click.Path(exists=True, dir_okay=False))
+@click.argument("dataset_file", type=click.Path(exists=True, dir_okay=True, file_okay=True))
 @click.argument("where_to_write", type=click.Path(dir_okay=True, file_okay=False, exists=False))
 @click.argument("field_to_compress")
 @click.argument("comp_idx", type=int)
@@ -368,7 +368,7 @@ def compress_with_optimal(dataset_file, where_to_write, field_to_compress,
     click.echo(msg)
 
 @cli.command("merge_compressed_fields")
-@click.argument("dataset_file", type=click.Path(exists=True, dir_okay=False))
+@click.argument("dataset_file", type=click.Path(exists=True, dir_okay=True, file_okay=True))
 @click.argument("compressed_files_location", type=click.Path(dir_okay=True, file_okay=False, exists=False))
 def merge_compressed_fields(dataset_file: str, compressed_files_location: str):
     """
@@ -705,7 +705,7 @@ def analyze_clustering(npy_file: str):
 
 
 @cli.command("plot_compression_errors")
-@click.argument("dataset_file", type=click.Path(exists=True, dir_okay=False))
+@click.argument("dataset_file", type=click.Path(exists=True, dir_okay=True, file_okay=True))
 @click.argument("where_to_write", type=click.Path(dir_okay=True, file_okay=False, exists=False))
 @click.argument("field_to_compress")
 @click.argument("comp_idx", type=int)

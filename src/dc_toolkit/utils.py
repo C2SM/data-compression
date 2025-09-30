@@ -40,6 +40,7 @@ from numcodecs_wasm_zfp import Zfp
 
 os.environ["EBCC_LOG_LEVEL"] = "4"  # ERROR (suppress WARN and below)
 
+
 def get_indexes(arr, indices):
     codec_to_id = []
     for ind in indices:
@@ -59,15 +60,38 @@ def get_indexes(arr, indices):
                 return IndexError(f'{item} not in list {list(codec_id_dict.keys())}')
     return np.asarray(id_ls)
 
+
+def open_zarr_memstore():
+    store = zarr.storage.MemoryStore()
+    return store
+
+def open_zarr_zipstore(zarr_zipstore_file: str):
+    store = zarr.storage.ZipStore(zarr_zipstore_file, read_only=True)
+    return zarr.open_group(store, mode='r'), store
+
+def open_zarr_localstore(zarr_localstore_file: str):
+    store = zarr.storage.LocalStore(zarr_localstore_file, read_only=True)
+    return zarr.open_group(store, mode='r'), store
+
+
 def open_dataset(dataset_file: str, field_to_compress: str | None = None, field_percentage_to_compress: float | None = None, rank: int = 0):
-    dataset_filepath = Path(dataset_file)    
+    dataset_filepath = Path(dataset_file)
+    suffixes = dataset_filepath.suffixes
     if dataset_filepath.suffix == ".nc":
         ds = xr.open_dataset(dataset_file, chunks="auto")  # auto for Dask backend
     elif dataset_filepath.suffix == ".grib":
         ds = xr.open_dataset(dataset_file, chunks="auto", engine="cfgrib", backend_kwargs={"indexpath": ""})
+    elif suffixes[-2:] == [".zarr", ".zip"]:
+        store = open_zarr_zipstore(dataset_file)[1]
+        ds = xr.open_zarr(store, chunks="auto", consolidated=False)
+        store.close()
+    elif dataset_filepath.suffix == ".zarr":
+        store = open_zarr_localstore(dataset_file)[1]
+        ds = xr.open_zarr(store, chunks="auto", consolidated=False)
+        store.close()
     else:
         if rank == 0:
-            click.echo(f"Unsupported file format: {dataset_filepath.suffix}. Only .nc and .grib are supported.")
+            click.echo(f"Unsupported file format: {dataset_filepath.suffix}. Only .nc/.grib/.zarr/.zarr.zip are supported.")
             click.echo("Aborting...")
         sys.exit(1)
 
@@ -100,14 +124,16 @@ def is_lat_lon(da):
     return False
 
 
-def open_zarr_zipstore(zarr_zipstore_file: str):
-    store = zarr.storage.ZipStore(zarr_zipstore_file, read_only=True)
-    return zarr.open_group(store, mode='r'), store
-
-
-def open_zarr_memstore():
-    store = zarr.storage.MemoryStore()
-    return store
+def _zip_zarr_dir(src_dir: str, dst_zip: str) -> None:
+    """
+    From a zarr LocalStore directory to a Zarr ZipStore file.
+    """
+    with zipfile.ZipFile(dst_zip, mode="w", compression=zipfile.ZIP_STORED) as zf:
+        for root, _, files in os.walk(src_dir):
+            for fn in files:
+                abs_path = os.path.join(root, fn)
+                arcname = os.path.relpath(abs_path, src_dir)
+                zf.write(abs_path, arcname)
 
 
 def compress_with_zarr(data, dataset_file, field_to_compress, where_to_write, filters, compressors, serializer, verbose=True, rank=0):
@@ -115,22 +141,45 @@ def compress_with_zarr(data, dataset_file, field_to_compress, where_to_write, fi
 
     basename = os.path.basename(dataset_file)
     zarr_file = os.path.join(where_to_write, basename)
-    zarr_file = f"{zarr_file}.=.field_{field_to_compress}.=.rank_{rank}.zarr.zip"
+    zarr_file = f"{zarr_file}.=.field_{field_to_compress}.=.rank_{rank}.zarr"
+    zarr_zip_file = f"{zarr_file}.zip"
+    dtype_zarr_parsed = zarr.core.dtype.parse_dtype(data.dtype, zarr_format=3)
 
-    with Timer("zarr.create_array"):
-        store = zarr.storage.ZipStore(zarr_file, mode='w')
-        zarr.create_array(
-            store=store,
-            name=field_to_compress,
-            data=data,
-            chunks="auto",
-            filters=filters,
-            compressors=compressors,
-            serializer=serializer,
-            )
+    codecs = []
+
+    if filters is not None:
+        codecs.extend(filters)
+
+    if serializer != "auto":
+        codecs.append(serializer)
+    else:
+        codecs.append(zarr.core.array.default_serializer_v3(dtype_zarr_parsed))
+
+    if compressors is not None:
+        codecs.extend(compressors)
+
+    if filters is None and compressors is None and serializer == "auto":
+        codecs = None
+
+    with Timer("dask.array.to_zarr"):
+        store = zarr.storage.LocalStore(zarr_file, read_only=False)
+        # Avoid zarr.create_array, because it does not work with data that come from zarr!
+        dask.array.to_zarr(
+            data.data,
+            store,
+            component=field_to_compress,
+            overwrite=True,
+            **{
+                "zarr_format": 3,
+                "dimension_names": data.dims,
+                "codecs": codecs,
+            },
+        )
         store.close()
+        _zip_zarr_dir(zarr_file, zarr_zip_file)
+        shutil.rmtree(zarr_file, ignore_errors=True)
 
-    group, store = open_zarr_zipstore(zarr_file)
+    group, store = open_zarr_zipstore(zarr_zip_file)
     z = group[field_to_compress]
     z_dask = dask.array.from_zarr(z)
 
@@ -429,8 +478,8 @@ def serializer_space(da, with_lossy=True, with_numcodecs_wasm=True, with_ebcc=Tr
                                                                              min_width=32,
                                                                              max_width=2047 )
 
-            if rank == 0:
-                click.echo(f"Using (lat_chunks * lon_chunks) = ({n_chunks_height} * {n_chunks_width}) = {n_chunks_height*n_chunks_width} chunks for EBCC serializers.")
+            # if rank == 0:
+            #     click.echo(f"Using (lat_chunks * lon_chunks) = ({n_chunks_height} * {n_chunks_width}) = {n_chunks_height*n_chunks_width} chunks for EBCC serializers.")
 
             for atol in [1e-2, 1e-3, 1e-6, 1e-9]:
                 ebcc_filter = EBCC_Filter(
