@@ -83,6 +83,4 @@ dc_toolkit run_web_ui
 ````
 ## Slides
 
-## 📽️ View the Slides
-
-👉 [Click here to view the slides](https://c2sm.github.io/data-compression/)
+### [View the Slides](https://c2sm.github.io/data-compression/)
