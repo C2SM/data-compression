@@ -19,17 +19,19 @@ The tools use the following compression libraries:
 - MPI implementation (required for mpi4py)
 - ecCodes library for GRIB files
 
-In Santis@ALPS:
+On Santis@ALPS:
 
  ```commandline
 export UENV_NAME="prgenv-gnu/24.11:v2"
-uenv image pull $UENV_NAME
-uenv start --view=default $UENV_NAME
 ```
 
-In Balfrin@ALPS:
+On Balfrin@ALPS:
  ```commandline
 export UENV_NAME="netcdf-tools/2024:v1"
+```
+
+Then:
+```
 uenv image pull $UENV_NAME
 uenv start --view=default $UENV_NAME
 ```
