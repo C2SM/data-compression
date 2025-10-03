@@ -971,11 +971,11 @@ def run_web_ui_vcluster(user_account: str = None, uenv_image: str = "", uploaded
         ntasks_per_node (str): number of tasks per node
     """
     current_dir = os.path.dirname(os.path.abspath(__file__))
-    cmd_web_ui_santis = [
-        "streamlit", "run", str(current_dir) + "/compression_analysis_ui_santis.py", "--", "--user_account", user_account, "--uenv_image", uenv_image,
+    cmd_web_ui_vcluster = [
+        "streamlit", "run", str(current_dir) + "/compression_analysis_ui_vcluster.py", "--", "--user_account", user_account, "--uenv_image", uenv_image,
         "--uploaded_file", uploaded_file, "--time", time, "--nodes", nodes, "--ntasks-per-node", ntasks_per_node
     ]
-    subprocess.run(cmd_web_ui_santis)
+    subprocess.run(cmd_web_ui_vcluster)
 
 
 @cli.command("run_web_ui")
