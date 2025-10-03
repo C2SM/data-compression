@@ -27,6 +27,13 @@ uenv image pull $UENV_NAME
 uenv start --view=default $UENV_NAME
 ```
 
+In Balfrin@ALPS:
+ ```commandline
+export UENV_NAME="netcdf-tools/2024:v1"
+uenv image pull $UENV_NAME
+uenv start --view=default $UENV_NAME
+```
+
 once the above is complete (just for Santis, locally it is not needed):
 
 ```commandline
@@ -68,8 +75,9 @@ If launched from santis, make sure to ssh correctly:
 ssh -L 8501:localhost:8501 santis
 ```
 ```
-dc_toolkit run_web_ui_santis \ 
+dc_toolkit run_web_ui_vcluster \ 
   --user_account "YOUR_USER_ACCOUNT" \ 
+  --uenv_image UENV_NAME \
   --uploaded_file "PATH_TO_FILE" \ 
   --time "00:15:00" \ 
   --nodes "1" --ntasks-per-node "72"

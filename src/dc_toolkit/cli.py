@@ -951,19 +951,20 @@ def plot_compression_errors(dataset_file: str, where_to_write: str, field_to_com
     plt.close(fig)
 
 
-@cli.command("run_web_ui_santis")
-@click.option("--user_account", type=str, default="", help="Santis user account name")
-@click.option("--uploaded_file", type=str, default="", help="Upload file from santis")
+@cli.command("run_web_ui_vcluster")
+@click.option("--user_account", type=str, default="", help="vCluster user account name")
+@click.option("--uenv_image", type=str, default="", help="vCluster uenv image name")
+@click.option("--uploaded_file", type=str, default="", help="Uploaded file from vcluster")
 @click.option("--time", type=str, default="", help="Allocated time")
 @click.option("--nodes", type=str, default="", help="Number of nodes")
 @click.option("--ntasks-per-node", type=str, default="", help="Number of tasks per node")
-def run_web_ui_santis(user_account: str = None, uploaded_file: str = "", time: str = "", nodes: str = "", ntasks_per_node: str = ""):
+def run_web_ui_vcluster(user_account: str = None, uenv_image: str = "", uploaded_file: str = "", time: str = "", nodes: str = "", ntasks_per_node: str = ""):
     """
-    Web UI for data clustering, analysis, and compression to be launched from santis.
+    Web UI for data clustering, analysis, and compression to be launched from vcluster.
 
     \b
     Args:
-        user_account (str): santis user id
+        user_account (str): vcluster user id
         uploaded_file (str): path to file to use for analysis
         time (str): UI time limit
         nodes (str): number of nodes
@@ -971,7 +972,7 @@ def run_web_ui_santis(user_account: str = None, uploaded_file: str = "", time: s
     """
     current_dir = os.path.dirname(os.path.abspath(__file__))
     cmd_web_ui_santis = [
-        "streamlit", "run", str(current_dir) + "/compression_analysis_ui_santis.py", "--", "--user_account", user_account,
+        "streamlit", "run", str(current_dir) + "/compression_analysis_ui_santis.py", "--", "--user_account", user_account, "--uenv_image", uenv_image,
         "--uploaded_file", uploaded_file, "--time", time, "--nodes", nodes, "--ntasks-per-node", ntasks_per_node
     ]
     subprocess.run(cmd_web_ui_santis)

@@ -50,6 +50,7 @@ def parse_args():
     parser.add_argument('--input_file', type=str, default='default.csv')
     parser.add_argument('--verbose', action='store_true')
     parser.add_argument('--user_account', type=str, default=None)
+    parser.add_argument('--uenv_image', type=str, default=None)
     parser.add_argument('--uploaded_file', type=str, default=None)
     parser.add_argument('--time', type=str, default=None)
     parser.add_argument('--nodes', type=str, default=None)
@@ -319,7 +320,7 @@ if uploaded_file is not None and uploaded_file.name.endswith(".nc"):
                 "--time", parse_args().time,
                 "--nodes", parse_args().nodes,
                 "--ntasks-per-node", parse_args().ntasks_per_node,
-                "--uenv=prgenv-gnu/24.11:v2",
+                "--uenv=" + parse_args().uenv_image,
                 "--view=default",
                 "--partition=debug",
                 "dc_toolkit",
@@ -339,7 +340,7 @@ if uploaded_file is not None and uploaded_file.name.endswith(".nc"):
                 "--time", parse_args().time,
                 "--nodes", parse_args().nodes,
                 "--ntasks-per-node", parse_args().ntasks_per_node,
-                "--uenv=prgenv-gnu/24.11:v2",
+                "--uenv=" + parse_args().uenv_image,
                 "--view=default",
                 "--partition=debug",
                 "dc_toolkit",
@@ -497,7 +498,7 @@ if uploaded_file is not None and uploaded_file.name.endswith(".nc"):
                 "--time", parse_args().time,
                 "--nodes", parse_args().nodes,
                 "--ntasks-per-node", parse_args().ntasks_per_node,
-                "--uenv=prgenv-gnu/24.11:v2",
+                "--uenv=" + parse_args().uenv_image,
                 "--view=default",
                 "--partition=debug",
                 "dc_toolkit",
