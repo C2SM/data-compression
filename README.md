@@ -91,6 +91,31 @@ dc_toolkit run_local_ui
 ````
 dc_toolkit run_web_ui
 ````
+
+## Docker
+
+A self-contained image has been setup in the `Dockerfile`. You can copy the file locally, the run:
+
+```commandline
+docker build -t dc-toolkit .
+```
+The image contains all dependencies and automatically clones the repository. 
+Once this build is complete, you can run commands with docker. An example: 
+
+```commandline
+docker run dc-toolkit 
+            evaluate_combos \ 
+            /opt/data-compression/netCDF_files/tigge_pl_t_q_dx=2_2024_08_02.nc \ 
+            /opt/data-compression/dump \ 
+            --field-to-compress t
+```
+
+Or for the web UI:
+
+```commandline
+docker run -p 8501:8501 dc-toolkit run_web_ui
+```
+
 ## Slides
 
 ### [Click here to view slides](https://c2sm.github.io/data-compression/)
