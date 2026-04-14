@@ -103,12 +103,28 @@ The image contains all dependencies and automatically clones the repository.
 Once this build is complete, you can run commands with docker. An example: 
 
 ```commandline
-docker run dc-toolkit \
-  evaluate_combos \
-  /opt/data-compression/netCDF_files/tigge_pl_t_q_dx=2_2024_08_02.nc \
-  /opt/data-compression/dump \
-  --field-to-compress t
+docker run \
+  -u $(id -u):$(id -g) \
+  -w /mnt/data/docker_saved_files \
+  -v "$(pwd)/netCDF_files":/mnt/data \
+  -e XDG_CACHE_HOME=/tmp/.cache \
+  --entrypoint /bin/bash \
+  dc-toolkit \
+  -c 'mkdir -p docker_saved_files && dc_toolkit evaluate_combos /opt/data-compression/netCDF_files/tigge_pl_t_q_dx=2_2024_08_02.nc /mnt/data/docker_saved_files --field-to-compress t'
 ```
+
+**Command Breakdown:**
+
+* **`-u $(id -u):$(id -g)`**: Runs the container using your local machine's User and Group IDs rather than the Docker default `root`. This guarantees that compressed files output to your machine, are fully owned by you and aren't locked behind root permissions.
+* **`-w /mnt/data/docker_saved_files`**: Sets the Working Directory.
+* **`-v "$(pwd)/netCDF_files":/mnt/data`**: The volume mount. This creates a bridge between your local computer and the container so the toolkit can read your input data and write the results back to your hard drive.
+* **`-e XDG_CACHE_HOME=/tmp/.cache`**: Sets the cache directory to a temporary location inside the container.
+* **`--entrypoint /bin/bash`**: Forces Docker to start with a Bash shell instead of the default program (dc_toolkit).
+* **`dc-toolkit`**: The name of the Docker image to run.
+* **`-c '...'`**: Executes a custom shell command to handle the complex environment setup:
+  * **`mkdir -p docker_saved_files`**: Creates an output directory on your host.
+  * **`dc_toolkit evaluate_combos ...`**: Executes the actual compression tool, using a file inside the container and saving the results to your mounted volume.
+
 
 Or for the web UI:
 
@@ -136,7 +152,7 @@ docker run \
   --entrypoint mpirun \
   dc-toolkit \
   -n 8 \
-  bash -c 'HOME=/tmp/$OMPI_COMM_WORLD_RANK exec dc_toolkit evaluate_combos /mnt/data/tigge_pl_t_q_dx=2_2024_08_02.nc /mnt/data/docker_saved_files --field-to-compress t'
+  bash -c 'HOME=/tmp/$OMPI_COMM_WORLD_RANK exec dc_toolkit evaluate_combos /opt/data-compression/netCDF_files/tigge_pl_t_q_dx=2_2024_08_02.nc /mnt/data/docker_saved_files --field-to-compress t'
 ```
 
 **Command Breakdown:**
