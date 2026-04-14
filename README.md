@@ -103,11 +103,11 @@ The image contains all dependencies and automatically clones the repository.
 Once this build is complete, you can run commands with docker. An example: 
 
 ```commandline
-docker run dc-toolkit 
-            evaluate_combos \ 
-            /opt/data-compression/netCDF_files/tigge_pl_t_q_dx=2_2024_08_02.nc \ 
-            /opt/data-compression/dump \ 
-            --field-to-compress t
+docker run dc-toolkit \
+  evaluate_combos \
+  /opt/data-compression/netCDF_files/tigge_pl_t_q_dx=2_2024_08_02.nc \
+  /opt/data-compression/dump \
+  --field-to-compress t
 ```
 
 Or for the web UI:
@@ -115,6 +115,68 @@ Or for the web UI:
 ```commandline
 docker run -p 8501:8501 dc-toolkit run_web_ui
 ```
+
+### Running with MPI (Parallel Processing)
+
+To drastically speed up the evaluation process, you can run the toolkit in parallel using OpenMPI. 
+
+Because running MPI inside Docker requires some specific file permission and cache handling, use the following commands to securely mount your directories and isolate the process caches depending on your operating system.
+
+---
+
+#### Mac and Linux
+
+For Unix-based systems, we map your local user ID to the container to avoid permission issues and assign unique temporary directories to isolate caches.
+
+```bash
+docker run \
+  -u $(id -u):$(id -g) \
+  -w /mnt/data/docker_saved_files \
+  -v $(pwd)/netCDF_files:/mnt/data \
+  --entrypoint mpirun \
+  dc-toolkit \
+  -n 8 \
+  bash -c 'HOME=/tmp/$OMPI_COMM_WORLD_RANK exec dc_toolkit evaluate_combos /mnt/data/tigge_pl_t_q_dx=2_2024_08_02.nc /mnt/data/docker_saved_files --field-to-compress t'
+```
+
+**Command Breakdown:**
+* **`-u $(id -u):$(id -g)`**: Runs the container using your local machine's User and Group IDs rather than the Docker default `root`. This guarantees that any compressed files output to your machine are fully owned by you and aren't locked behind root permissions.
+* **`-w /mnt/data/docker_saved_files`**: Sets the "Working Directory" inside the container. This ensures that any files hardcoded to save in the current directory (like `config_space.csv`) are dropped exactly where you want them.
+* **`-v $(pwd)/netCDF_files:/mnt/data`**: The volume mount. This creates a bridge between your local computer and the container so the toolkit can read your input data and write the results back to your hard drive.
+* **`--entrypoint mpirun`**: Tells Docker to bypass the image's default entrypoint and boot up using OpenMPI's runner instead.
+* **`dc-toolkit`**: The name of the Docker image to run.
+* **`-n 8`**: Tells `mpirun` to spin up 8 parallel processes.
+* **`bash -c '...'`**: Executes a custom shell command across all 8 processes to handle the complex environment setup:
+  * **`HOME=/tmp/$OMPI_COMM_WORLD_RANK`**: Assigns a mathematically unique, temporary "Home" directory to each of the 8 processes. This completely eliminates race conditions where multiple processes try to write to the exact same  cache simultaneously.
+  * **`exec dc_toolkit evaluate_combos ...`**: Executes the actual compression tool, passing the paths (as they appear *inside* the container's `/mnt/data` mount) to the input NetCDF file and the designated output directory.
+
+---
+
+#### Windows (PowerShell)
+
+When using Docker Desktop on Windows via WSL 2, Docker handles file permissions differently. You do not need to pass your user ID (as Docker Desktop handles the translation automatically), but you do need to explicitly allow OpenMPI to run as root and format your paths for PowerShell.
+
+```powershell
+docker run `
+  -e HOME=/tmp `
+  -w /mnt/data/docker_saved_files `
+  -v "${PWD}\netCDF_files:/mnt/data" `
+  --entrypoint mpirun `
+  dc-toolkit `
+  --allow-run-as-root `
+  -n 8 `
+  bash -c "HOME=/tmp/`$OMPI_COMM_WORLD_RANK exec dc_toolkit evaluate_combos /mnt/data/tigge_pl_t_q_dx=2_2024_08_02.nc /mnt/data/docker_saved_files --field-to-compress t"
+```
+
+**Command Breakdown:**
+* **`-e HOME=/tmp`**: Sets a base temporary home directory for the container environment.
+* **`-w /mnt/data/docker_saved_files`**: Sets the Working Directory inside the container so output files (like `config_space.csv`) drop exactly into your mounted folder.
+* **`-v "${PWD}\netCDF_files:/mnt/data"`**: The Windows equivalent of the volume mount. `${PWD}` dynamically grabs your current PowerShell directory to link your local files to the container.
+* **`--entrypoint mpirun`**: Bypasses the default container start command to run OpenMPI.
+* **`dc-toolkit`**: The name of the Docker image.
+* **`--allow-run-as-root`**: Because the container defaults to the `root` user on Windows, this flag is required to bypass OpenMPI's built-in safety restrictions against running parallel jobs as root.
+* **`-n 8`**: Tells `mpirun` to spin up 8 parallel processes.
+* **`bash -c "..."`**: Executes the parallel command. Notice that double-quotes are used here for PowerShell, with an escaped backtick (` `$ `) in front of the MPI variable to prevent PowerShell from prematurely evaluating it on your host machine before it reaches the container.
 
 ## Slides
 
