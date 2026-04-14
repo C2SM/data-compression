@@ -140,14 +140,15 @@ docker run \
 ```
 
 **Command Breakdown:**
-* **`-u $(id -u):$(id -g)`**: Runs the container using your local machine's User and Group IDs rather than the Docker default `root`. This guarantees that any compressed files output to your machine are fully owned by you and aren't locked behind root permissions.
-* **`-w /mnt/data/docker_saved_files`**: Sets the "Working Directory" inside the container. This ensures that any files hardcoded to save in the current directory (like `config_space.csv`) are dropped exactly where you want them.
+
+* **`-u $(id -u):$(id -g)`**: Runs the container using your local machine's User and Group IDs rather than the Docker default `root`. This guarantees that compressed files output to your machine, are fully owned by you and aren't locked behind root permissions.
+* **`-w /mnt/data/docker_saved_files`**: Sets the Working Directory.
 * **`-v $(pwd)/netCDF_files:/mnt/data`**: The volume mount. This creates a bridge between your local computer and the container so the toolkit can read your input data and write the results back to your hard drive.
 * **`--entrypoint mpirun`**: Tells Docker to bypass the image's default entrypoint and boot up using OpenMPI's runner instead.
 * **`dc-toolkit`**: The name of the Docker image to run.
 * **`-n 8`**: Tells `mpirun` to spin up 8 parallel processes.
 * **`bash -c '...'`**: Executes a custom shell command across all 8 processes to handle the complex environment setup:
-  * **`HOME=/tmp/$OMPI_COMM_WORLD_RANK`**: Assigns a mathematically unique, temporary "Home" directory to each of the 8 processes. This completely eliminates race conditions where multiple processes try to write to the exact same  cache simultaneously.
+  * **`HOME=/tmp/$OMPI_COMM_WORLD_RANK`**: Assigns a mathematically unique, temporary "Home" directory to each process. This completely eliminates race conditions where multiple processes try to write to the exact same  cache simultaneously.
   * **`exec dc_toolkit evaluate_combos ...`**: Executes the actual compression tool, passing the paths (as they appear *inside* the container's `/mnt/data` mount) to the input NetCDF file and the designated output directory.
 
 ---
@@ -169,6 +170,7 @@ docker run `
 ```
 
 **Command Breakdown:**
+
 * **`-e HOME=/tmp`**: Sets a base temporary home directory for the container environment.
 * **`-w /mnt/data/docker_saved_files`**: Sets the Working Directory inside the container so output files (like `config_space.csv`) drop exactly into your mounted folder.
 * **`-v "${PWD}\netCDF_files:/mnt/data"`**: The Windows equivalent of the volume mount. `${PWD}` dynamically grabs your current PowerShell directory to link your local files to the container.
