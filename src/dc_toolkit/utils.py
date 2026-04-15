@@ -13,6 +13,7 @@ import math
 import zipfile
 import click
 import humanize
+import uuid
 from pathlib import Path
 import numpy as np
 import dask
@@ -140,9 +141,13 @@ def compress_with_zarr(data, dataset_file, field_to_compress, where_to_write, fi
     assert isinstance(data.data, dask.array.Array)
 
     basename = os.path.basename(dataset_file)
-    zarr_file = os.path.join(where_to_write, basename)
-    zarr_file = f"{zarr_file}.=.field_{field_to_compress}.=.rank_{rank}.zarr"
-    zarr_zip_file = f"{zarr_file}.zip"
+    base_name_str = f"{basename}.=.field_{field_to_compress}.=.rank_{rank}"
+    
+    # Generate a unique ID for the intermediate directory to avoid File System issues
+    unique_id = uuid.uuid4().hex[:8]
+    temp_zarr_dir = os.path.join(where_to_write, f"{base_name_str}.={unique_id}.zarr")
+    zarr_zip_file = os.path.join(where_to_write, f"{base_name_str}.zarr.zip")
+    
     dtype_zarr_parsed = zarr.core.dtype.parse_dtype(data.dtype, zarr_format=3)
 
     codecs = []
@@ -162,8 +167,9 @@ def compress_with_zarr(data, dataset_file, field_to_compress, where_to_write, fi
         codecs = None
 
     with Timer("dask.array.to_zarr"):
-        store = zarr.storage.LocalStore(zarr_file, read_only=False)
+        store = zarr.storage.LocalStore(temp_zarr_dir, read_only=False)
         # Avoid zarr.create_array, because it does not work with data that come from zarr!
+        # TODO: Update to the latest API
         dask.array.to_zarr(
             data.data,
             store,
@@ -176,8 +182,19 @@ def compress_with_zarr(data, dataset_file, field_to_compress, where_to_write, fi
             },
         )
         store.close()
-        _zip_zarr_dir(zarr_file, zarr_zip_file)
-        shutil.rmtree(zarr_file, ignore_errors=True)
+        
+        # Explicitly remove the zip file if it exists from a previous loop iteration.
+        # This forces the filesystem to allocate a new inode, preventing stale read caches.
+        if os.path.exists(zarr_zip_file):
+            try:
+                os.remove(zarr_zip_file)
+            except OSError:
+                pass
+
+        _zip_zarr_dir(temp_zarr_dir, zarr_zip_file)
+        
+        # Clean up the unique temp dir
+        shutil.rmtree(temp_zarr_dir, ignore_errors=True)
 
     group, store = open_zarr_zipstore(zarr_zip_file)
     z = group[field_to_compress]
