@@ -4,21 +4,31 @@
 #SBATCH --uenv=prgenv-gnu/24.11:v2
 #SBATCH --view=default
 #SBATCH --partition=debug
-#SBATCH --ntasks-per-node=32
+#SBATCH --ntasks-per-node=1
 #SBATCH --nodes=1
 #SBATCH --time=00:30:00
 #SBATCH --output=out-%j.out
 #SBATCH --error=out-%j.out
 
+# NOTE on MPI topology:
+# evaluate_combos requires exactly ONE MPI rank per node (each rank drives a
+# node-local ThreadPoolExecutor). To scale out, increase --nodes and keep
+# --ntasks-per-node=1. Do NOT raise --ntasks-per-node.
+
 export PYTHONUNBUFFERED=1
 source venv/bin/activate
+
+# Outer parallelism (MPI ranks x ThreadPoolExecutor) is explicit in
+# dc_toolkit, so codec-internal threadpools must be pinned to 1 to avoid
+# nested-parallelism oversubscription.
+export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 BLOSC_NTHREADS=1 NUMBA_NUM_THREADS=1
 
 srun dc_toolkit \
      evaluate_combos \
      /capstor/store/cscs/userlab/cwp03/ppothapa/Data_Dyamond_PostProcessed/DYAMOND_R02B10L120_main/out_15/temp_20200410T000000Z.nc \
-     ./res_folder \
+     --where-to-write ./res_folder \
      --field-to-compress temp \
-     --field-percentage-to-compress 10 \
+     --eval-data-size-limit 5GB \
      --override-existing-l1-error 0.002 \
      --compressor-class Zlib \
      --serializer-class PCodec \
@@ -26,12 +36,22 @@ srun dc_toolkit \
      --without-numcodecs-wasm \
      --without-ebcc
 
+# Follow-up step: persist the winning combo at production chunk/shard sizes.
+# IMPORTANT: pass the SAME --eval-data-size-limit as above, otherwise the
+# (comp_idx, filt_idx, ser_idx) tuple may resolve to codec objects with
+# slightly different statistical parameters (e.g. Asinh.linear_width) -
+# symptom is a worse compression ratio than the sweep reported, no error.
+#
 # srun -n 1 dc_toolkit \
 #      compress_with_optimal \
 #      /capstor/store/cscs/userlab/cwp03/ppothapa/Data_Dyamond_PostProcessed/DYAMOND_R02B10L120_main/out_15/temp_20200410T000000Z.nc \
 #      ./res_folder \
 #      temp \
 #      2 0 9 \
+#      --eval-data-size-limit 5GB \
+#      --inner-chunk-mib 16 \
+#      --shard-mib 512 \
+#      --verify \
 #      --compressor-class Zlib \
 #      --serializer-class PCodec \
 #      --without-lossy \

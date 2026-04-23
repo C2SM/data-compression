@@ -5,11 +5,12 @@
 #
 # Please, refer to the LICENSE file in the root directory.
 # SPDX-License-Identifier: BSD-3-Clause
+import hashlib
+import json
 import math
 import os
-import sys
 import io
-import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 import itertools
@@ -30,6 +31,7 @@ from mpi4py import MPI
 import dask
 import dask.array
 import humanize
+import psutil
 
 # Heavyweight optional imports (matplotlib / sklearn / plotly / tqdm) are
 # deferred: they are only used by the clustering and plotting commands below
@@ -89,6 +91,118 @@ def _merged_store_path(where_to_write: str, dataset_file: str) -> str:
     return str(Path(where_to_write) / f"{dataset_stem}.zarr")
 
 
+def _version_banner(component_name: str) -> str:
+    """
+    Return a short string with the zarr version and a few other keys, for
+    debugging provenance.  Prints from rank 0 only in the CLI commands.
+    """
+    zarr_ver = getattr(zarr, "__version__", "unknown")
+    np_ver = getattr(np, "__version__", "unknown")
+    dask_ver = getattr(dask, "__version__", "unknown")
+    return (
+        f"[env] {component_name} | zarr={zarr_ver} | numpy={np_ver} | "
+        f"dask={dask_ver}"
+    )
+
+
+def _check_memory_headroom(required_bytes: int, label: str, threshold: float = 0.60) -> None:
+    """
+    Refuse to allocate `required_bytes` if it would exceed `threshold` of
+    currently-available RAM.  Aborts the whole MPI world on violation.
+
+    This is defense-in-depth against user misconfiguration, e.g. passing
+    `--eval-data-size-limit 50GB` on a 64 GB node or `--threads 256` with
+    large shards on a RAM-starved box.  Catches the error before numpy /
+    dask raise a MemoryError halfway through a long run.
+
+    psutil is a hard dependency (see pyproject.toml), so the query itself
+    is always available; we only wrap the call in try/except to tolerate
+    the rare environment where /proc is unreadable (unusual containers)
+    and treat it as "unable to check" rather than crashing.
+    """
+    try:
+        avail = psutil.virtual_memory().available
+    except Exception as e:
+        click.echo(
+            f"[memcheck] WARNING: could not query available memory ({e}); "
+            f"skipping guard for {label}."
+        )
+        return
+    if required_bytes > threshold * avail:
+        click.echo(
+            f"[memcheck] REFUSING to proceed: {label} needs "
+            f"{humanize.naturalsize(required_bytes, binary=True)}, which "
+            f"exceeds {int(threshold*100)}% of currently-available RAM "
+            f"({humanize.naturalsize(avail, binary=True)}).\n"
+            f"  Reduce the relevant flag (e.g. --eval-data-size-limit, "
+            f"--threads, --shard-mib) or run on a larger node."
+        )
+        MPI.COMM_WORLD.Abort(1)
+
+
+def _sample_signature(
+    dataset_file: str,
+    var: str,
+    eval_data_size_limit: int,
+    sample_np: np.ndarray,
+) -> dict:
+    """
+    Build a compact, deterministic signature of the representative sample
+    used to parameterise the codec space.
+
+    Purpose: the codec-space indices written by `evaluate_combos` are only
+    valid in `compress_with_optimal` when both commands see an *identical*
+    sample - because statistics (Asinh.linear_width, FixedOffsetScale.offset/
+    scale, EBCC chunk geometry) are derived from that sample.  We hash enough
+    of the sample's identity to detect a mismatch at the start of
+    `compress_with_optimal` and refuse to continue silently.
+
+    Design:
+    - Hashes the full buffer bytes (sha256).  Fast enough for 5 GB (~5s on
+      modern CPUs); the alternative of hashing summary stats can alias on
+      pathological data.  We pay this once per variable, once per command.
+    - Includes `(shape, dtype, dataset_stem, var, eval_data_size_limit)`
+      alongside the content hash so a debug message can point at the
+      mismatch cause.
+
+    Returns a plain dict (json-serialisable).
+
+    Unsupported: object-dtype arrays.  numpy stores object arrays as a
+    buffer of pointer addresses, not their referents, so the hash would
+    include process-local memory addresses and be unreproducible across
+    runs.  We refuse early rather than silently emit a garbage signature.
+    Climate data is never object-dtype in practice, so this is defensive.
+    """
+    if sample_np.dtype == object:
+        raise ValueError(
+            "_sample_signature does not support object-dtype arrays: the "
+            "buffer holds pointer addresses, not values, so the hash would "
+            "be process-local and not reproducible across runs."
+        )
+    h = hashlib.sha256()
+    # memoryview over the numpy buffer avoids an extra copy.  We force
+    # contiguity at the broadcast site, so the buffer is already C-ordered.
+    mv = memoryview(np.ascontiguousarray(sample_np)).cast("B")
+    # Stream in 64 MiB chunks to keep the worst-case transient allocation low.
+    step = 64 * 1024 * 1024
+    n = len(mv)
+    for i in range(0, n, step):
+        h.update(mv[i:i + step])
+    return {
+        "dataset_stem": Path(dataset_file).stem,
+        "var": var,
+        "eval_data_size_limit": int(eval_data_size_limit),
+        "shape": list(sample_np.shape),
+        "dtype": str(sample_np.dtype),
+        "nbytes": int(sample_np.nbytes),
+        "sha256": h.hexdigest(),
+    }
+
+
+def _signature_path(where_to_write: str, var: str) -> Path:
+    return Path(where_to_write) / f"sample_signature_{var}.json"
+
+
 @cli.command("evaluate_combos")
 @click.argument("dataset_file", type=click.Path(exists=True, dir_okay=True, file_okay=True))
 @click.option("--where-to-write", "where_to_write", required=True,
@@ -128,6 +242,12 @@ def _merged_store_path(where_to_write: str, dataset_file: str) -> str:
 @click.option("--with-lossy/--without-lossy", default=True, show_default=True)
 @click.option("--with-numcodecs-wasm/--without-numcodecs-wasm", default=True, show_default=True)
 @click.option("--with-ebcc/--without-ebcc", default=True, show_default=True)
+@click.option("--resume/--no-resume", default=False, show_default=True,
+              help="If set and a `config_space_{var}_rank{rank}.csv` already "
+                   "exists in --where-to-write, skip combos already present in "
+                   "it (matched by (comp_idx, filt_idx, ser_idx)).  Useful for "
+                   "picking up a sweep that died partway.  The streaming CSV "
+                   "is appended rather than overwritten in resume mode.")
 def evaluate_combos(dataset_file,
                     where_to_write,
                     field_to_compress, eval_data_size_limit,
@@ -135,7 +255,8 @@ def evaluate_combos(dataset_file,
                     oversubscription_check,
                     override_existing_l1_error,
                     compressor_class, filter_class, serializer_class,
-                    with_lossy, with_numcodecs_wasm, with_ebcc):
+                    with_lossy, with_numcodecs_wasm, with_ebcc,
+                    resume):
     """
     Sweep compressor x filter x serializer combinations on a representative
     sample of the field to find the best configuration.
@@ -164,7 +285,7 @@ def evaluate_combos(dataset_file,
     rank = comm.Get_rank()
     size = comm.Get_size()
 
-    node_comm, ranks_on_node, local_rank = utils.detect_node_topology(comm)
+    node_comm, ranks_on_node, _local_rank = utils.detect_node_topology(comm)
 
     # ---- Enforce 1 MPI rank per node --------------------------------------
     # The refactor is designed around shared-memory threading within the node.
@@ -182,6 +303,11 @@ def evaluate_combos(dataset_file,
                 f"    srun --nodes=<N> --ntasks-per-node=1 dc_toolkit evaluate_combos ...)"
             )
         comm.Abort(1)
+
+    try:
+        node_comm.Free()
+    except Exception:
+        pass
 
     cores_avail = utils.detect_cores_available()
     if threads_per_rank is None:
@@ -221,6 +347,12 @@ def evaluate_combos(dataset_file,
         # can report the EFFECTIVE parallelism (min(size*threads, num_loops))
         # rather than an overstated theoretical peak.
 
+        # Version + environment banner (rank 0 only) — surfaces the exact
+        # zarr/numpy/dask combination that ran so a regression in compression
+        # ratio can be pinned to a library upgrade.
+        if rank == 0:
+            click.echo(_version_banner("evaluate_combos"))
+
         # -------------------------------------------------------------------------
         # Fetch threshold table (rank 0) and broadcast
         #
@@ -236,8 +368,12 @@ def evaluate_combos(dataset_file,
                     sheet_url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv"
                     thresholds = pd.read_csv(sheet_url)
                 except Exception as e:
-                    print(f"[Rank 0] Failed to fetch thresholds: {e}")
+                    click.echo(
+                        f"[Rank 0] Failed to fetch thresholds: {e}  "
+                        f"(pass --override-existing-l1-error to skip the lookup.)"
+                    )
                     comm.Abort(1)
+
                 buffer = io.BytesIO()
                 thresholds.to_parquet(buffer, index=False)
                 data_bytes = buffer.getvalue()
@@ -289,6 +425,16 @@ def evaluate_combos(dataset_file,
             # -------------------------------------------------------------------------
             # Build representative sample ONCE on rank 0, broadcast to others.
             # -------------------------------------------------------------------------
+            # Memory guardrail before the sample broadcast.
+            field_bytes = int(da.dtype.itemsize) * int(np.prod(da.shape))
+            actual_sample_bytes = min(field_bytes, int(eval_data_size_limit))
+            multiplier = 2 if (rank == 0 and size > 1) else 1
+            _check_memory_headroom(
+                multiplier * actual_sample_bytes,
+                label=f"sample for '{var}' on rank {rank} "
+                      f"({humanize.naturalsize(actual_sample_bytes, binary=True)})",
+            )
+
             if rank == 0:
                 sample_da_local = utils.build_representative_sample(
                     da, eval_data_size_limit, rank=rank,
@@ -309,6 +455,46 @@ def evaluate_combos(dataset_file,
             # metadata dict via pickle (dims + attrs are tiny).
             sample_np  = utils.broadcast_numpy(sample_np_local, comm=comm, root=0)
             sample_meta = comm.bcast(sample_meta, root=0)
+
+            # Free the rank-0 duplicate ASAP so we fall from 2x transient to 1x
+            # steady state.  The broadcast has already committed the bytes to
+            # every rank's buffer; the local copy is no longer needed.
+            if rank == 0:
+                del sample_np_local
+
+            # ----------------------------------------------------------------
+            # Sample reproducibility hash (M5).
+            #
+            # Rank 0 hashes the broadcast buffer and writes a
+            # sample_signature_{var}.json next to the sweep results.
+            # `compress_with_optimal` will re-hash and refuse to proceed on
+            # mismatch, closing the "silent wrong combo" footgun from a
+            # --eval-data-size-limit drift between the two commands.
+            # ----------------------------------------------------------------
+            if rank == 0:
+                try:
+                    sig = _sample_signature(
+                        dataset_file=dataset_file,
+                        var=str(var),
+                        eval_data_size_limit=int(eval_data_size_limit),
+                        sample_np=sample_np,
+                    )
+                    _signature_path(where_to_write, str(var)).write_text(
+                        json.dumps(sig, indent=2)
+                    )
+                    click.echo(
+                        f"[sample-hash] {var}: sha256={sig['sha256'][:16]}… "
+                        f"shape={tuple(sig['shape'])} dtype={sig['dtype']} -> "
+                        f"{_signature_path(where_to_write, str(var)).name}"
+                    )
+                except Exception as sig_err:
+                    # Non-fatal: continue the sweep even if signature write
+                    # fails.  compress_with_optimal will log a softer warning
+                    # instead of blocking when the signature is absent.
+                    click.echo(
+                        f"[sample-hash] WARNING: could not write signature "
+                        f"for {var}: {sig_err}"
+                    )
 
             # Reconstruct a DataArray view around the broadcast buffer.  The codec-
             # space builders only use .dims / .shape / .values and basic arithmetic,
@@ -352,6 +538,37 @@ def evaluate_combos(dataset_file,
                     f"{threads_per_rank} thread(s)/node -> peak {theoretical_peak} "
                     f"parallel evaluations{trailer}."
                 )
+                # Memory budget banner — mirror of the one in compress_with_optimal.
+                # Rank-0 transient peak is 2x sample_size (local + broadcast buffer
+                # briefly alive together, then dropped).  Steady state per rank is
+                # sample + optional EBCC float32 copy + per-thread working set.
+                steady_mib = int(sample_np.nbytes / 2**20)
+                ebcc_overhead_mib = int(sample_np.nbytes / 2**20) if (
+                    any(_is_ebcc_serializer(ser) for (_, ser) in serializers)
+                    and sample_np.dtype != np.float32
+                ) else 0
+                thread_pool_mib = threads_per_rank * max(1, inner_chunk_mib) * 2
+                click.echo(
+                    f"[memory] rank-0 transient peak ~= "
+                    f"{int(2 * sample_np.nbytes / 2**20)} MiB (during Bcast); "
+                    f"per-rank steady ~= {steady_mib + ebcc_overhead_mib} MiB "
+                    f"(sample + EBCC copy) + ~{thread_pool_mib} MiB (threads x "
+                    f"2 x inner_chunk_mib)."
+                )
+                # If the caller omitted --field-to-compress, flag the per-var
+                # Bcast cost so they're not surprised by 30 variables x 5 GB
+                # on a slow fabric.
+                n_vars_total = sum(
+                    1 for v in ds.data_vars
+                    if field_to_compress is None or v == field_to_compress
+                )
+                if n_vars_total > 1:
+                    click.echo(
+                        f"[topology] sweep will iterate {n_vars_total} variables; "
+                        f"one sample Bcast per variable (~"
+                        f"{humanize.naturalsize(sample_np.nbytes, binary=True)} each "
+                        f"over the interconnect)."
+                    )
                 click.echo(
                     f"[sweep] {num_loops} combos "
                     f"({len(compressors)} x {len(filters)} x {len(serializers)}) "
@@ -447,25 +664,97 @@ def evaluate_combos(dataset_file,
             failures = []
 
             total_local = len(configs_for_rank)
+            var_sweep_t0 = time.perf_counter()
 
+            # ----- Resume support --------------------------------------------
+            # Load already-completed (comp_idx, filt_idx, ser_idx) triples from
+            # the per-rank CSV if --resume is set and the CSV exists.  We skip
+            # these configs on submission and APPEND (not overwrite) to the CSV
+            # so the resumed run ends with one complete audit trail.
             partial_csv_path = os.path.join(
                 where_to_write, f"config_space_{var}_rank{rank}.csv"
             )
-            # Streaming per-rank audit trail.  One row per
-            # successful combo evaluation (passing or filtered-out,
-            # distinguished by the `keep` column).  Failures stay in the
-            # `failures` list and are aggregated via `comm.reduce` below.
-            # The CSV is opened here and closed at the end of this block
-            # (before `comm.gather`) so rank 0 can concat every per-rank
-            # CSV into results_{var}.parquet with a clean read.
-            with open(partial_csv_path, "w", newline="") as partial_csv_file:
+            failures_csv_path = os.path.join(
+                where_to_write, f"failures_{var}_rank{rank}.csv"
+            )
+            already_done = set()
+            open_mode = "w"
+            if resume and Path(partial_csv_path).is_file():
+                try:
+                    prev = pd.read_csv(partial_csv_path)
+                    already_done = set(
+                        (int(a), int(b), int(c))
+                        for a, b, c in zip(
+                            prev["comp_idx"], prev["filt_idx"], prev["ser_idx"]
+                        )
+                    )
+                    open_mode = "a"
+                    if rank == 0:
+                        click.echo(
+                            f"[resume] rank 0 found {len(already_done)} previously-"
+                            f"recorded combo(s) for '{var}'; skipping."
+                        )
+                except Exception as resume_err:
+                    if rank == 0:
+                        click.echo(
+                            f"[resume] WARNING: failed to parse previous "
+                            f"partial CSV {partial_csv_path}: {resume_err}. "
+                            f"Starting from scratch."
+                        )
+                    already_done = set()
+                    open_mode = "w"
+
+            def _cfg_key(cfg):
+                (comp_idx, _), (filt_idx, _), (ser_idx, _) = cfg
+                return (int(comp_idx), int(filt_idx), int(ser_idx))
+
+            configs_pending = [
+                cfg for cfg in configs_for_rank
+                if _cfg_key(cfg) not in already_done
+            ]
+
+            # ----- Streaming CSVs --------------------------------------------
+            # partial_csv: one row per successful eval (kept or filtered-out)
+            # failures_csv: one row per failure (exception).  Both are flushed
+            # every FLUSH_EVERY rows to keep MDS pressure down while still
+            # giving crash-safety.  Header written iff the file doesn't yet
+            # exist (or is empty), so resume-mode appends cleanly to a prior
+            # run AND still produces a valid CSV when only one of the two
+            # files was created before the crash.
+            FLUSH_EVERY = 100
+            # Batched flushing reduces Lustre MDS round-trips from one-per-row
+            # to roughly one-per-FLUSH_EVERY-rows (10k combos -> 100 flushes
+            # instead of 10k).  Still flushes on normal exit via the `with`
+            # block, so a clean finish leaves the CSV fully on disk.
+            rows_since_flush = 0
+            failed_rows_since_flush = 0
+
+            partial_exists = (
+                open_mode == "a"
+                and Path(partial_csv_path).is_file()
+                and Path(partial_csv_path).stat().st_size > 0
+            )
+            failures_exists = (
+                open_mode == "a"
+                and Path(failures_csv_path).is_file()
+                and Path(failures_csv_path).stat().st_size > 0
+            )
+
+            with open(partial_csv_path, open_mode, newline="") as partial_csv_file, \
+                 open(failures_csv_path, open_mode, newline="") as failures_csv_file:
                 partial_csv_writer = csv.writer(partial_csv_file)
-                partial_csv_writer.writerow([
-                    "compressor", "filter", "serializer",
-                    "comp_idx", "filt_idx", "ser_idx",
-                    "ratio", "l1_rel", "l2_rel", "linf_rel", "eucd",
-                    "keep",
-                ])
+                failures_csv_writer = csv.writer(failures_csv_file)
+                if not partial_exists:
+                    partial_csv_writer.writerow([
+                        "compressor", "filter", "serializer",
+                        "comp_idx", "filt_idx", "ser_idx",
+                        "ratio", "l1_rel", "l2_rel", "linf_rel", "eucd",
+                        "keep",
+                    ])
+                if not failures_exists:
+                    failures_csv_writer.writerow([
+                        "compressor", "filter", "serializer", "error",
+                    ])
                 # From here on, per-combo threads provide parallelism.  Dask runs
                 # serially inside each thread to avoid nested thread pools.  The
                 # synchronous-scheduler setting is scoped with `with dask.config.set`
@@ -475,15 +764,27 @@ def evaluate_combos(dataset_file,
                 # longer-lived processes.
                 with dask.config.set(scheduler="synchronous"):
                     with ThreadPoolExecutor(max_workers=threads_per_rank) as pool:
-                        future_to_cfg = {pool.submit(_evaluate_one, cfg): cfg for cfg in configs_for_rank}
+                        future_to_cfg = {
+                            pool.submit(_evaluate_one, cfg): cfg for cfg in configs_pending
+                        }
                         for fut in as_completed(future_to_cfg):
                             cfg = future_to_cfg[fut]
+
                             try:
                                 r = fut.result()
                             except Exception as e:
                                 # Never crash the sweep on a single combo failure.
+                                # Failures are logged to failures_{var}_rank{rank}.csv
+                                # and aggregated across ranks at the end of the sweep.
                                 (_, compressor), (_, filt), (_, serializer) = cfg
                                 failures.append((str(compressor), str(filt), str(serializer), repr(e)))
+                                failures_csv_writer.writerow([
+                                    str(compressor), str(filt), str(serializer), repr(e),
+                                ])
+                                failed_rows_since_flush += 1
+                                if failed_rows_since_flush >= FLUSH_EVERY:
+                                    failures_csv_file.flush()
+                                    failed_rows_since_flush = 0
                                 utils.progress_bar(total_local, print_every=100, key=str(var))
                                 continue
 
@@ -495,17 +796,21 @@ def evaluate_combos(dataset_file,
                             if existing_l1_error is not None:
                                 keep = (l1_rel <= existing_l1_error)
 
-                            # Per-rank streaming audit row (item 13).  Written for every
+                            # Per-rank streaming audit row.  Written for every
                             # successful evaluation, including filtered-out ones (the
-                            # `keep` column distinguishes).  flush() after each row so a
-                            # mid-sweep crash still leaves a usable audit trail on disk.
+                            # `keep` column distinguishes).  Batched flushes keep MDS
+                            # pressure down while still surviving a mid-sweep crash
+                            # up to FLUSH_EVERY rows.
                             partial_csv_writer.writerow([
                                 r["compressor"], r["filter"], r["serializer"],
                                 r["comp_idx"], r["filt_idx"], r["ser_idx"],
                                 r["ratio"], l1_rel, l2_rel, linf_rel, r["eucd"],
                                 keep,
                             ])
-                            partial_csv_file.flush()
+                            rows_since_flush += 1
+                            if rows_since_flush >= FLUSH_EVERY:
+                                partial_csv_file.flush()
+                                rows_since_flush = 0
 
                             if keep:
                                 results.append((
@@ -520,21 +825,43 @@ def evaluate_combos(dataset_file,
 
                             utils.progress_bar(total_local, print_every=100, key=str(var))
 
-            # Aggregate failure counts collectively so rank-1..N failures aren't
-            # silent.  Detailed tracebacks still only come from rank 0 (printing
-            # from all ranks would be noisy), but the total tells you if other
-            # ranks had trouble.
+                # Flush any remaining buffered rows before closing the files.
+                partial_csv_file.flush()
+                failures_csv_file.flush()
+
+            # ----- Aggregate failure details across ranks (M2) ---------------
+            # Gather the first few failures from every rank so the user can see
+            # node-local issues (bad EBCC geometry on one host, codec-library
+            # mismatch on another) even when rank 0 is clean.  Limit to 5 per
+            # rank to keep the pickle small.
+            sample_failures = failures[:5]
+            all_failures = comm.gather(sample_failures, root=0)
             total_failures = comm.reduce(len(failures), op=MPI.SUM, root=0)
 
             if rank == 0 and total_failures and total_failures > 0:
                 click.echo(
                     f"[warning] {total_failures} combo(s) failed total across "
-                    f"{size} rank(s) ({len(failures)} on rank 0):"
+                    f"{size} rank(s)."
                 )
-                for compressor, filt, serializer, err in failures[:10]:
-                    click.echo(f"  - {compressor} | {filt} | {serializer}: {err}")
-                if len(failures) > 10:
-                    click.echo(f"  ... and {len(failures) - 10} more on rank 0.")
+                shown = 0
+                for r_idx, batch in enumerate(all_failures):
+                    for compressor, filt, serializer, err in batch:
+                        click.echo(
+                            f"  [rank {r_idx}] {compressor} | {filt} | {serializer}: {err}"
+                        )
+                        shown += 1
+                        if shown >= 30:
+                            break
+                    if shown >= 30:
+                        break
+                if total_failures > shown:
+                    click.echo(
+                        f"  ... and {total_failures - shown} more "
+                        f"(full details in failures_{var}_rank*.csv)."
+                    )
+
+            # Per-variable sweep timing for the run manifest.
+            var_sweep_seconds = time.perf_counter() - var_sweep_t0
 
             # -------------------------------------------------------------------------
             # Gather + best-combo selection (rank 0)
@@ -602,6 +929,83 @@ def evaluate_combos(dataset_file,
                 else:
                     click.echo("[sweep] no combos passed the threshold filter.")
 
+                # -------------------------------------------------------------
+                # Run manifest (machine-readable summary per variable).
+                # Useful for CI / downstream tooling that wants the best combo
+                # without parsing stdout.  Everything is primitive/JSON-safe.
+                # -------------------------------------------------------------
+                manifest = {
+                    "command": "evaluate_combos",
+                    "dataset_file": os.fspath(dataset_file),
+                    "var": str(var),
+                    "where_to_write": os.fspath(where_to_write),
+                    "args": {
+                        "eval_data_size_limit": int(eval_data_size_limit),
+                        "threads_per_rank": int(threads_per_rank),
+                        "inner_chunk_mib": int(inner_chunk_mib),
+                        "compressor_class": compressor_class,
+                        "filter_class": filter_class,
+                        "serializer_class": serializer_class,
+                        "with_lossy": bool(with_lossy),
+                        "with_numcodecs_wasm": bool(with_numcodecs_wasm),
+                        "with_ebcc": bool(with_ebcc),
+                        "override_existing_l1_error": override_existing_l1_error,
+                        "resume": bool(resume),
+                    },
+                    "topology": {
+                        "size": int(size),
+                        "cores_avail": int(cores_avail),
+                    },
+                    "existing_l1_error": existing_l1_error,
+                    "num_combos": int(num_loops),
+                    "num_passed": int(len(results_gather)),
+                    "num_failed_total": int(total_failures or 0),
+                    "var_sweep_seconds": float(var_sweep_seconds),
+                    "env": {
+                        "zarr": getattr(zarr, "__version__", None),
+                        "numpy": getattr(np, "__version__", None),
+                        "dask": getattr(dask, "__version__", None),
+                    },
+                    "sample_signature_path": os.fspath(
+                        _signature_path(where_to_write, str(var))
+                    ),
+                    "outputs": {
+                        "npy": os.fspath(npy_path),
+                        "parquet": (
+                            os.fspath(parquet_path) if partial_paths else None
+                        ),
+                        "config_space_csv": os.fspath(
+                            Path(where_to_write) / f"config_space_{var}.csv"
+                        ),
+                    },
+                    "best": None,
+                }
+                if results_gather:
+                    manifest["best"] = {
+                        "compressor": best[0][0],
+                        "filter":     best[0][1],
+                        "serializer": best[0][2],
+                        "comp_idx":   int(best[0][3]),
+                        "filt_idx":   int(best[0][4]),
+                        "ser_idx":    int(best[0][5]),
+                        "ratio":      float(best[1]),
+                        "l1_rel":     float(best[2]),
+                        "eucd":       float(best[3]),
+                    }
+
+                manifest_path = os.path.join(
+                    where_to_write, f"manifest_{var}.json"
+                )
+                try:
+                    with open(manifest_path, "w") as mf:
+                        json.dump(manifest, mf, indent=2, default=str)
+                    click.echo(f"[sweep] wrote manifest -> {manifest_path}")
+                except Exception as manifest_err:
+                    click.echo(
+                        f"[sweep] WARNING: could not write manifest "
+                        f"{manifest_path}: {manifest_err}"
+                    )
+
 
 @cli.command("compress_with_optimal")
 @click.argument("dataset_file", type=click.Path(exists=True, dir_okay=True, file_okay=True))
@@ -652,13 +1056,21 @@ def evaluate_combos(dataset_file,
 @click.option("--with-lossy/--without-lossy", default=True, show_default=True)
 @click.option("--with-numcodecs-wasm/--without-numcodecs-wasm", default=True, show_default=True)
 @click.option("--with-ebcc/--without-ebcc", default=True, show_default=True)
+@click.option("--force/--no-force", default=False, show_default=True,
+              help="Suppress the warning emitted when the (comp_idx, filt_idx, "
+                   "ser_idx) you pass does not match the best combo recorded in "
+                   "manifest_{field}.json by evaluate_combos.  Default is to "
+                   "warn (non-fatal) so typos and stale indices get flagged.  "
+                   "Pass --force when you deliberately want to write a non-best "
+                   "combo (e.g. exploring the Pareto front, testing a fallback).")
 def compress_with_optimal(dataset_file, where_to_write, field_to_compress,
                           comp_idx, filt_idx, ser_idx,
                           eval_data_size_limit,
                           inner_chunk_mib, shard_mib,
                           threads, oversubscription_check, verify,
                           compressor_class, filter_class, serializer_class,
-                          with_lossy, with_numcodecs_wasm, with_ebcc):
+                          with_lossy, with_numcodecs_wasm, with_ebcc,
+                          force):
     """
     Compress a single field with the combo chosen by evaluate_combos, streaming
     directly into the shared {where_to_write}/{dataset}.zarr store under
@@ -716,6 +1128,105 @@ def compress_with_optimal(dataset_file, where_to_write, field_to_compress,
 
     os.makedirs(where_to_write, exist_ok=True)
 
+    # Version + environment banner (for parity with evaluate_combos).
+    click.echo(_version_banner("compress_with_optimal"))
+
+    # -------------------------------------------------------------------------
+    # -------------------------------------------------------------------------
+    # Manifest cross-checks (best combo + library versions).
+    #
+    # evaluate_combos writes `manifest_{var}.json` containing the winning
+    # (comp_idx, filt_idx, ser_idx) triple AND the zarr / numpy / dask
+    # versions that produced the sweep.  We check both here:
+    #
+    #   1. If the user's triple differs from the manifest's best, warn
+    #      (non-fatal) - catches typos and stale indices without blocking
+    #      legitimate "I want to try a different combo" workflows.
+    #   2. If the library versions differ from the sweep's, warn (non-
+    #      fatal) - a decode-path change across versions could shift the
+    #      sample bytes and make the sample-signature hash check trip for
+    #      reasons unrelated to user error.  This is defense-in-depth:
+    #      the hash check itself still catches the mismatch; the warning
+    #      just helps the user understand WHY it happened.
+    #
+    # --force suppresses both warnings (it's the "I know what I'm doing"
+    # escape hatch).
+    #
+    # Both warnings are emitted here (not from the sample-hash block
+    # further down) so users see them BEFORE the expensive work
+    # (dataset open, .compute() of the sample) even starts.  Cheap to
+    # read a JSON file; lets a user abort fast if they realise they
+    # fat-fingered an index or loaded the wrong environment module.
+    # -------------------------------------------------------------------------
+    manifest_path = Path(where_to_write) / f"manifest_{field_to_compress}.json"
+    if manifest_path.is_file() and not force:
+        try:
+            manifest = json.loads(manifest_path.read_text())
+            # ---- best-combo check ----
+            best = manifest.get("best")
+            if best is not None:
+                best_triple = (int(best["comp_idx"]),
+                               int(best["filt_idx"]),
+                               int(best["ser_idx"]))
+                user_triple = (int(comp_idx), int(filt_idx), int(ser_idx))
+                if user_triple != best_triple:
+                    click.echo(
+                        f"[manifest] WARNING: {manifest_path.name} says best "
+                        f"is {best_triple}; you passed {user_triple}."
+                    )
+                    click.echo(
+                        f"  Best combo per manifest:  "
+                        f"compressor={best['compressor']}  "
+                        f"filter={best['filter']}  "
+                        f"serializer={best['serializer']}  "
+                        f"ratio={best['ratio']:.3f}"
+                    )
+                    click.echo(
+                        "  Proceeding anyway.  Pass --force to suppress this "
+                        "warning, or re-run with the manifest triple to use "
+                        "the sweep's best combo."
+                    )
+            # ---- library-version check ----
+            # Minor version differences (e.g. dask 2026.3.0 -> 2026.3.1) are
+            # usually harmless but decode paths in xarray / netCDF4 can shift
+            # bytes across version upgrades, which would trip the sample-
+            # signature hash check below.  We report differences here so the
+            # user can connect a hash mismatch to a library upgrade rather
+            # than hunting for a flag they didn't change.
+            sweep_env = manifest.get("env", {}) or {}
+            current_env = {
+                "zarr":  getattr(zarr, "__version__", None),
+                "numpy": getattr(np,   "__version__", None),
+                "dask":  getattr(dask, "__version__", None),
+            }
+            env_deltas = [
+                (pkg, sweep_env.get(pkg), current_env.get(pkg))
+                for pkg in ("zarr", "numpy", "dask")
+                if sweep_env.get(pkg) is not None
+                and sweep_env.get(pkg) != current_env.get(pkg)
+            ]
+            if env_deltas:
+                click.echo(
+                    f"[manifest] WARNING: library versions differ from the "
+                    f"sweep that wrote {manifest_path.name}:"
+                )
+                for pkg, sweep_ver, now_ver in env_deltas:
+                    click.echo(f"  {pkg}: sweep={sweep_ver}  now={now_ver}")
+                click.echo(
+                    "  If the sample-signature check below reports a hash "
+                    "mismatch, a decode-path change across these versions is "
+                    "a likely cause.  Either rerun evaluate_combos in the "
+                    "current environment, or switch back to the sweep's "
+                    "environment.  Pass --force to suppress this warning."
+                )
+        except Exception as manifest_err:
+            # Don't block the run on an unparseable manifest - users may have
+            # hand-edited it, or it may be from an older toolkit version.
+            click.echo(
+                f"[manifest] WARNING: could not parse {manifest_path.name}: "
+                f"{manifest_err}.  Skipping best-combo check."
+            )
+
     # -------------------------------------------------------------------------
     # Thread & dask configuration
     #
@@ -729,6 +1240,23 @@ def compress_with_optimal(dataset_file, where_to_write, field_to_compress,
     utils.check_thread_oversubscription(
         abort_if_unsafe=oversubscription_check, rank=rank,
     )
+
+    # Memory guardrail for the write: documented peak is threads * shard_mib.
+    # In practice rechunk transients can push 1.5-2x above that; we check
+    # against the documented peak as a floor.  If it's already too big, the
+    # real peak will definitely be too big.
+    write_peak_bytes = int(threads) * int(shard_mib) * 2**20
+    _check_memory_headroom(
+        write_peak_bytes,
+        label=f"compress_with_optimal write peak (threads x shard_mib "
+              f"= {threads} x {shard_mib} MiB)",
+    )
+    # The codec-space sample guard is deferred until after the dataset is
+    # opened, so we can check against the ACTUAL sample size (field bytes
+    # capped by the limit) rather than the full budget.  Checking the budget
+    # here would spuriously abort tiny fields when a large default limit is
+    # configured.
+
     # Scope the scheduler + worker-count settings to this function so they
     # don't leak if compress_with_optimal is imported and called from a
     # notebook or longer-lived process.  No-op difference for the single-
@@ -739,13 +1267,24 @@ def compress_with_optimal(dataset_file, where_to_write, field_to_compress,
             f"[topology] {cores_avail} core(s) visible; "
             f"dask will use {threads} worker(s) for the write. "
             f"Peak working set ~= {threads} x shard_mib ({shard_mib} MiB) = "
-            f"{threads * shard_mib} MiB."
+            f"{threads * shard_mib} MiB (documented; rechunk transients may "
+            f"push 1.5-2x this on fields with adverse source chunking)."
         )
 
         # Open dataset + field (lazy).  The FULL FIELD `da` is what gets
         # compressed; the sample below is used only to build the codec space.
         ds = utils.open_dataset(dataset_file, field_to_compress)
         da = ds[field_to_compress]
+
+        # Now that `da` is known, check the ACTUAL sample allocation size
+        # against available RAM (not the budget-as-upper-bound).
+        field_bytes = int(da.dtype.itemsize) * int(np.prod(da.shape))
+        actual_sample_bytes = min(field_bytes, int(eval_data_size_limit))
+        _check_memory_headroom(
+            actual_sample_bytes,
+            label=f"codec-space sample for '{field_to_compress}' "
+                  f"({humanize.naturalsize(actual_sample_bytes, binary=True)})",
+        )
 
         # Build the codec space from a representative sample of the field.
         #
@@ -762,6 +1301,82 @@ def compress_with_optimal(dataset_file, where_to_write, field_to_compress,
         sample_for_codec_space = utils.build_representative_sample(
             da, eval_data_size_limit,
         ).compute()
+
+        # --------------------------------------------------------------------
+        # Sample reproducibility hash (M5 verification side).
+        #
+        # If evaluate_combos wrote a sample_signature_{var}.json in this
+        # directory, recompute the hash here and compare.  Mismatch means
+        # the codec-space objects won't match the ones that won the sweep,
+        # so comp_idx / filt_idx / ser_idx resolve to a DIFFERENT codec
+        # than the user thinks.  Refuse to continue.
+        #
+        # The signature file being ABSENT is not an error — evaluate_combos
+        # may have been run with an older version of this toolkit, or the
+        # user may have hand-picked indices from another source.  In that
+        # case we warn once and proceed on trust.
+        # --------------------------------------------------------------------
+        sig_path = _signature_path(where_to_write, str(field_to_compress))
+        if sig_path.is_file():
+            try:
+                expected = json.loads(sig_path.read_text())
+                sample_np_view = np.ascontiguousarray(
+                    sample_for_codec_space.values
+                )
+                observed = _sample_signature(
+                    dataset_file=dataset_file,
+                    var=str(field_to_compress),
+                    eval_data_size_limit=int(eval_data_size_limit),
+                    sample_np=sample_np_view,
+                )
+                # Compare the meaningful fields.  `dataset_stem` and `var`
+                # must match.  `shape`/`dtype`/`nbytes`/`sha256` must match.
+                # `eval_data_size_limit` mismatch is the most common cause.
+                fields_to_check = (
+                    "dataset_stem", "var", "eval_data_size_limit",
+                    "shape", "dtype", "nbytes", "sha256",
+                )
+                mismatches = [
+                    f for f in fields_to_check
+                    if expected.get(f) != observed.get(f)
+                ]
+                if mismatches:
+                    click.echo(
+                        f"[sample-hash] MISMATCH vs {sig_path.name}: "
+                        f"differing fields = {mismatches}"
+                    )
+                    for f in mismatches:
+                        click.echo(
+                            f"  {f}: expected={expected.get(f)} "
+                            f"observed={observed.get(f)}"
+                        )
+                    click.echo(
+                        "  The codec-space indices written by evaluate_combos "
+                        "will resolve to different codec objects than the "
+                        "sweep measured.  Most common cause: different "
+                        "--eval-data-size-limit between the two commands.  "
+                        "Re-run compress_with_optimal with the matching flag."
+                    )
+                    comm.Abort(1)
+                else:
+                    click.echo(
+                        f"[sample-hash] OK, matches {sig_path.name} "
+                        f"(sha256={observed['sha256'][:16]}…)."
+                    )
+                # Free the transient copy; sample_for_codec_space (the xarray
+                # wrapper) still holds the underlying buffer via its .values.
+                del sample_np_view
+            except Exception as sig_err:
+                click.echo(
+                    f"[sample-hash] WARNING: could not verify signature "
+                    f"{sig_path.name}: {sig_err}.  Proceeding without check."
+                )
+        else:
+            click.echo(
+                f"[sample-hash] no {sig_path.name} found - proceeding on "
+                f"trust.  (For the full safety net, run evaluate_combos "
+                f"first with the same --where-to-write.)"
+            )
 
         compressors = utils.compressor_space(sample_for_codec_space, with_lossy,
                                              with_numcodecs_wasm, with_ebcc, compressor_class)
@@ -828,6 +1443,7 @@ def compress_with_optimal(dataset_file, where_to_write, field_to_compress,
             f"(inner chunks={inner_chunks}, shards={shards})"
         )
 
+        persist_t0 = time.perf_counter()
         ratio, errors, eucd = utils.persist_with_codec_pipeline(
             data_to_persist, store,
             component=field_to_compress,
@@ -835,6 +1451,7 @@ def compress_with_optimal(dataset_file, where_to_write, field_to_compress,
             inner_chunks=inner_chunks, shards=shards,
             verify=verify, verbose=False, rank=rank,
         )
+        persist_seconds = time.perf_counter() - persist_t0
 
         # Compose the summary.  Error metrics are only defined when --verify is on
         # (persist_with_codec_pipeline returns errors=None, eucd=None otherwise),
@@ -858,6 +1475,490 @@ def compress_with_optimal(dataset_file, where_to_write, field_to_compress,
         else:
             summary += "  (error metrics skipped: --no-verify)"
         click.echo(summary)
+
+        # ------------------------------------------------------------------
+        # Per-field persist manifest (machine-readable).
+        # Mirrors the evaluate_combos manifest so a downstream tool can pick
+        # up the exact combo that was written, which shards were produced,
+        # and how long it took.
+        # ------------------------------------------------------------------
+        persist_manifest = {
+            "command": "compress_with_optimal",
+            "dataset_file": os.fspath(dataset_file),
+            "var": str(field_to_compress),
+            "where_to_write": os.fspath(where_to_write),
+            "merged_store": merged_path,
+            "args": {
+                "comp_idx": int(comp_idx),
+                "filt_idx": int(filt_idx),
+                "ser_idx":  int(ser_idx),
+                "eval_data_size_limit": int(eval_data_size_limit),
+                "inner_chunk_mib": int(inner_chunk_mib),
+                "shard_mib": int(shard_mib),
+                "threads": int(threads),
+                "verify": bool(verify),
+                "force": bool(force),
+                "compressor_class": compressor_class,
+                "filter_class": filter_class,
+                "serializer_class": serializer_class,
+            },
+            "inner_chunks": list(inner_chunks),
+            "shards": list(shards),
+            "compressor": str(optimal_compressor),
+            "filter":     str(optimal_filter),
+            "serializer": str(optimal_serializer),
+            "ratio": float(ratio),
+            "errors": {k: float(v) for k, v in (errors or {}).items()},
+            "eucd": (float(eucd) if eucd is not None else None),
+            "persist_seconds": float(persist_seconds),
+            "env": {
+                "zarr": getattr(zarr, "__version__", None),
+                "numpy": getattr(np, "__version__", None),
+                "dask": getattr(dask, "__version__", None),
+            },
+        }
+        persist_manifest_path = os.path.join(
+            where_to_write, f"persist_manifest_{field_to_compress}.json"
+        )
+        try:
+            with open(persist_manifest_path, "w") as pmf:
+                json.dump(persist_manifest, pmf, indent=2, default=str)
+            click.echo(f"[persist] wrote manifest -> {persist_manifest_path}")
+        except Exception as persist_manifest_err:
+            click.echo(
+                f"[persist] WARNING: could not write manifest "
+                f"{persist_manifest_path}: {persist_manifest_err}"
+            )
+
+        # Release the LocalStore handles.  At CLI-shape this is cosmetic (the
+        # process exits next), but keeps the function well-behaved when
+        # imported and called from a longer-lived process.
+        close = getattr(store, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                pass
+
+
+@cli.command("compress_fields_from_results")
+@click.argument("dataset_file", type=click.Path(exists=True, dir_okay=True, file_okay=True))
+@click.argument("where_to_write", type=click.Path(dir_okay=True, file_okay=False, exists=True))
+@click.option("--vars", "vars_filter", default=None,
+              help="Comma-separated list of variable names to process. "
+                   "Default: every variable for which a results_{var}.parquet "
+                   "or manifest_{var}.json exists in --where-to-write.")
+@click.option("--eval-data-size-limit", default="5GB", callback=_size_option_callback,
+              show_default=True,
+              help="Must match the value used in the prior evaluate_combos run.")
+@click.option("--inner-chunk-mib", type=int, default=16, show_default=True)
+@click.option("--shard-mib", type=int, default=512, show_default=True)
+@click.option("--threads", type=int, default=None,
+              help="Dask workers for the write.  Default: auto-detected.")
+@click.option("--oversubscription-check/--no-oversubscription-check", default=True,
+              show_default=True)
+@click.option("--verify/--no-verify", default=True, show_default=True)
+@click.option("--compressor-class", default="all")
+@click.option("--filter-class", default="all")
+@click.option("--serializer-class", default="all")
+@click.option("--with-lossy/--without-lossy", default=True, show_default=True)
+@click.option("--with-numcodecs-wasm/--without-numcodecs-wasm", default=True, show_default=True)
+@click.option("--with-ebcc/--without-ebcc", default=True, show_default=True)
+@click.option("--skip-existing/--no-skip-existing", default=True, show_default=True,
+              help="If a field is already present in the merged store, skip it. "
+                   "Disable with --no-skip-existing to force re-compression.")
+@click.option("--continue-on-error/--no-continue-on-error", default=True, show_default=True,
+              help="If compressing one field fails, log and continue with the "
+                   "rest (default).  Disable to fail the whole run on first error.")
+def compress_fields_from_results(dataset_file, where_to_write, vars_filter,
+                                  eval_data_size_limit, inner_chunk_mib, shard_mib,
+                                  threads, oversubscription_check, verify,
+                                  compressor_class, filter_class, serializer_class,
+                                  with_lossy, with_numcodecs_wasm, with_ebcc,
+                                  skip_existing, continue_on_error):
+    """
+    Batch wrapper around compress_with_optimal.
+
+    Reads the best (comp_idx, filt_idx, ser_idx) per variable from
+    `manifest_{var}.json` (preferred) or `results_{var}.parquet` (fallback),
+    then compresses each variable into the shared `{dataset}.zarr` store.
+    The dataset is opened once and re-used across variables.
+
+    This is the command most production pipelines want after an
+    `evaluate_combos` run - it closes the loop without forcing the user to
+    glue together N per-field invocations by hand.
+
+    Launch as a SINGLE process (no mpirun).  Parallelism inside the write is
+    provided by dask's threaded scheduler, same as compress_with_optimal.
+    """
+    comm = MPI.COMM_WORLD
+    rank = comm.Get_rank()
+    size = comm.Get_size()
+    if size > 1:
+        if rank == 0:
+            click.echo("compress_fields_from_results is not meant to run in parallel. "
+                       "Launch it with a single process.")
+        comm.Abort(1)
+
+    click.echo(_version_banner("compress_fields_from_results"))
+
+    # Thread + dask config (same pattern as compress_with_optimal)
+    cores_avail = utils.detect_cores_available()
+    if threads is None:
+        threads = cores_avail
+    utils.check_thread_oversubscription(
+        abort_if_unsafe=oversubscription_check, rank=rank,
+    )
+    write_peak_bytes = int(threads) * int(shard_mib) * 2**20
+    _check_memory_headroom(
+        write_peak_bytes,
+        label=f"write peak (threads x shard_mib = {threads} x {shard_mib} MiB)",
+    )
+    # Per-variable sample memory check happens inside the loop below, once
+    # we know each variable's actual size - a single budget-based check
+    # here would spuriously abort on a mix of small and large fields.
+
+    # --------------------------------------------------------------------
+    # Resolve (var, comp_idx, filt_idx, ser_idx) list from the where_to_write
+    # directory.  Prefer manifest_{var}.json because it encodes exact codec
+    # spellings and was designed for this; fall back to best-ratio from
+    # results_{var}.parquet if the manifest is missing.
+    #
+    # We also capture the env block from the first manifest we read so we
+    # can warn once if the sweep ran with different library versions than
+    # this batch run (decode-path drift -> signature mismatches later).
+    # --------------------------------------------------------------------
+    wtw = Path(where_to_write)
+    candidates = []
+    sweep_env = None
+    for mpath in sorted(wtw.glob("manifest_*.json")):
+        var_name = mpath.stem.removeprefix("manifest_")
+        try:
+            m = json.loads(mpath.read_text())
+            best = m.get("best")
+            if best is None:
+                click.echo(f"[batch] {var_name}: manifest has no best combo; skipping.")
+                continue
+            candidates.append({
+                "var": var_name,
+                "comp_idx": int(best["comp_idx"]),
+                "filt_idx": int(best["filt_idx"]),
+                "ser_idx":  int(best["ser_idx"]),
+                "source": f"manifest {mpath.name}",
+            })
+            if sweep_env is None and m.get("env"):
+                sweep_env = m["env"]
+        except Exception as e:
+            click.echo(f"[batch] WARNING: failed to parse {mpath}: {e}")
+
+    # One-shot library-version cross-check.  Same rationale as the one in
+    # compress_with_optimal: if zarr/numpy/dask differ between the sweep
+    # and now, the sample bytes may shift (decode path) and the per-var
+    # signature checks in the loop below may trip for environmental rather
+    # than user reasons.  Reporting here connects the two for the user.
+    if sweep_env:
+        current_env = {
+            "zarr":  getattr(zarr, "__version__", None),
+            "numpy": getattr(np,   "__version__", None),
+            "dask":  getattr(dask, "__version__", None),
+        }
+        env_deltas = [
+            (pkg, sweep_env.get(pkg), current_env.get(pkg))
+            for pkg in ("zarr", "numpy", "dask")
+            if sweep_env.get(pkg) is not None
+            and sweep_env.get(pkg) != current_env.get(pkg)
+        ]
+        if env_deltas:
+            click.echo(
+                "[batch] WARNING: library versions differ from the sweep "
+                "that wrote these manifests:"
+            )
+            for pkg, sweep_ver, now_ver in env_deltas:
+                click.echo(f"  {pkg}: sweep={sweep_ver}  now={now_ver}")
+            click.echo(
+                "  If per-variable signature checks below report hash "
+                "mismatches, a decode-path change across these versions "
+                "is a likely cause.  Either rerun evaluate_combos in the "
+                "current environment, or switch back to the sweep's "
+                "environment."
+            )
+
+    # Any parquet files without a companion manifest? Take best-ratio from them.
+    known_vars = {c["var"] for c in candidates}
+    for ppath in sorted(wtw.glob("results_*.parquet")):
+        var_name = ppath.stem.removeprefix("results_")
+        if var_name in known_vars:
+            continue
+        try:
+            dfp = pd.read_parquet(ppath)
+            kept = dfp[dfp["keep"] == True] if "keep" in dfp.columns else dfp
+            if len(kept) == 0:
+                click.echo(f"[batch] {var_name}: no kept rows in {ppath.name}; skipping.")
+                continue
+            best_row = kept.sort_values("ratio", ascending=False).iloc[0]
+            candidates.append({
+                "var": var_name,
+                "comp_idx": int(best_row["comp_idx"]),
+                "filt_idx": int(best_row["filt_idx"]),
+                "ser_idx":  int(best_row["ser_idx"]),
+                "source": f"parquet {ppath.name}",
+            })
+        except Exception as e:
+            click.echo(f"[batch] WARNING: failed to parse {ppath}: {e}")
+
+    if vars_filter:
+        wanted = set(v.strip() for v in vars_filter.split(",") if v.strip())
+        candidates = [c for c in candidates if c["var"] in wanted]
+        missing = wanted - {c["var"] for c in candidates}
+        if missing:
+            click.echo(
+                f"[batch] WARNING: --vars specified {sorted(missing)} "
+                f"but no manifest/parquet was found for those."
+            )
+
+    if not candidates:
+        click.echo(
+            "[batch] ERROR: no variables to compress. Did evaluate_combos run "
+            "against the same --where-to-write?"
+        )
+        comm.Abort(1)
+
+    click.echo(
+        f"[batch] will compress {len(candidates)} field(s): "
+        f"{', '.join(c['var'] for c in candidates)}"
+    )
+
+    # Open dataset ONCE; pass the same da to each iteration.
+    ds = utils.open_dataset(dataset_file, field_to_compress=None, rank=rank)
+
+    merged_path = _merged_store_path(where_to_write, dataset_file)
+    os.makedirs(Path(merged_path).parent, exist_ok=True)
+
+    # Inspect the merged store (if any) to honor --skip-existing.
+    existing_arrays = set()
+    if Path(merged_path).is_dir():
+        try:
+            store_ro = zarr.storage.LocalStore(merged_path, read_only=True)
+            g_ro = zarr.open_group(store_ro, mode="r")
+            existing_arrays = set(g_ro.array_keys())
+            close_ro = getattr(store_ro, "close", None)
+            if callable(close_ro):
+                try:
+                    close_ro()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    # ---- per-field loop ----
+    results_by_var = {}
+    any_error = False
+
+    with dask.config.set(scheduler="threads", num_workers=int(threads)):
+        for idx, c in enumerate(candidates, start=1):
+            var = c["var"]
+            click.echo(
+                f"\n[batch] ({idx}/{len(candidates)}) {var} from {c['source']}: "
+                f"comp={c['comp_idx']} filt={c['filt_idx']} ser={c['ser_idx']}"
+            )
+            if skip_existing and var in existing_arrays:
+                click.echo(f"[batch] {var} already in {merged_path}; skipping.")
+                results_by_var[var] = {"status": "skipped-existing"}
+                continue
+            if var not in ds.data_vars:
+                msg = f"variable '{var}' not in dataset"
+                if continue_on_error:
+                    click.echo(f"[batch] WARNING: {msg}; skipping.")
+                    results_by_var[var] = {"status": "missing-from-dataset"}
+                    continue
+                else:
+                    click.echo(f"[batch] ERROR: {msg}; aborting (use "
+                               f"--continue-on-error to skip).")
+                    comm.Abort(1)
+
+            try:
+                field_t0 = time.perf_counter()
+                da = ds[var]
+
+                # Per-variable memory guard: check the actual sample size
+                # against available RAM, not the budget (which would abort
+                # tiny fields spuriously when a large default is configured).
+                field_bytes = int(da.dtype.itemsize) * int(np.prod(da.shape))
+                actual_sample_bytes = min(field_bytes, int(eval_data_size_limit))
+                _check_memory_headroom(
+                    actual_sample_bytes,
+                    label=f"codec-space sample for '{var}' "
+                          f"({humanize.naturalsize(actual_sample_bytes, binary=True)})",
+                )
+
+                # Build codec space from the sample (same contract as
+                # compress_with_optimal).  Verify against signature when present.
+                sample_for_codec_space = utils.build_representative_sample(
+                    da, eval_data_size_limit,
+                ).compute()
+
+                sig_path = _signature_path(where_to_write, str(var))
+                if sig_path.is_file():
+                    try:
+                        expected = json.loads(sig_path.read_text())
+                        sample_np_view = np.ascontiguousarray(
+                            sample_for_codec_space.values
+                        )
+                        observed = _sample_signature(
+                            dataset_file=dataset_file,
+                            var=str(var),
+                            eval_data_size_limit=int(eval_data_size_limit),
+                            sample_np=sample_np_view,
+                        )
+                        mismatches = [
+                            f for f in (
+                                "dataset_stem", "var", "eval_data_size_limit",
+                                "shape", "dtype", "nbytes", "sha256",
+                            )
+                            if expected.get(f) != observed.get(f)
+                        ]
+                        del sample_np_view
+                        if mismatches:
+                            click.echo(
+                                f"[sample-hash] MISMATCH for {var}: "
+                                f"differing fields = {mismatches}"
+                            )
+                            if continue_on_error:
+                                click.echo(
+                                    f"[batch] skipping {var} (use matching "
+                                    f"--eval-data-size-limit to fix)."
+                                )
+                                results_by_var[var] = {"status": "signature-mismatch"}
+                                continue
+                            comm.Abort(1)
+                    except Exception as sig_err:
+                        click.echo(
+                            f"[sample-hash] WARNING {var}: {sig_err}; proceeding."
+                        )
+
+                compressors = utils.compressor_space(
+                    sample_for_codec_space, with_lossy, with_numcodecs_wasm,
+                    with_ebcc, compressor_class,
+                )
+                filters_space = utils.filter_space(
+                    sample_for_codec_space, with_lossy, with_numcodecs_wasm,
+                    with_ebcc, filter_class,
+                )
+                serializers = utils.serializer_space(
+                    sample_for_codec_space, with_lossy, with_numcodecs_wasm,
+                    with_ebcc, serializer_class,
+                )
+
+                comp_idx = c["comp_idx"]; filt_idx = c["filt_idx"]; ser_idx = c["ser_idx"]
+                for name, idx2, arr in [("comp_idx", comp_idx, compressors),
+                                        ("filt_idx", filt_idx, filters_space),
+                                        ("ser_idx",  ser_idx,  serializers)]:
+                    if not (-1 <= idx2 < len(arr)):
+                        raise IndexError(
+                            f"Invalid {name}: {idx2} (must be in [-1, {len(arr)-1}]) for {var}"
+                        )
+
+                optimal_compressor = compressors[comp_idx][1] if comp_idx != -1 else None
+                optimal_filter     = filters_space[filt_idx][1] if filt_idx != -1 else None
+                optimal_serializer = serializers[ser_idx][1]  if ser_idx  != -1 else None
+
+                data_to_persist = da
+                if _is_zfpy_serializer(optimal_serializer):
+                    data_to_persist = da.stack(flat_dim=da.dims)
+                elif _is_ebcc_serializer(optimal_serializer):
+                    data_to_persist = da.squeeze().astype("float32")
+
+                filters_ = [optimal_filter]
+                compressors_ = [optimal_compressor]
+                serializer_ = optimal_serializer
+                if isinstance(serializer_, AnyNumcodecsArrayBytesCodec) or optimal_filter is None:
+                    filters_ = None
+                if optimal_compressor is None:
+                    compressors_ = None
+                if optimal_serializer is None:
+                    serializer_ = "auto"
+
+                inner_chunks, shards = utils.compute_chunk_and_shard_shape(
+                    data_to_persist.shape, data_to_persist.dtype,
+                    inner_mib=inner_chunk_mib, shard_mib=shard_mib,
+                )
+
+                store = zarr.storage.LocalStore(merged_path, read_only=False)
+                try:
+                    try:
+                        zarr.open_group(store, mode="a", zarr_format=3)
+                    except Exception as e:
+                        click.echo(
+                            f"[persist] ERROR opening group at {merged_path}: {e}"
+                        )
+                        raise
+                    click.echo(
+                        f"[persist] {var} -> {merged_path} "
+                        f"(inner chunks={inner_chunks}, shards={shards})"
+                    )
+                    ratio, errors, eucd = utils.persist_with_codec_pipeline(
+                        data_to_persist, store,
+                        component=var,
+                        filters=filters_, compressors=compressors_, serializer=serializer_,
+                        inner_chunks=inner_chunks, shards=shards,
+                        verify=verify, verbose=False, rank=rank,
+                    )
+                finally:
+                    close = getattr(store, "close", None)
+                    if callable(close):
+                        try:
+                            close()
+                        except Exception:
+                            pass
+
+                field_seconds = time.perf_counter() - field_t0
+                summary = f"{var}: ratio={ratio:.3f}"
+                if verify:
+                    summary += (
+                        f" L1_rel={errors['Relative_Error_L1']:.3e} "
+                        f"eucd={eucd:.3e}"
+                    )
+                summary += f"  ({field_seconds:.1f}s)"
+                click.echo(f"[batch] {summary}")
+                results_by_var[var] = {
+                    "status": "ok",
+                    "ratio": float(ratio),
+                    "errors": {k: float(v) for k, v in (errors or {}).items()},
+                    "eucd": (float(eucd) if eucd is not None else None),
+                    "seconds": float(field_seconds),
+                    "comp_idx": int(comp_idx),
+                    "filt_idx": int(filt_idx),
+                    "ser_idx":  int(ser_idx),
+                }
+
+            except Exception as field_err:
+                any_error = True
+                click.echo(f"[batch] ERROR on {var}: {field_err!r}")
+                results_by_var[var] = {"status": "error", "error": repr(field_err)}
+                if not continue_on_error:
+                    raise
+
+    # Summary manifest for the whole batch.
+    batch_manifest_path = os.path.join(where_to_write, "batch_manifest.json")
+    try:
+        with open(batch_manifest_path, "w") as bmf:
+            json.dump(
+                {
+                    "command": "compress_fields_from_results",
+                    "dataset_file": os.fspath(dataset_file),
+                    "where_to_write": os.fspath(where_to_write),
+                    "merged_store": merged_path,
+                    "results": results_by_var,
+                    "any_error": any_error,
+                },
+                bmf, indent=2, default=str,
+            )
+        click.echo(f"\n[batch] wrote summary -> {batch_manifest_path}")
+    except Exception as bmf_err:
+        click.echo(f"[batch] WARNING: could not write batch manifest: {bmf_err}")
+
+    if any_error and not continue_on_error:
+        comm.Abort(1)
 
 
 @cli.command("merge_compressed_fields")
@@ -895,14 +1996,27 @@ def merge_compressed_fields(dataset_file: str, compressed_files_location: str):
                    "`where_to_write`?")
         comm.Abort(1)
 
+    # Open in a try/finally so the LocalStore handles are released even if
+    # consolidate_metadata or the subsequent array listing raises.  Zarr v3's
+    # LocalStore holds open file descriptors; at CLI-shape the OS would reap
+    # them on process exit, but merging via an imported function (notebook /
+    # longer-lived process) would leak them without an explicit close.
     store = zarr.storage.LocalStore(merged_path, read_only=False)
-    zarr.consolidate_metadata(store)
-    click.echo(f"[merge] consolidated metadata on {merged_path}")
+    try:
+        zarr.consolidate_metadata(store)
+        click.echo(f"[merge] consolidated metadata on {merged_path}")
 
-    # Report what's inside
-    g = zarr.open_group(store, mode="r")
-    arr_names = list(g.array_keys())
-    click.echo(f"[merge] arrays in store ({len(arr_names)}): {', '.join(arr_names) or '<none>'}")
+        # Report what's inside
+        g = zarr.open_group(store, mode="r")
+        arr_names = list(g.array_keys())
+        click.echo(f"[merge] arrays in store ({len(arr_names)}): {', '.join(arr_names) or '<none>'}")
+    finally:
+        close = getattr(store, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                pass
 
 
 @cli.command("open_zarr_and_inspect")
@@ -1422,8 +2536,13 @@ def plot_compression_errors(dataset_file: str, where_to_write: str, field_to_com
 
     # Flatten data for ZFPY serializer
     if isinstance(selected_serializer, numcodecs.zarr3.ZFPY):
-        da = da.stack(flat_dim=da.dims)
-        shifted_da = shifted_da.stack(flat_dim=da.dims)
+        # Save the original dims BEFORE mutating `da`.  Using `da.dims` on the
+        # second stack call after the first one runs would read the stacked
+        # shape (`("flat_dim",)`), so xarray would try to stack `shifted_da`
+        # on a dimension it doesn't have and raise ValueError.
+        orig_dims = da.dims
+        da = da.stack(flat_dim=orig_dims)
+        shifted_da = shifted_da.stack(flat_dim=orig_dims)
 
     ############
     # COMPRESS #

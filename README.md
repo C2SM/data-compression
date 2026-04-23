@@ -3,7 +3,7 @@
   <img src="./data-compression_logo.png" alt="Logo" width="300"/>
 </div>
 
-Set of tools for compressing netCDF files with Zarr. 
+Set of tools for compressing netCDF files with Zarr.
 
 The tools use the following compression libraries:
 
@@ -50,25 +50,70 @@ bash install_dc_toolkit.sh
 ```
 --------------------------------------------------------------------------------
 
-Usage: dc_toolkit --help # List of available commands
-
-Usage: dc_toolkit COMMAND --help # Documentation per command
+Usage: dc_toolkit --help           # List of available commands
+Usage: dc_toolkit COMMAND --help   # Documentation per command
 
 Example:
 
-dc_toolkit \ # CLI-tool
-  evaluate_combos \ # command
-  netCDF_files/tigge_pl_t_q_dx=2_2024_08_02.nc \ # netCDF file to compress
-  ./dump \ # where to write the compressed file(s)
-  --field-to-compress t # field of netCDF to compress
+dc_toolkit \                                                # CLI-tool
+  evaluate_combos \                                         # command
+  netCDF_files/tigge_pl_t_q_dx=2_2024_08_02.nc \            # netCDF file
+  --where-to-write ./dump \                                 # output directory
+  --field-to-compress t \                                   # field to sweep
+  --eval-data-size-limit 5GB                                # sample size
 
 --------------------------------------------------------------------------------
 ```
 
+### End-to-end workflow
+
+The typical pipeline is three commands:
+
+1. **`evaluate_combos`** — sweep `(compressor × filter × serializer)` combinations on a representative sample of the field and record compression ratio / error metrics per combo.
+2. **`compress_with_optimal`** (one field at a time) or **`compress_fields_from_results`** (batch: all fields at once, dataset opened once) — persist the field(s) into a shared `.zarr` store using the winning combo from step 1, at production chunk/shard sizes.
+3. **`merge_compressed_fields`** — consolidate metadata on the shared store so downstream readers can open it quickly without scanning every array.
+
+> **Important:** pass the **same `--eval-data-size-limit`** to step 2 as you used in step 1. The `(comp_idx, filt_idx, ser_idx)` tuple from the sweep indexes into a codec space whose statistical parameters (e.g. `Asinh.linear_width`) are derived from the sample — change the sample size and the tuple can resolve to a slightly different codec object. Symptom: worse compression ratio at persist time than the sweep reported, no error.
+
+### Output files
+
+`evaluate_combos` writes the following per variable `{var}` into `--where-to-write`:
+
+| File | What it is |
+|------|------------|
+| `config_space_{var}.csv` | Full planning space — the Cartesian product that was going to be evaluated. Input to `analyze_clustering`. |
+| `config_space_{var}_rank{N}.csv` | Per-rank streaming audit trail, flushed per row. Useful to tail during long sweeps or to inspect after a crash. |
+| `results_{var}.parquet` | Consolidated results across all ranks, with a `keep` column distinguishing passing and filtered-out combos. The canonical file for analysis. |
+| `*_scored_results_with_names.npy` | Kept-only scored configs in numpy structured-array form. Input to `perform_clustering` / `analyze_clustering`. |
+| `manifest_{var}.json` | Best combo per variable. Read by `compress_fields_from_results` to drive the batch persist. |
+
+`compress_with_optimal` and `compress_fields_from_results` write the compressed data into `{where_to_write}/{dataset_basename}.zarr`, under one group per variable. `batch_manifest.json` summarises a batch run.
+
+### HPC parallelism (SLURM / MPI)
+
+`evaluate_combos` requires **exactly one MPI rank per node** — each rank drives a node-local `ThreadPoolExecutor`. To scale out, increase `--nodes` and keep `--ntasks-per-node=1`:
+
+```bash
+srun --nodes=<N> --ntasks-per-node=1 \
+  dc_toolkit evaluate_combos input.nc \
+    --where-to-write ./out \
+    --field-to-compress t \
+    --eval-data-size-limit 5GB
+```
+
+Codec-internal thread pools must be pinned to 1 to avoid nested oversubscription (the tool checks this at startup and aborts by default; `--no-oversubscription-check` disables the guard):
+
+```bash
+export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 \
+       BLOSC_NTHREADS=1 NUMBA_NUM_THREADS=1
+```
+
+`compress_with_optimal`, `compress_fields_from_results`, and `merge_compressed_fields` are single-process commands — launch with `srun -n 1 ...` or plain invocation. Parallelism inside the write comes from dask's threaded scheduler, tuned via `--threads` (default: auto-detected from visible cores), `--inner-chunk-mib` (default: 16), and `--shard-mib` (default: 512). `--verify/--no-verify` (default on) re-reads the store to compute error norms — skip with `--no-verify` on re-compression runs where the combo is already trusted.
+
 ## UI implementation
 
 Two User Interfaces have been implemented to make the file compression process more user-friendly.
-Both UIs provide functionlaities for compressors similarity metrics and file compression.
+Both UIs provide functionalities for compressors similarity metrics and file compression.
 
 Outside of the mutual UI functionalities, this UI allows users to download similarity metrics plots and tweak parameters more dynamically.
 
@@ -77,11 +122,11 @@ If launched from santis, make sure to ssh correctly:
 ssh -L 8501:localhost:8501 santis
 ```
 ```
-dc_toolkit run_web_ui_vcluster \ 
-  --user_account "YOUR_USER_ACCOUNT" \ 
+dc_toolkit run_web_ui_vcluster \
+  --user_account "YOUR_USER_ACCOUNT" \
   --uenv_image UENV_NAME \
-  --uploaded_file "PATH_TO_FILE" \ 
-  --time "00:15:00" \ 
+  --uploaded_file "PATH_TO_FILE" \
+  --time "00:15:00" \
   --nodes "1" --ntasks-per-node "72"
 ```
 Local web-versions and non are also available:
@@ -99,8 +144,8 @@ A self-contained image has been setup in the `Dockerfile`. You can copy the file
 ```commandline
 docker build -t dc-toolkit .
 ```
-The image contains all dependencies and automatically clones the repository. 
-Once this build is complete, you can run commands with docker. An example: 
+The image contains all dependencies and automatically clones the repository.
+Once this build is complete, you can run commands with docker. An example:
 
 ```commandline
 docker run \
@@ -110,7 +155,7 @@ docker run \
   -e XDG_CACHE_HOME=/tmp/.cache \
   --entrypoint /bin/bash \
   dc-toolkit \
-  -c 'mkdir -p docker_saved_files && dc_toolkit evaluate_combos /opt/data-compression/netCDF_files/tigge_pl_t_q_dx=2_2024_08_02.nc /mnt/data/docker_saved_files --field-to-compress t'
+  -c 'mkdir -p docker_saved_files && dc_toolkit evaluate_combos /opt/data-compression/netCDF_files/tigge_pl_t_q_dx=2_2024_08_02.nc --where-to-write /mnt/data/docker_saved_files --field-to-compress t'
 ```
 
 **Command Breakdown:**
@@ -123,8 +168,14 @@ docker run \
 * **`dc-toolkit`**: The name of the Docker image to run.
 * **`-c '...'`**: Executes a custom shell command to handle the complex environment setup:
   * **`mkdir -p docker_saved_files`**: Creates an output directory on your host.
-  * **`dc_toolkit evaluate_combos ...`**: Executes the actual compression tool, using a file inside the container and saving the results to your mounted volume.
+  * **`dc_toolkit evaluate_combos ...`**: Executes the actual compression tool, using a file inside the container and saving the results (under `--where-to-write`) to your mounted volume.
 
+Single-machine runs (Docker included) get their parallelism from the node-local `ThreadPoolExecutor` inside a single MPI rank — no multi-rank `mpirun` is needed. Also make sure to pin codec-internal thread pools so they don't fight the outer threads:
+
+```bash
+-e OMP_NUM_THREADS=1 -e MKL_NUM_THREADS=1 -e OPENBLAS_NUM_THREADS=1 \
+-e BLOSC_NTHREADS=1 -e NUMBA_NUM_THREADS=1
+```
 
 Or for the web UI:
 
@@ -132,69 +183,71 @@ Or for the web UI:
 docker run -p 8501:8501 dc-toolkit run_web_ui
 ```
 
-### Running with MPI (Parallel Processing)
+### Running with MPI (single-container, exercises the MPI code path)
 
-To drastically speed up the evaluation process, you can run the toolkit in parallel using OpenMPI. 
-
-Because running MPI inside Docker requires some specific file permission and cache handling, use the following commands to securely mount your directories and isolate the process caches depending on your operating system.
+OpenMPI + Docker requires specific file permission and cache handling. Note that on a single container `evaluate_combos` runs with **one** MPI rank (`-n 1`) — the rank-per-node invariant means multi-rank on one node is not supported. Parallel work inside the single rank is done by the `ThreadPoolExecutor`; the `mpirun` launch is useful for exercising the MPI code path in CI or smoke tests. For real multi-node speedup, use SLURM (see the HPC section above).
 
 ---
 
 #### Mac and Linux
-
-For Unix-based systems, we map your local user ID to the container to avoid permission issues and assign unique temporary directories to isolate caches.
 
 ```bash
 docker run \
   -u $(id -u):$(id -g) \
   -w /mnt/data/docker_saved_files \
   -v $(pwd)/netCDF_files:/mnt/data \
+  -e OMP_NUM_THREADS=1 -e MKL_NUM_THREADS=1 -e OPENBLAS_NUM_THREADS=1 \
+  -e BLOSC_NTHREADS=1 -e NUMBA_NUM_THREADS=1 \
   --entrypoint mpirun \
   dc-toolkit \
-  -n 8 \
-  bash -c 'HOME=/tmp/$OMPI_COMM_WORLD_RANK exec dc_toolkit evaluate_combos /opt/data-compression/netCDF_files/tigge_pl_t_q_dx=2_2024_08_02.nc /mnt/data/docker_saved_files --field-to-compress t'
+  -n 1 \
+  bash -c 'HOME=/tmp/$OMPI_COMM_WORLD_RANK exec dc_toolkit evaluate_combos /opt/data-compression/netCDF_files/tigge_pl_t_q_dx=2_2024_08_02.nc --where-to-write /mnt/data/docker_saved_files --field-to-compress t --eval-data-size-limit 5GB'
 ```
 
 **Command Breakdown:**
 
-* **`-u $(id -u):$(id -g)`**: Runs the container using your local machine's User and Group IDs rather than the Docker default `root`. This guarantees that compressed files output to your machine, are fully owned by you and aren't locked behind root permissions.
+* **`-u $(id -u):$(id -g)`**: Runs the container as your local user so outputs aren't locked behind `root` permissions.
 * **`-w /mnt/data/docker_saved_files`**: Sets the Working Directory.
-* **`-v $(pwd)/netCDF_files:/mnt/data`**: The volume mount. This creates a bridge between your local computer and the container so the toolkit can read your input data and write the results back to your hard drive.
-* **`--entrypoint mpirun`**: Tells Docker to bypass the image's default entrypoint and boot up using OpenMPI's runner instead.
-* **`dc-toolkit`**: The name of the Docker image to run.
-* **`-n 8`**: Tells `mpirun` to spin up 8 parallel processes.
-* **`bash -c '...'`**: Executes a custom shell command across all 8 processes to handle the complex environment setup:
-  * **`HOME=/tmp/$OMPI_COMM_WORLD_RANK`**: Assigns a mathematically unique, temporary "Home" directory to each process. This completely eliminates race conditions where multiple processes try to write to the exact same  cache simultaneously.
-  * **`exec dc_toolkit evaluate_combos ...`**: Executes the actual compression tool, passing the paths (as they appear *inside* the container's `/mnt/data` mount) to the input NetCDF file and the designated output directory.
+* **`-v $(pwd)/netCDF_files:/mnt/data`**: Volume mount bridging local and container filesystems.
+* **`-e OMP_NUM_THREADS=1 ...`**: Pins codec-internal thread pools to 1 so they don't nest against the `ThreadPoolExecutor` inside the rank.
+* **`--entrypoint mpirun`**: Bypasses the default entrypoint to launch via OpenMPI.
+* **`dc-toolkit`**: The image name.
+* **`-n 1`**: One MPI rank per node; on a Docker container that's one rank total. Parallelism inside the rank comes from threads, not from multiple ranks.
+* **`bash -c '...'`**: Executes the dc_toolkit command:
+  * **`HOME=/tmp/$OMPI_COMM_WORLD_RANK`**: Assigns a unique `$HOME` per rank — harmless with `-n 1`, kept for parity with multi-rank launches.
+  * **`exec dc_toolkit evaluate_combos ... --where-to-write /mnt/data/docker_saved_files ...`**: Runs the sweep, writing all outputs into the mounted volume.
 
 ---
 
 #### Windows (PowerShell)
 
-When using Docker Desktop on Windows via WSL 2, Docker handles file permissions differently. You do not need to pass your user ID (as Docker Desktop handles the translation automatically), but you do need to explicitly allow OpenMPI to run as root and format your paths for PowerShell.
+When using Docker Desktop on Windows via WSL 2, Docker handles file permissions differently. You don't need to pass your user ID (Docker Desktop handles the translation automatically), but you do need to explicitly allow OpenMPI to run as root and format your paths for PowerShell.
 
 ```powershell
 docker run `
   -e HOME=/tmp `
+  -e OMP_NUM_THREADS=1 -e MKL_NUM_THREADS=1 -e OPENBLAS_NUM_THREADS=1 `
+  -e BLOSC_NTHREADS=1 -e NUMBA_NUM_THREADS=1 `
   -w /mnt/data/docker_saved_files `
   -v "${PWD}\netCDF_files:/mnt/data" `
   --entrypoint mpirun `
   dc-toolkit `
   --allow-run-as-root `
-  -n 8 `
-  bash -c "HOME=/tmp/`$OMPI_COMM_WORLD_RANK exec dc_toolkit evaluate_combos /mnt/data/tigge_pl_t_q_dx=2_2024_08_02.nc /mnt/data/docker_saved_files --field-to-compress t"
+  -n 1 `
+  bash -c "HOME=/tmp/`$OMPI_COMM_WORLD_RANK exec dc_toolkit evaluate_combos /mnt/data/tigge_pl_t_q_dx=2_2024_08_02.nc --where-to-write /mnt/data/docker_saved_files --field-to-compress t --eval-data-size-limit 5GB"
 ```
 
 **Command Breakdown:**
 
 * **`-e HOME=/tmp`**: Sets a base temporary home directory for the container environment.
-* **`-w /mnt/data/docker_saved_files`**: Sets the Working Directory inside the container so output files (like `config_space.csv`) drop exactly into your mounted folder.
-* **`-v "${PWD}\netCDF_files:/mnt/data"`**: The Windows equivalent of the volume mount. `${PWD}` dynamically grabs your current PowerShell directory to link your local files to the container.
+* **`-e OMP_NUM_THREADS=1 ...`**: Pins codec-internal thread pools to 1 (prevents nested oversubscription).
+* **`-w /mnt/data/docker_saved_files`**: Sets the Working Directory inside the container so output files (like `config_space_{var}.csv` and `results_{var}.parquet`) drop exactly into your mounted folder.
+* **`-v "${PWD}\netCDF_files:/mnt/data"`**: Windows equivalent of the volume mount. `${PWD}` dynamically grabs your current PowerShell directory to link your local files to the container.
 * **`--entrypoint mpirun`**: Bypasses the default container start command to run OpenMPI.
-* **`dc-toolkit`**: The name of the Docker image.
-* **`--allow-run-as-root`**: Because the container defaults to the `root` user on Windows, this flag is required to bypass OpenMPI's built-in safety restrictions against running parallel jobs as root.
-* **`-n 8`**: Tells `mpirun` to spin up 8 parallel processes.
-* **`bash -c "..."`**: Executes the parallel command. Notice that double-quotes are used here for PowerShell, with an escaped backtick (` `$ `) in front of the MPI variable to prevent PowerShell from prematurely evaluating it on your host machine before it reaches the container.
+* **`dc-toolkit`**: The image name.
+* **`--allow-run-as-root`**: The container defaults to `root` on Windows; this flag bypasses OpenMPI's built-in safety restrictions against running parallel jobs as root.
+* **`-n 1`**: One rank per node; on a Docker container that's one rank total.
+* **`bash -c "..."`**: Executes the parallel command. Note double-quotes for PowerShell, with an escaped backtick (` `$ `) in front of the MPI variable to prevent PowerShell from evaluating it on your host before it reaches the container.
 
 ## Slides
 

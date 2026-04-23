@@ -31,6 +31,7 @@ dependencies = [
     "h5netcdf",
     "plotly",
     "cfgrib",
+    "psutil",
     "numcodecs_wasm",
     "numcodecs_combinators",
     "numcodecs_observers",
