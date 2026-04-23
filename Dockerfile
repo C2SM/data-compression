@@ -25,7 +25,5 @@ ENV PATH="/opt/venv/bin:$PATH"
 
 RUN bash install_dc_toolkit.sh
 
-RUN pip install --force-reinstall "dask[complete]==2025.7.0" "numpy==2.2.6"
-
 ENTRYPOINT ["dc_toolkit"]
 CMD ["--help"]

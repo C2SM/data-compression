@@ -9,14 +9,15 @@ import math
 import os
 import sys
 import io
-import traceback
-import click
-from tqdm import tqdm
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-import math
-import zarr
-import shutil
 import itertools
+import subprocess
+import csv
+
+import click
+import zarr
 import numcodecs
 import numcodecs.zarr3
 import xarray as xr
@@ -25,30 +26,26 @@ from zarr_any_numcodecs import AnyNumcodecsArrayBytesCodec
 from ebcc.zarr_filter import EBCCZarrFilter
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
-from sklearn.cluster import KMeans
-from sklearn.metrics import silhouette_score
 from mpi4py import MPI
 import dask
 import dask.array
-import plotly.io as pio
-import plotly.express as px
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
-import subprocess
 import humanize
+
+# Heavyweight optional imports (matplotlib / sklearn / plotly / tqdm) are
+# deferred: they are only used by the clustering and plotting commands below
+# and are imported lazily inside each of those commands.  Keeping them out of
+# the module-level import list means `dc_toolkit evaluate_combos` and
+# `compress_with_optimal` don't pay the import cost, and environments without
+# (e.g.) a matplotlib install can still run the main sweep.
 
 import warnings
 warnings.filterwarnings(
     "ignore",
-    message="Numcodecs codecs are not in the Zarr version 3 specification and may not be supported by other zarr implementations",
+    message="Numcodecs codecs are not in the Zarr version 3 specification.*",
     category=UserWarning,
-    module="numcodecs.zarr3"
 )
 warnings.filterwarnings(
-    "ignore",
-    message="Engine 'cfgrib' loading failed",
-    category=RuntimeWarning,
+    "ignore", message="Engine 'cfgrib' loading failed", category=RuntimeWarning,
 )
 warnings.filterwarnings("ignore", message="overflow encountered in square")
 
@@ -58,198 +55,552 @@ def cli():
     pass
 
 
+# =============================================================================
+# Helpers specific to this CLI
+# =============================================================================
+
+def _size_option_callback(ctx, param, value):
+    if value is None:
+        return None
+    try:
+        return utils.parse_size(value)
+    except Exception as e:
+        raise click.BadParameter(f"Invalid size '{value}': {e}")
+
+
+def _is_ebcc_serializer(serializer) -> bool:
+    return (
+        isinstance(serializer, AnyNumcodecsArrayBytesCodec)
+        and isinstance(serializer.codec, EBCCZarrFilter)
+    )
+
+
+def _is_zfpy_serializer(serializer) -> bool:
+    return isinstance(serializer, numcodecs.zarr3.ZFPY)
+
+
+def _merged_store_path(where_to_write: str, dataset_file: str) -> str:
+    """One .zarr store per dataset; fields live as arrays inside.
+
+    Uses Path.stem so `foo.nc` -> `foo.zarr` (not `foo.nc.zarr`).  The store
+    name is derived only from the input filename, not its directory.
+    """
+    dataset_stem = Path(dataset_file).stem
+    return str(Path(where_to_write) / f"{dataset_stem}.zarr")
+
+
 @cli.command("evaluate_combos")
 @click.argument("dataset_file", type=click.Path(exists=True, dir_okay=True, file_okay=True))
-@click.argument("where_to_write", type=click.Path(dir_okay=True, file_okay=False, exists=False))
-@click.option("--field-to-compress", default=None, help="Field to compress [if not given, all fields will be compressed].")
-@click.option("--field-percentage-to-compress", default=None, callback=utils.validate_percentage, help="Compress a percentage of the field [1-99%]. If not given, the whole field will be compressed.")
-@click.option("--override-existing-l1-error", type=float, default=None, help="Override the existing L1 error threshold from the lookup table. If provided, this value will be used instead of the spreadsheet value.")
-@click.option("--compressor-class", default="all", help="Compressor class to use (case insensitive), i.e. specified one instead of the full list `all` [`none` skips all compressors].")
-@click.option("--filter-class", default="all", help="Filter class to use (case insensitive), i.e. specified one instead of the full list `all` [`none` skips all filters].")
-@click.option("--serializer-class", default="all", help="Serializer class to use (case insensitive), i.e. specified one instead of the full list `all` [`none` skips all serializers].")
-@click.option("--with-lossy/--without-lossy", default=True, show_default=True, help="Enable or disable lossy compressors/filters/serializers.")
-@click.option("--with-numcodecs-wasm/--without-numcodecs-wasm", default=True, show_default=True, help="Enable or disable Numcodecs-wasm codecs.")
-@click.option("--with-ebcc/--without-ebcc", default=True, show_default=True, help="Enable or disable EBCC serializer.")
-def evaluate_combos(dataset_file: str, where_to_write: str, 
-                    field_to_compress: str | None = None, field_percentage_to_compress: str | None = None, override_existing_l1_error: float | None = None,
-                    compressor_class: str = "all", filter_class: str = "all", serializer_class: str = "all",
-                    with_lossy: bool = True, with_numcodecs_wasm: bool = True, with_ebcc: bool = True):
+@click.option("--where-to-write", "where_to_write", required=True,
+              type=click.Path(dir_okay=True, file_okay=False, exists=False),
+              help="Directory where sweep outputs are written: per-var config "
+                   "space CSV, per-rank streaming partials, consolidated "
+                   "`results_{var}.parquet`, and the legacy scored-results "
+                   "`.npy`.  The directory is created if it doesn't exist.")
+@click.option("--field-to-compress", default=None,
+              help="Field to compress [if not given, all fields will be evaluated].")
+@click.option("--eval-data-size-limit", default="5GB", callback=_size_option_callback,
+              show_default=True,
+              help="Representative-sample size budget (e.g. '5GB', '512MiB'). "
+                   "If the field fits under this, the full field is used; otherwise "
+                   "a strided subsample along the leading dim is used.  "
+                   "The same sample is used to compute data-derived codec parameters "
+                   "(Asinh.linear_width, FixedOffsetScale.offset/scale, etc.), so "
+                   "`compress_with_optimal` must be invoked with the same value for "
+                   "codec-space indices to resolve to identical codec objects.")
+@click.option("--threads-per-rank", type=int, default=None,
+              help="Threads per MPI rank.  Default: auto-detected from cores/rank.")
+@click.option("--inner-chunk-mib", type=int, default=16, show_default=True,
+              help="Target size of a zarr chunk (in MiB) during in-memory evaluation. "
+                   "For the measured compression ratio to reflect production conditions, "
+                   "pass the same value to compress_with_optimal.")
+@click.option("--oversubscription-check/--no-oversubscription-check", default=True,
+              show_default=True,
+              help="At startup, warn/abort if OMP/BLOSC/MKL thread vars aren't pinned to 1.")
+@click.option("--override-existing-l1-error", type=float, default=None,
+              help="Override the existing L1 error threshold from the lookup table.")
+@click.option("--compressor-class", default="all",
+              help="Compressor class (case-insensitive) or 'none' to skip.")
+@click.option("--filter-class", default="all",
+              help="Filter class (case-insensitive) or 'none' to skip.")
+@click.option("--serializer-class", default="all",
+              help="Serializer class (case-insensitive) or 'none' to skip.")
+@click.option("--with-lossy/--without-lossy", default=True, show_default=True)
+@click.option("--with-numcodecs-wasm/--without-numcodecs-wasm", default=True, show_default=True)
+@click.option("--with-ebcc/--without-ebcc", default=True, show_default=True)
+def evaluate_combos(dataset_file,
+                    where_to_write,
+                    field_to_compress, eval_data_size_limit,
+                    threads_per_rank, inner_chunk_mib,
+                    oversubscription_check,
+                    override_existing_l1_error,
+                    compressor_class, filter_class, serializer_class,
+                    with_lossy, with_numcodecs_wasm, with_ebcc):
     """
-    Loop over combinations of compressors, filters, and serializers to find the optimal configuration for compressing a given field in a dataset file.
+    Sweep compressor x filter x serializer combinations on a representative
+    sample of the field to find the best configuration.
 
-    List of compressors : Blosc, LZ4, Zstd, Zlib, GZip, BZ2, LZMA \n
-    List of filters     : Delta, BitRound, Quantize, Asinh, FixedOffsetScale \n
-    List of serializers : PCodec, ZFPY, EBCCZarrFilter, Zfp
+    Parallelism
+    -----------
+    - MPI ranks partition the config space (config_space[rank::size]).
+    - Within each rank, a ThreadPoolExecutor runs N configs concurrently.
+    - Recommended launch:
+        mpirun -n <NODES> --ntasks-per-node=1 dc_toolkit evaluate_combos ...
+      (or srun --nodes=<N> --ntasks-per-node=1 ... on Slurm).
+    - 1 MPI rank per node is REQUIRED.  Multi-rank-per-node launches are
+      rejected at startup; within-node parallelism is provided by threads,
+      not MPI.
+    - Cores-per-rank is auto-detected via sched_getaffinity; override with
+      --threads-per-rank.
 
-    \b
-    Args:
-        dataset_file (str): Path to the input dataset file.
-        where_to_write (str): Directory where the output files will be written.
-        field_to_compress: --field-to-compress
-        field_percentage_to_compress: --field-percentage-to-compress
-        override_existing_l1_error: --override-existing-l1-error
-        compressor_class: --compressor-class
-        filter_class: --filter-class
-        serializer_class: --serializer-class
-        with_lossy: --with-lossy/--without-lossy
-        with_numcodecs_wasm: --with-numcodecs-wasm/--without-numcodecs-wasm
-        with_ebcc: --with-ebcc/--without-ebcc
+    The evaluation runs entirely in memory (MemoryStore) - no disk I/O per
+    combo.  Use `compress_with_optimal` afterwards to materialise the winner
+    against the full field.
     """
-    dask.config.set(scheduler="single-threaded")
-    dask.config.set(array__chunk_size="512MiB")
+    # -------------------------------------------------------------------------
+    # Topology + dask config
+    # -------------------------------------------------------------------------
     comm = MPI.COMM_WORLD
     rank = comm.Get_rank()
     size = comm.Get_size()
 
-    os.makedirs(where_to_write, exist_ok=True) 
+    node_comm, ranks_on_node, local_rank = utils.detect_node_topology(comm)
 
+    # ---- Enforce 1 MPI rank per node --------------------------------------
+    # The refactor is designed around shared-memory threading within the node.
+    # Multi-rank-per-node launches are silently wasteful (sample duplication,
+    # redundant MPI broadcasts) so we reject them outright.
+    if ranks_on_node > 1:
+        if rank == 0:
+            click.echo(
+                f"[topology] ERROR: detected {ranks_on_node} MPI rank(s) per node.\n"
+                f"  This toolkit requires exactly 1 rank per node; within-node\n"
+                f"  parallelism is provided by threads, not MPI.\n"
+                f"  Relaunch with:\n"
+                f"    mpirun -n <NODES> --ntasks-per-node=1 dc_toolkit evaluate_combos ...\n"
+                f"  (or on Slurm:\n"
+                f"    srun --nodes=<N> --ntasks-per-node=1 dc_toolkit evaluate_combos ...)"
+            )
+        comm.Abort(1)
+
+    cores_avail = utils.detect_cores_available()
+    if threads_per_rank is None:
+        threads_per_rank = utils.compute_default_threads_per_rank(ranks_on_node, cores_avail)
+
+    utils.check_thread_oversubscription(
+        abort_if_unsafe=oversubscription_check, rank=rank,
+    )
+
+    # Create the output directory once on rank 0, then barrier so all ranks
+    # see it before anyone tries to write into it.  `exist_ok=True` so repeat
+    # runs don't fail; the barrier avoids a rank-1..N race against rank 0 on
+    # filesystems that don't handle concurrent creation gracefully (certain
+    # Lustre / NFS configurations).
     if rank == 0:
-        try:
-            # Lookup table for valid thresholds
-            # https://docs.google.com/spreadsheets/d/1lHcX-HE2WpVCOeKyDvM4iFqjlWvkd14lJlA-CUoCxMM
-            sheet_id = "1lHcX-HE2WpVCOeKyDvM4iFqjlWvkd14lJlA-CUoCxMM"
-            sheet_url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv"
-            thresholds = pd.read_csv(sheet_url)
-        except Exception as e:
-            print(f"[Rank 0] Failed to fetch thresholds: {e}")
-            sys.exit(1)
-        # Convert DataFrame to bytes for broadcasting
-        buffer = io.BytesIO()
-        thresholds.to_parquet(buffer, index=False)
-        data_bytes = buffer.getvalue()
-    else:
-        data_bytes = None
+        os.makedirs(where_to_write, exist_ok=True)
+    comm.Barrier()
 
-    data_bytes = comm.bcast(data_bytes, root=0)
+    # `array.chunk-size` must be set BEFORE any xarray open() that uses
+    # `chunks="auto"` for the setting to be honored by the dask graph builder.
+    # The threaded dask scheduler is used for the sample read and codec-space
+    # construction below (both go through dask.compute).  We switch to the
+    # synchronous scheduler right before the ThreadPoolExecutor (nested
+    # `with` inside the sweep) so the per-combo threads do not nest thread
+    # pools.
+    #
+    # Wrapping in `with` scopes these settings to evaluate_combos; they
+    # revert on function exit instead of leaking into the parent process.
+    # Matters for notebook/compose use; no-op for single-command CLI runs.
+    with dask.config.set({
+        "array.chunk-size": "512MiB",
+        "scheduler": "threads",
+        "num_workers": threads_per_rank,
+    }):
 
-    if rank != 0:
-        buffer = io.BytesIO(data_bytes)
-        thresholds = pd.read_parquet(buffer)
+        # Topology banner is printed later, after the config_space is built, so we
+        # can report the EFFECTIVE parallelism (min(size*threads, num_loops))
+        # rather than an overstated theoretical peak.
 
-    # This is opened by all MPI processes -lazy evaluation with Dask backend-
-    ds = utils.open_dataset(dataset_file, field_to_compress, field_percentage_to_compress, rank=rank)
-
-    for var in ds.data_vars:
-        if field_to_compress is not None and field_to_compress != var:
-            continue
-        da = ds[var]
-
+        # -------------------------------------------------------------------------
+        # Fetch threshold table (rank 0) and broadcast
+        #
+        # Skipped entirely when the user has supplied --override-existing-l1-error,
+        # because we'd never read from the table in that case.  Avoids the slow,
+        # network-dependent Google Sheets call for offline/CI runs.
+        # -------------------------------------------------------------------------
+        thresholds = None
         if override_existing_l1_error is None:
-            lookup = var
-            threshold_row = thresholds[thresholds["Short Name"] == lookup]
-            matching_units = threshold_row.iloc[0]["Unit"] == da.attrs.get("units", None) if not threshold_row.empty else None
-            existing_l1_error = threshold_row.iloc[0]["Existing L1 error"] if not threshold_row.empty and matching_units else None
-            existing_l1_error = float(existing_l1_error.replace(",", ".")) if existing_l1_error else None
-        else:
-            existing_l1_error = override_existing_l1_error
+            if rank == 0:
+                try:
+                    sheet_id = "1lHcX-HE2WpVCOeKyDvM4iFqjlWvkd14lJlA-CUoCxMM"
+                    sheet_url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv"
+                    thresholds = pd.read_csv(sheet_url)
+                except Exception as e:
+                    print(f"[Rank 0] Failed to fetch thresholds: {e}")
+                    comm.Abort(1)
+                buffer = io.BytesIO()
+                thresholds.to_parquet(buffer, index=False)
+                data_bytes = buffer.getvalue()
+            else:
+                data_bytes = None
 
-        if rank == 0:
-            click.echo(f"Processing variable: {var} (Units: {da.attrs.get('units', 'N/A')}, Existing L1 Error: {existing_l1_error})")
+            data_bytes = comm.bcast(data_bytes, root=0)
+            if rank != 0:
+                thresholds = pd.read_parquet(io.BytesIO(data_bytes))
 
-        if field_percentage_to_compress is not None:
-            field_percentage_to_compress = float(field_percentage_to_compress)
-            slices = {dim: slice(0, max(1, int(size * (field_percentage_to_compress / 100)))) for dim, size in da.sizes.items()}
-            da = da.isel(**slices)
+        # -------------------------------------------------------------------------
+        # Open dataset (lazy; shared by all ranks; each rank gets its own handle)
+        # -------------------------------------------------------------------------
+        ds = utils.open_dataset(dataset_file, field_to_compress, rank=rank)
 
-        compressors = utils.compressor_space(da, with_lossy, with_numcodecs_wasm, with_ebcc, compressor_class)
-        filters = utils.filter_space(da, with_lossy, with_numcodecs_wasm, with_ebcc, filter_class)
-        serializers = utils.serializer_space(da, with_lossy, with_numcodecs_wasm, with_ebcc, serializer_class)
+        # -------------------------------------------------------------------------
+        # Per-variable loop
+        # -------------------------------------------------------------------------
+        for var in ds.data_vars:
+            if field_to_compress is not None and field_to_compress != var:
+                continue
+            da = ds[var]
 
-        num_compressors = len(compressors)
-        num_filters = len(filters)
-        num_serializers = len(serializers)
+            if override_existing_l1_error is None:
+                threshold_row = thresholds[thresholds["Short Name"] == var]
+                matching_units = (
+                    threshold_row.iloc[0]["Unit"] == da.attrs.get("units", None)
+                    if not threshold_row.empty else None
+                )
+                raw_threshold = (
+                    threshold_row.iloc[0]["Existing L1 error"]
+                    if not threshold_row.empty and matching_units else None
+                )
+                if raw_threshold is None or (isinstance(raw_threshold, float) and math.isnan(raw_threshold)):
+                    existing_l1_error = None
+                elif isinstance(raw_threshold, str):
+                    existing_l1_error = float(raw_threshold.replace(",", "."))
+                else:
+                    existing_l1_error = float(raw_threshold)
+            else:
+                existing_l1_error = override_existing_l1_error
 
-        num_loops = num_compressors * num_filters * num_serializers
-        if rank == 0:
-            click.echo(f"Number of loops: {num_loops} ({num_compressors} compressors, {num_filters} filters, {num_serializers} serializers) -divided across {size} MPI task(s)-")
-
-        config_space = list(itertools.product(compressors, filters, serializers))
-        configs_for_rank = config_space[rank::size]
-
-        results = []
-        raw_values_explicit_with_names = []
-        total_configs = len(configs_for_rank)
-        if rank == 0:
-            pd.DataFrame(config_space).to_csv("config_space.csv", index=False)
-        for i, ((comp_idx, compressor), (filt_idx, filt), (ser_idx, serializer)) in enumerate(configs_for_rank):
-            data_to_compress = da
-            if isinstance(serializer, numcodecs.zarr3.ZFPY):
-                data_to_compress = da.stack(flat_dim=da.dims)
-            if isinstance(serializer, AnyNumcodecsArrayBytesCodec) and isinstance(serializer.codec, EBCCZarrFilter):
-                data_to_compress = da.squeeze().astype("float32")
-
-            filters_ = [filt,]
-            compressors_ = [compressor,]
-            serializer_ = serializer
-            
-            if isinstance(serializer_, AnyNumcodecsArrayBytesCodec) or filt is None:
-                filters_ = None  # TODO: fix (?) filter stacking with EBCC & numcodecs-wasm serializers
-                filt = None
-                filt_idx = -1
-            if compressor is None:
-                compressors_ = None
-                comp_idx = -1
-            if serializer is None:
-                serializer_ = "auto"
-                ser_idx = -1
-
-            try:
-                compression_ratio, errors, euclidean_distance = utils.compress_with_zarr(
-                    data_to_compress,
-                    dataset_file,
-                    var,
-                    where_to_write,
-                    filters=filters_,
-                    compressors=compressors_,
-                    serializer=serializer_,
-                    verbose=False,
-                    rank=rank,
+            if rank == 0:
+                click.echo(
+                    f"[var] {var} | units={da.attrs.get('units', 'N/A')} | "
+                    f"Existing L1 error={existing_l1_error}"
                 )
 
-                l1_error_rel = errors["Relative_Error_L1"]
-                l2_error_rel = errors["Relative_Error_L2"]
-                linf_error_rel = errors["Relative_Error_Linf"]
+            # -------------------------------------------------------------------------
+            # Build representative sample ONCE on rank 0, broadcast to others.
+            # -------------------------------------------------------------------------
+            if rank == 0:
+                sample_da_local = utils.build_representative_sample(
+                    da, eval_data_size_limit, rank=rank,
+                )
+                # .compute() forces the dask read; we want the buffer, not a lazy handle.
+                sample_da_local = sample_da_local.compute()
+                sample_np_local = np.ascontiguousarray(sample_da_local.values)
+                sample_meta = {
+                    "dims": tuple(sample_da_local.dims),
+                    "attrs": dict(sample_da_local.attrs),
+                    "name":  sample_da_local.name,
+                }
+            else:
+                sample_np_local = None
+                sample_meta = None
 
-                # TODO: refine criteria based on the thresholds table
-                if existing_l1_error:
-                    if l1_error_rel <= existing_l1_error:
-                        results.append(((str(compressor), str(filt), str(serializer), comp_idx, filt_idx, ser_idx), compression_ratio, l1_error_rel, euclidean_distance))
-                        raw_values_explicit_with_names.append((compression_ratio, l1_error_rel, l2_error_rel, linf_error_rel, euclidean_distance, str(compressor), str(filt), str(serializer)))
-                else:
-                    results.append(((str(compressor), str(filt), str(serializer), comp_idx, filt_idx, ser_idx), compression_ratio, l1_error_rel, euclidean_distance))
-                    raw_values_explicit_with_names.append((compression_ratio, l1_error_rel, l2_error_rel, linf_error_rel, euclidean_distance, str(compressor), str(filt), str(serializer)))
+            # Bcast the numpy buffer via MPI's buffer protocol.  bcast() the small
+            # metadata dict via pickle (dims + attrs are tiny).
+            sample_np  = utils.broadcast_numpy(sample_np_local, comm=comm, root=0)
+            sample_meta = comm.bcast(sample_meta, root=0)
 
-            except:
-                click.echo(f"Failed to compress with {compressor}, {filt}, {serializer} [Indices: {comp_idx}, {filt_idx}, {ser_idx}]")
-                traceback.print_exc(file=sys.stderr)
-                sys.exit(1)
-
-            utils.progress_bar(i, total_configs, print_every=100)
-
-        results_gather = comm.gather(results, root=0)
-        raw_values_explicit_with_names_gather = comm.gather(raw_values_explicit_with_names, root=0)
-
-        if rank == 0:
-            click.echo("Compressors analysis completed. Writing files...")
-            # Flatten list of lists
-            results_gather = list(itertools.chain.from_iterable(results_gather))
-            raw_values_explicit_with_names_gather = list(itertools.chain.from_iterable(raw_values_explicit_with_names_gather))
-
-            # Needed for clustering
-            lossy_option = "with-lossy" if with_lossy else "without-lossy"
-            numcodecs_wasm_option = "with-numcodecs-wasm" if with_numcodecs_wasm else "without-numcodecs-wasm"
-            ebcc_option = "with-ebcc" if with_ebcc else "without-ebcc"
-            score_results_file_name = [field_to_compress, compressor_class, filter_class, serializer_class, lossy_option, numcodecs_wasm_option, ebcc_option]
-            np.save(os.path.basename(dataset_file) + '_' + '_'.join(score_results_file_name) + '_scored_results_with_names.npy', np.asarray(pd.DataFrame(raw_values_explicit_with_names_gather)))
-            best_combo = max(results_gather, key=lambda x: x[1])
-            msg = (
-                "optimal combo: \n"
-                f"compressor : {best_combo[0][0]}\nfilter     : {best_combo[0][1]}\nserializer : {best_combo[0][2]}\n"
-                "corresponding indices in lists of instantiated objects:\n"
-                f"compressor : {best_combo[0][3]}\nfilter     : {best_combo[0][4]}\nserializer : {best_combo[0][5]}\n"
-                f"Compression Ratio: {best_combo[1]:.3f} | Relative L1 Error: {best_combo[2]:.3e} | Euclidean Distance: {best_combo[3]:.3e}"
+            # Reconstruct a DataArray view around the broadcast buffer.  The codec-
+            # space builders only use .dims / .shape / .values and basic arithmetic,
+            # so a thin wrapper without xarray coords is sufficient and avoids a
+            # second compute() on non-root ranks.
+            sample_da = xr.DataArray(
+                sample_np,
+                dims=sample_meta["dims"],
+                attrs=sample_meta["attrs"],
+                name=sample_meta["name"],
             )
-            click.echo(msg)
+
+            # -------------------------------------------------------------------------
+            # Build codec spaces from the SAMPLE (deterministic; compress_with_optimal
+            # must use the same --eval-data-size-limit to reproduce these objects).
+            # -------------------------------------------------------------------------
+            compressors = utils.compressor_space(sample_da, with_lossy, with_numcodecs_wasm,
+                                                 with_ebcc, compressor_class)
+            filters     = utils.filter_space(sample_da, with_lossy, with_numcodecs_wasm,
+                                             with_ebcc, filter_class)
+            serializers = utils.serializer_space(sample_da, with_lossy, with_numcodecs_wasm,
+                                                 with_ebcc, serializer_class)
+
+            num_loops = len(compressors) * len(filters) * len(serializers)
+            config_space = list(itertools.product(compressors, filters, serializers))
+            configs_for_rank = config_space[rank::size]
+
+            if rank == 0:
+                # Honest topology banner: if the sweep is smaller than the theoretical
+                # peak parallelism, say so rather than overstating.
+                theoretical_peak = size * threads_per_rank
+                effective = min(theoretical_peak, num_loops)
+                trailer = ""
+                if effective < theoretical_peak:
+                    trailer = (
+                        f" (only {effective} will run concurrently; "
+                        f"{num_loops} combos total)"
+                    )
+                click.echo(
+                    f"[topology] {size} node(s) | {cores_avail} core(s)/node | "
+                    f"{threads_per_rank} thread(s)/node -> peak {theoretical_peak} "
+                    f"parallel evaluations{trailer}."
+                )
+                click.echo(
+                    f"[sweep] {num_loops} combos "
+                    f"({len(compressors)} x {len(filters)} x {len(serializers)}) "
+                    f"split across {size} rank(s); ~{len(configs_for_rank)} per rank, "
+                    f"running {threads_per_rank}-wide."
+                )
+                pd.DataFrame(config_space).to_csv(
+                    os.path.join(where_to_write, f"config_space_{var}.csv"),
+                    index=False,
+                )
+
+            # -------------------------------------------------------------------------
+            # Pre-materialise a float32 view of the sample IF any EBCC combo is present
+            # and the dtype isn't already float32 (avoids per-thread float32 allocations).
+            # -------------------------------------------------------------------------
+            sample_np_ebcc = None
+            any_ebcc_local = any(
+                _is_ebcc_serializer(ser) for (_, ser) in serializers
+            )
+            if any_ebcc_local and sample_np.dtype != np.float32:
+                sample_np_ebcc = np.ascontiguousarray(
+                    np.squeeze(sample_np).astype(np.float32, copy=True)
+                )
+            elif any_ebcc_local:
+                sample_np_ebcc = np.ascontiguousarray(np.squeeze(sample_np))
+
+            # -------------------------------------------------------------------------
+            # Per-combo evaluator (runs inside a thread)
+            # -------------------------------------------------------------------------
+            def _evaluate_one(cfg):
+                (comp_idx, compressor), (filt_idx, filt), (ser_idx, serializer) = cfg
+
+                # Prep data + dims for this serializer's expectations
+                if _is_zfpy_serializer(serializer):
+                    data_np = sample_np.reshape(-1)  # flat view; no copy
+                    dims = ("flat_dim",)
+                elif _is_ebcc_serializer(serializer):
+                    data_np = sample_np_ebcc        # shared across threads
+                    dims = tuple(d for d, s in zip(sample_da.dims, sample_da.shape) if s > 1)
+                    if not dims:
+                        dims = sample_da.dims
+                else:
+                    data_np = sample_np
+                    dims = sample_da.dims
+
+                # Pipeline assembly rules (match original semantics)
+                filters_ = [filt]
+                compressors_ = [compressor]
+                serializer_ = serializer
+                local_filt_idx = filt_idx
+                local_comp_idx = comp_idx
+                local_ser_idx = ser_idx
+
+                if isinstance(serializer_, AnyNumcodecsArrayBytesCodec) or filt is None:
+                    filters_ = None
+                    filt = None
+                    local_filt_idx = -1
+                if compressor is None:
+                    compressors_ = None
+                    local_comp_idx = -1
+                if serializer is None:
+                    serializer_ = "auto"
+                    local_ser_idx = -1
+
+                # Chunks for the eval memory store (configurable via --inner-chunk-mib)
+                eval_chunks = utils.compute_chunk_shape_for_eval(
+                    data_np.shape, data_np.dtype, target_mib=inner_chunk_mib,
+                )
+
+                ratio, errors, eucd = utils.evaluate_codec_pipeline(
+                    data_np, dims,
+                    filters=filters_, compressors=compressors_, serializer=serializer_,
+                    chunks=eval_chunks,
+                )
+
+                return {
+                    "comp_idx":   local_comp_idx,
+                    "filt_idx":   local_filt_idx,
+                    "ser_idx":    local_ser_idx,
+                    "compressor": str(compressor),
+                    "filter":     str(filt),
+                    "serializer": str(serializer),
+                    "ratio":      float(ratio),
+                    "errors":     errors,
+                    "eucd":       float(eucd),
+                }
+
+            # -------------------------------------------------------------------------
+            # Thread pool: submit all combos for this rank, collect as they complete
+            # -------------------------------------------------------------------------
+            results = []
+            raw_values_explicit_with_names = []
+            failures = []
+
+            total_local = len(configs_for_rank)
+
+            partial_csv_path = os.path.join(
+                where_to_write, f"config_space_{var}_rank{rank}.csv"
+            )
+            # Streaming per-rank audit trail.  One row per
+            # successful combo evaluation (passing or filtered-out,
+            # distinguished by the `keep` column).  Failures stay in the
+            # `failures` list and are aggregated via `comm.reduce` below.
+            # The CSV is opened here and closed at the end of this block
+            # (before `comm.gather`) so rank 0 can concat every per-rank
+            # CSV into results_{var}.parquet with a clean read.
+            with open(partial_csv_path, "w", newline="") as partial_csv_file:
+                partial_csv_writer = csv.writer(partial_csv_file)
+                partial_csv_writer.writerow([
+                    "compressor", "filter", "serializer",
+                    "comp_idx", "filt_idx", "ser_idx",
+                    "ratio", "l1_rel", "l2_rel", "linf_rel", "eucd",
+                    "keep",
+                ])
+                # From here on, per-combo threads provide parallelism.  Dask runs
+                # serially inside each thread to avoid nested thread pools.  The
+                # synchronous-scheduler setting is scoped with `with dask.config.set`
+                # so it reverts automatically when we leave the sweep block - it
+                # wouldn't leak in the CLI flow (one process per command), but this
+                # keeps evaluate_combos safe to import into notebooks or compose in
+                # longer-lived processes.
+                with dask.config.set(scheduler="synchronous"):
+                    with ThreadPoolExecutor(max_workers=threads_per_rank) as pool:
+                        future_to_cfg = {pool.submit(_evaluate_one, cfg): cfg for cfg in configs_for_rank}
+                        for fut in as_completed(future_to_cfg):
+                            cfg = future_to_cfg[fut]
+                            try:
+                                r = fut.result()
+                            except Exception as e:
+                                # Never crash the sweep on a single combo failure.
+                                (_, compressor), (_, filt), (_, serializer) = cfg
+                                failures.append((str(compressor), str(filt), str(serializer), repr(e)))
+                                utils.progress_bar(total_local, print_every=100, key=str(var))
+                                continue
+
+                            l1_rel   = r["errors"]["Relative_Error_L1"]
+                            l2_rel   = r["errors"]["Relative_Error_L2"]
+                            linf_rel = r["errors"]["Relative_Error_Linf"]
+
+                            keep = True
+                            if existing_l1_error is not None:
+                                keep = (l1_rel <= existing_l1_error)
+
+                            # Per-rank streaming audit row (item 13).  Written for every
+                            # successful evaluation, including filtered-out ones (the
+                            # `keep` column distinguishes).  flush() after each row so a
+                            # mid-sweep crash still leaves a usable audit trail on disk.
+                            partial_csv_writer.writerow([
+                                r["compressor"], r["filter"], r["serializer"],
+                                r["comp_idx"], r["filt_idx"], r["ser_idx"],
+                                r["ratio"], l1_rel, l2_rel, linf_rel, r["eucd"],
+                                keep,
+                            ])
+                            partial_csv_file.flush()
+
+                            if keep:
+                                results.append((
+                                    (r["compressor"], r["filter"], r["serializer"],
+                                     r["comp_idx"], r["filt_idx"], r["ser_idx"]),
+                                    r["ratio"], l1_rel, r["eucd"],
+                                ))
+                                raw_values_explicit_with_names.append((
+                                    r["ratio"], l1_rel, l2_rel, linf_rel, r["eucd"],
+                                    r["compressor"], r["filter"], r["serializer"],
+                                ))
+
+                            utils.progress_bar(total_local, print_every=100, key=str(var))
+
+            # Aggregate failure counts collectively so rank-1..N failures aren't
+            # silent.  Detailed tracebacks still only come from rank 0 (printing
+            # from all ranks would be noisy), but the total tells you if other
+            # ranks had trouble.
+            total_failures = comm.reduce(len(failures), op=MPI.SUM, root=0)
+
+            if rank == 0 and total_failures and total_failures > 0:
+                click.echo(
+                    f"[warning] {total_failures} combo(s) failed total across "
+                    f"{size} rank(s) ({len(failures)} on rank 0):"
+                )
+                for compressor, filt, serializer, err in failures[:10]:
+                    click.echo(f"  - {compressor} | {filt} | {serializer}: {err}")
+                if len(failures) > 10:
+                    click.echo(f"  ... and {len(failures) - 10} more on rank 0.")
+
+            # -------------------------------------------------------------------------
+            # Gather + best-combo selection (rank 0)
+            # -------------------------------------------------------------------------
+            results_gather = comm.gather(results, root=0)
+            raw_gather     = comm.gather(raw_values_explicit_with_names, root=0)
+
+            if rank == 0:
+                click.echo("[sweep] complete. Writing results...")
+                results_gather = list(itertools.chain.from_iterable(results_gather))
+                raw_gather     = list(itertools.chain.from_iterable(raw_gather))
+
+                lossy_option          = "with-lossy" if with_lossy else "without-lossy"
+                numcodecs_wasm_option = "with-numcodecs-wasm" if with_numcodecs_wasm else "without-numcodecs-wasm"
+                ebcc_option           = "with-ebcc" if with_ebcc else "without-ebcc"
+                # `var` is used unconditionally here (was `field_to_compress or "all"`)
+                # so that when the caller omits --field-to-compress and we iterate
+                # over every data_var, each iteration produces a distinct filename.
+                score_tag = [
+                    var,
+                    compressor_class, filter_class, serializer_class,
+                    lossy_option, numcodecs_wasm_option, ebcc_option,
+                ]
+                npy_path = os.path.join(
+                    where_to_write,
+                    os.path.basename(dataset_file) + "_" + "_".join(score_tag)
+                    + "_scored_results_with_names.npy",
+                )
+                np.save(npy_path, np.asarray(pd.DataFrame(raw_gather)))
+
+                # Consolidate per-rank streaming CSVs into one parquet
+                partial_paths = sorted(
+                    Path(where_to_write).glob(f"config_space_{var}_rank*.csv")
+                )
+                if partial_paths:
+                    consolidated = pd.concat(
+                        [pd.read_csv(p) for p in partial_paths],
+                        ignore_index=True,
+                    )
+                    parquet_path = os.path.join(
+                        where_to_write, f"results_{var}.parquet"
+                    )
+                    consolidated.to_parquet(parquet_path, index=False)
+                    click.echo(
+                        f"[sweep] consolidated {len(partial_paths)} per-rank "
+                        f"CSV(s) -> {parquet_path} "
+                        f"({len(consolidated)} row(s))."
+                    )
+
+                if results_gather:
+                    best = max(results_gather, key=lambda x: x[1])
+                    click.echo(
+                        "optimal combo:\n"
+                        f"compressor : {best[0][0]}\n"
+                        f"filter     : {best[0][1]}\n"
+                        f"serializer : {best[0][2]}\n"
+                        "corresponding indices in lists of instantiated objects:\n"
+                        f"compressor : {best[0][3]}\n"
+                        f"filter     : {best[0][4]}\n"
+                        f"serializer : {best[0][5]}\n"
+                        f"Compression Ratio: {best[1]:.3f} | "
+                        f"Relative L1 Error: {best[2]:.3e} | "
+                        f"Euclidean Distance: {best[3]:.3e}"
+                    )
+                else:
+                    click.echo("[sweep] no combos passed the threshold filter.")
 
 
 @cli.command("compress_with_optimal")
@@ -259,230 +610,406 @@ def evaluate_combos(dataset_file: str, where_to_write: str,
 @click.argument("comp_idx", type=int)
 @click.argument("filt_idx", type=int)
 @click.argument("ser_idx", type=int)
-@click.option("--compressor-class", default="all", help="Same as in evaluate_combos.")
-@click.option("--filter-class", default="all", help="Same as in evaluate_combos.")
-@click.option("--serializer-class", default="all", help="Same as in evaluate_combos.")
-@click.option("--with-lossy/--without-lossy", default=True, show_default=True, help="Same as in evaluate_combos.")
-@click.option("--with-numcodecs-wasm/--without-numcodecs-wasm", default=True, show_default=True, help="Same as in evaluate_combos.")
-@click.option("--with-ebcc/--without-ebcc", default=True, show_default=True, help="Same as in evaluate_combos.")
-def compress_with_optimal(dataset_file, where_to_write, field_to_compress, 
-                          comp_idx, filt_idx, ser_idx, 
-                          compressor_class: str = "all", filter_class: str = "all", serializer_class: str = "all",
-                          with_lossy: bool = True, with_numcodecs_wasm: bool = True, with_ebcc: bool = True):
+@click.option("--eval-data-size-limit", default="5GB", callback=_size_option_callback,
+              show_default=True,
+              help="Size budget for the sample used to build the codec space "
+                   "(i.e. to compute data-derived codec parameters such as "
+                   "Asinh.linear_width, FixedOffsetScale.offset/scale, and EBCC "
+                   "chunk geometry).  The FULL FIELD is always compressed - this "
+                   "flag does NOT control what gets written.  "
+                   "Must match the value used in evaluate_combos so the codec-space "
+                   "indices (comp_idx, filt_idx, ser_idx) resolve to identical codec "
+                   "objects.")
+@click.option("--inner-chunk-mib", type=int, default=16, show_default=True,
+              help="Target size of a zarr inner chunk, in MiB. "
+                   "For the measured compression ratio in evaluate_combos to reflect "
+                   "production conditions, pass the same value here.")
+@click.option("--shard-mib", type=int, default=512, show_default=True,
+              help="Target shard size in MiB. Each shard contains an integer "
+                   "number of inner chunks.")
+@click.option("--threads", type=int, default=None,
+              help="Number of dask workers used for the parallel write. "
+                   "Default: auto-detected from visible cores. "
+                   "Peak memory use during the write is roughly threads * shard_mib.")
+@click.option("--oversubscription-check/--no-oversubscription-check", default=True,
+              show_default=True,
+              help="At startup, warn/abort if OMP/BLOSC/MKL thread vars aren't pinned to 1.")
+@click.option("--verify/--no-verify", default=True, show_default=True,
+              help="After the write finishes, re-read the persisted store and "
+                   "recompute the relative L1/L2/Linf error norms and Euclidean "
+                   "distance against the in-memory original.  On by default as a "
+                   "safety net (catches silent codec bugs and I/O corruption).  "
+                   "Cost: a full second pass of the dataset through the reader, "
+                   "which roughly doubles the wall time of compress_with_optimal. "
+                   "Pass --no-verify for routine production runs where the "
+                   "(compressor, filter, serializer) combo is already trusted - "
+                   "e.g. re-compressing sibling fields with a combo vetted on a "
+                   "prior run - and re-reading the shared Zarr store is the "
+                   "bottleneck.")
+@click.option("--compressor-class", default="all")
+@click.option("--filter-class", default="all")
+@click.option("--serializer-class", default="all")
+@click.option("--with-lossy/--without-lossy", default=True, show_default=True)
+@click.option("--with-numcodecs-wasm/--without-numcodecs-wasm", default=True, show_default=True)
+@click.option("--with-ebcc/--without-ebcc", default=True, show_default=True)
+def compress_with_optimal(dataset_file, where_to_write, field_to_compress,
+                          comp_idx, filt_idx, ser_idx,
+                          eval_data_size_limit,
+                          inner_chunk_mib, shard_mib,
+                          threads, oversubscription_check, verify,
+                          compressor_class, filter_class, serializer_class,
+                          with_lossy, with_numcodecs_wasm, with_ebcc):
     """
-    Compress a field with the optimal combination of 
-    compressor, filter, and serializer as generated by the evaluate_combos command.
+    Compress a single field with the combo chosen by evaluate_combos, streaming
+    directly into the shared {where_to_write}/{dataset}.zarr store under
+    component=field_to_compress.
 
-    Make sure to provide the same --[compressor/filter/serializer]-class and the same --with/without-[lossy/numcodecs-wasm/ebcc] flags as in evaluate_combos,
-    such that the same lists of instantiated objects are generated.
-    
-    Note on passing -1 as index:
-    dc_toolkit compress_with_optimal ... --compressor-class X ... --- -1 -1 -1
+    Run this command once per field; all invocations write into the same store.
+    After all fields are compressed, call `merge_compressed_fields` to
+    consolidate the metadata.
 
-    \b
-    Args:
-        dataset_file (str): Path to the input dataset file.
-        where_to_write (str): Directory where the compressed output will be written.
-        field_to_compress (str): Name of the field to compress.
-        comp_idx (int): Index of the compressor to use.
-        filt_idx (int): Index of the filter to use.
-        ser_idx (int): Index of the serializer to use.
-        compressor_class: --compressor-class
-        filter_class: --filter-class
-        serializer_class: --serializer-class
-        with_lossy: --with-lossy/--without-lossy
-        with_numcodecs_wasm: --with-numcodecs-wasm/--without-numcodecs-wasm
-        with_ebcc: --with-ebcc/--without-ebcc
+    What gets compressed
+    --------------------
+    The FULL FIELD.  Sampling is not used to decide what to write - it is used
+    only to parameterize the codec space (see below).
+
+    Codec-space reproducibility
+    ---------------------------
+    Several codecs have parameters derived from data statistics: Asinh's
+    linear_width comes from a quantile of |da|; FixedOffsetScale's offset and
+    scale come from da.mean/std/min/max; EBCC's chunk geometry comes from the
+    field shape.  These are computed inside compressor_space / filter_space /
+    serializer_space to produce a list of pre-instantiated codec objects, and
+    comp_idx / filt_idx / ser_idx index into those lists.
+
+    For an index produced by evaluate_combos to resolve to the SAME codec
+    object here, both commands must build the codec space the same way - which
+    means computing those statistics on the same data.  We do this by sampling
+    the field with build_representative_sample and feeding the sample into the
+    space builders.  Because the sampling is deterministic (np.linspace), the
+    two commands produce identical samples as long as they see the same
+    --eval-data-size-limit value.
+
+    Mismatch failure mode: no crash, no warning - just a codec object with
+    slightly different parameters than the one that won the sweep.  The
+    symptom is a worse compression ratio than evaluate_combos reported.
+
+    Parallelism
+    -----------
+    This command runs as a single MPI process, but the write itself is
+    parallelised by dask's threaded scheduler.  Use `--threads N` to cap the
+    number of dask workers; the default auto-detects from visible cores.
+    Peak in-flight memory during the write is roughly `threads * shard_mib`
+    bytes - reduce `--threads` if memory-constrained.
     """
     comm = MPI.COMM_WORLD
     rank = comm.Get_rank()
     size = comm.Get_size()
     if size > 1:
         if rank == 0:
-            click.echo("This command is not meant to be run in parallel. Please run it with a single process.")
-        sys.exit(1)
+            click.echo("compress_with_optimal is not meant to run in parallel. "
+                       "Launch it with a single process.")
+        # Collective abort: if we got here, the user launched this with
+        # `mpirun -n >1`; sys.exit on rank 0 alone would leave ranks 1..N
+        # blocking at the next collective.
+        comm.Abort(1)
 
     os.makedirs(where_to_write, exist_ok=True)
 
-    ds = utils.open_dataset(dataset_file, field_to_compress)
-    da = ds[field_to_compress]
-
-    compressors = utils.compressor_space(da, with_lossy, with_numcodecs_wasm, with_ebcc, compressor_class)
-    filters = utils.filter_space(da, with_lossy, with_numcodecs_wasm, with_ebcc, filter_class)
-    serializers = utils.serializer_space(da, with_lossy, with_numcodecs_wasm, with_ebcc, serializer_class)
-
-    if -1 <= comp_idx < len(compressors):
-        pass
-    else:
-        click.echo(f"Invalid comp_idx: {comp_idx}")
-        sys.exit(1)
-    if -1 <= filt_idx < len(filters):
-        pass
-    else:
-        click.echo(f"Invalid filt_idx: {filt_idx}")
-        sys.exit(1)
-    if -1 <= ser_idx < len(serializers):
-        pass
-    else:
-        click.echo(f"Invalid ser_idx: {ser_idx}")
-        sys.exit(1)
-
-    optimal_compressor = compressors[comp_idx][1] if comp_idx != -1 else None
-    optimal_filter = filters[filt_idx][1] if filt_idx != -1 else None
-    optimal_serializer = serializers[ser_idx][1] if ser_idx != -1 else None
-
-    if isinstance(optimal_serializer, numcodecs.zarr3.ZFPY):
-        da = da.stack(flat_dim=da.dims)
-    if isinstance(optimal_serializer, AnyNumcodecsArrayBytesCodec) and isinstance(optimal_serializer.codec, EBCCZarrFilter):
-        da = da.squeeze().astype("float32")
-
-    filters_ = [optimal_filter,]
-    compressors_ = [optimal_compressor,]
-    serializer_ = optimal_serializer
-
-    if isinstance(serializer_, AnyNumcodecsArrayBytesCodec) or optimal_filter is None:
-        filters_ = None
-    if optimal_compressor is None:
-        compressors_ = None
-    if optimal_serializer is None:
-        serializer_ = "auto"
-
-    compression_ratio, errors, euclidean_distance = utils.compress_with_zarr(
-        da,
-        dataset_file,
-        field_to_compress,
-        where_to_write,
-        filters=filters_,
-        compressors=compressors_,
-        serializer=serializer_,
-        verbose=False,
+    # -------------------------------------------------------------------------
+    # Thread & dask configuration
+    #
+    # The write goes through dask.array.to_zarr, which will parallelise the
+    # codec pipeline across shards.  We make the worker count explicit so the
+    # user can control peak memory (roughly: threads * shard_mib).
+    # -------------------------------------------------------------------------
+    cores_avail = utils.detect_cores_available()
+    if threads is None:
+        threads = cores_avail
+    utils.check_thread_oversubscription(
+        abort_if_unsafe=oversubscription_check, rank=rank,
     )
+    # Scope the scheduler + worker-count settings to this function so they
+    # don't leak if compress_with_optimal is imported and called from a
+    # notebook or longer-lived process.  No-op difference for the single-
+    # command CLI flow (process exits immediately after), but matches the
+    # pattern used in evaluate_combos.
+    with dask.config.set(scheduler="threads", num_workers=int(threads)):
+        click.echo(
+            f"[topology] {cores_avail} core(s) visible; "
+            f"dask will use {threads} worker(s) for the write. "
+            f"Peak working set ~= {threads} x shard_mib ({shard_mib} MiB) = "
+            f"{threads * shard_mib} MiB."
+        )
 
-    msg = (
-        "optimal combo: \n"
-        f"compressor : {optimal_compressor}\nfilter     : {optimal_filter}\nserializer : {optimal_serializer}\n"
-        "corresponding indices in lists of instantiated objects:\n"
-        f"compressor : {comp_idx}\nfilter     : {filt_idx}\nserializer : {ser_idx}\n"
-        f"Compression Ratio: {compression_ratio:.3f} | Relative L1 Error: {errors['Relative_Error_L1']:.3e} | Euclidean Distance: {euclidean_distance:.3e}"
-    )
-    click.echo(msg)
+        # Open dataset + field (lazy).  The FULL FIELD `da` is what gets
+        # compressed; the sample below is used only to build the codec space.
+        ds = utils.open_dataset(dataset_file, field_to_compress)
+        da = ds[field_to_compress]
+
+        # Build the codec space from a representative sample of the field.
+        #
+        # The sample here has ONE purpose: to make compressor_space / filter_space /
+        # serializer_space produce the same pre-instantiated codec objects as
+        # evaluate_combos produced (those builders compute data-dependent parameters
+        # like Asinh.linear_width, FixedOffsetScale.offset/scale, EBCC chunk geometry).
+        # `build_representative_sample` is deterministic, so as long as the user
+        # passes the same --eval-data-size-limit to both commands, both commands
+        # see the same sample and produce identical codec objects.
+        #
+        # The sample is NOT what gets compressed - we compress `da` (the full field)
+        # below.  This flag does not control write behavior.
+        sample_for_codec_space = utils.build_representative_sample(
+            da, eval_data_size_limit,
+        ).compute()
+
+        compressors = utils.compressor_space(sample_for_codec_space, with_lossy,
+                                             with_numcodecs_wasm, with_ebcc, compressor_class)
+        filters     = utils.filter_space(sample_for_codec_space, with_lossy,
+                                         with_numcodecs_wasm, with_ebcc, filter_class)
+        serializers = utils.serializer_space(sample_for_codec_space, with_lossy,
+                                             with_numcodecs_wasm, with_ebcc, serializer_class)
+
+        # Index validation
+        for name, idx, arr in [("comp_idx", comp_idx, compressors),
+                               ("filt_idx", filt_idx, filters),
+                               ("ser_idx",  ser_idx,  serializers)]:
+            if not (-1 <= idx < len(arr)):
+                click.echo(f"Invalid {name}: {idx} (must be in [-1, {len(arr) - 1}])")
+                comm.Abort(1)
+
+        optimal_compressor = compressors[comp_idx][1] if comp_idx != -1 else None
+        optimal_filter     = filters[filt_idx][1]     if filt_idx != -1 else None
+        optimal_serializer = serializers[ser_idx][1]  if ser_idx  != -1 else None
+
+        # Per-serializer data shaping (on the FULL field, not the sample).
+        # zfpy and EBCC have incompatible shape expectations; at most one branch
+        # fires (elif documents that intent).
+        data_to_persist = da
+        if _is_zfpy_serializer(optimal_serializer):
+            data_to_persist = da.stack(flat_dim=da.dims)
+        elif _is_ebcc_serializer(optimal_serializer):
+            data_to_persist = da.squeeze().astype("float32")
+
+        # Pipeline assembly rules (same semantics as the original)
+        filters_ = [optimal_filter]
+        compressors_ = [optimal_compressor]
+        serializer_ = optimal_serializer
+        if isinstance(serializer_, AnyNumcodecsArrayBytesCodec) or optimal_filter is None:
+            filters_ = None
+        if optimal_compressor is None:
+            compressors_ = None
+        if optimal_serializer is None:
+            serializer_ = "auto"
+
+        # Compute sharding geometry for the FULL field
+        inner_chunks, shards = utils.compute_chunk_and_shard_shape(
+            data_to_persist.shape, data_to_persist.dtype,
+            inner_mib=inner_chunk_mib, shard_mib=shard_mib,
+        )
+
+        # Open (or create) the shared merged store.  mode='a' means new fields are
+        # added alongside any fields previously written.
+        merged_path = _merged_store_path(where_to_write, dataset_file)
+        os.makedirs(Path(merged_path).parent, exist_ok=True)
+        store = zarr.storage.LocalStore(merged_path, read_only=False)
+        # Ensure a root group exists.  If the store is corrupted or the path is
+        # unwritable we want to surface that now, not deep inside persist_with_codec_pipeline.
+        try:
+            zarr.open_group(store, mode="a", zarr_format=3)
+        except Exception as e:
+            click.echo(
+                f"[persist] ERROR: cannot open or create zarr group at {merged_path}: {e}"
+            )
+            raise
+
+        click.echo(
+            f"[persist] {field_to_compress} -> {merged_path} "
+            f"(inner chunks={inner_chunks}, shards={shards})"
+        )
+
+        ratio, errors, eucd = utils.persist_with_codec_pipeline(
+            data_to_persist, store,
+            component=field_to_compress,
+            filters=filters_, compressors=compressors_, serializer=serializer_,
+            inner_chunks=inner_chunks, shards=shards,
+            verify=verify, verbose=False, rank=rank,
+        )
+
+        # Compose the summary.  Error metrics are only defined when --verify is on
+        # (persist_with_codec_pipeline returns errors=None, eucd=None otherwise),
+        # so we gate that tail of the message rather than crashing on None indexing.
+        summary = (
+            "optimal combo:\n"
+            f"compressor : {optimal_compressor}\n"
+            f"filter     : {optimal_filter}\n"
+            f"serializer : {optimal_serializer}\n"
+            "corresponding indices in lists of instantiated objects:\n"
+            f"compressor : {comp_idx}\n"
+            f"filter     : {filt_idx}\n"
+            f"serializer : {ser_idx}\n"
+            f"Compression Ratio: {ratio:.3f}"
+        )
+        if verify:
+            summary += (
+                f" | Relative L1 Error: {errors['Relative_Error_L1']:.3e}"
+                f" | Euclidean Distance: {eucd:.3e}"
+            )
+        else:
+            summary += "  (error metrics skipped: --no-verify)"
+        click.echo(summary)
+
 
 @cli.command("merge_compressed_fields")
 @click.argument("dataset_file", type=click.Path(exists=True, dir_okay=True, file_okay=True))
 @click.argument("compressed_files_location", type=click.Path(dir_okay=True, file_okay=False, exists=False))
 def merge_compressed_fields(dataset_file: str, compressed_files_location: str):
     """
-    Once all fields have been compressed, this command merges them into a single Zarr Zipped file.
+    Consolidate metadata on the shared {dataset}.zarr store.
 
-    \b
+    Under the new design, `compress_with_optimal` writes each field directly
+    into a shared LocalStore, so the old unzip+copy+rezip merge is unnecessary.
+    This command just runs `zarr.consolidate_metadata` so downstream readers
+    can open the store quickly without scanning every array.
+
     Args:
-        dataset_file (str): Path to the input dataset file.
-        compressed_files_location (str): Directory where the compressed files are located.
+        dataset_file (str): Path to the original dataset file (used to
+            derive the name of the merged .zarr store).
+        compressed_files_location (str): Directory containing
+            {dataset_basename}.zarr.
     """
     comm = MPI.COMM_WORLD
     rank = comm.Get_rank()
     size = comm.Get_size()
     if size > 1:
         if rank == 0:
-            click.echo("This command is not meant to be run in parallel. Please run it with a single process.")
-        sys.exit(1)
+            click.echo("merge_compressed_fields is not meant to run in parallel.")
+        # Collective abort: sys.exit on rank 0 alone would leave ranks 1..N
+        # blocking at the next collective.
+        comm.Abort(1)
 
-    # populate this folder with the compressed fields
-    dataset_filename = Path(dataset_file).name
-    merged_folder = Path(compressed_files_location) / f"{dataset_filename}.zarr"
-    if Path(merged_folder).exists():
-        shutil.rmtree(merged_folder)
-    os.makedirs(merged_folder)
+    merged_path = _merged_store_path(compressed_files_location, dataset_file)
+    if not Path(merged_path).is_dir():
+        click.echo(f"Expected merged store not found: {merged_path}")
+        click.echo("Did compress_with_optimal run at least once with the same "
+                   "`where_to_write`?")
+        comm.Abort(1)
 
-    for var in utils.open_dataset(dataset_file).data_vars:
-        compressed_field = f"{Path(compressed_files_location) / dataset_filename}.=.field_{var}.=.rank_{rank}.zarr.zip"
-        if not Path(compressed_field).exists():
-            click.echo("All fields must be compressed first.")
-            sys.exit(1)
-        extract_to = utils.unzip_file(compressed_field)
-        utils.copy_folder_contents(extract_to, merged_folder)
-        shutil.rmtree(extract_to)
+    store = zarr.storage.LocalStore(merged_path, read_only=False)
+    zarr.consolidate_metadata(store)
+    click.echo(f"[merge] consolidated metadata on {merged_path}")
 
-    zipped_merged_folder = str(merged_folder) + ".zip"
-    if Path(zipped_merged_folder).exists():
-        os.remove(zipped_merged_folder)
-    shutil.make_archive(merged_folder, 'zip', merged_folder)
-
-    if Path(merged_folder).exists():
-        shutil.rmtree(merged_folder)
+    # Report what's inside
+    g = zarr.open_group(store, mode="r")
+    arr_names = list(g.array_keys())
+    click.echo(f"[merge] arrays in store ({len(arr_names)}): {', '.join(arr_names) or '<none>'}")
 
 
-@cli.command("open_zarr_zip_file_and_inspect")
-@click.argument("zarr_zip_file", type=click.Path(exists=True, dir_okay=False))
-def open_zarr_zip_file_and_inspect(zarr_zip_file: str):
+@cli.command("open_zarr_and_inspect")
+@click.argument("zarr_path", type=click.Path(exists=True, dir_okay=True, file_okay=False))
+@click.option("--head", type=int, default=4, show_default=True,
+              help="Per-array head slice size (across each dim) for a tiny preview. "
+                   "Set to 0 to skip reading any data.")
+def open_zarr_and_inspect(zarr_path: str, head: int):
     """
-    Open a Zarr Zipped file and inspect its contents.
+    Inspect a zarr v3 LocalStore without materialising full arrays.
 
-    \b
-    Args:
-        zarr_zip_file (str): Path to the Zarr file.
+    Shows: group tree, per-array metadata (shape, dtype, codecs, sharding,
+    compression ratio from info_complete), and a tiny head slice.
     """
     comm = MPI.COMM_WORLD
     rank = comm.Get_rank()
     size = comm.Get_size()
     if size > 1:
         if rank == 0:
-            click.echo("This command is not meant to be run in parallel. Please run it with a single process.")
-        sys.exit(1)
+            click.echo("open_zarr_and_inspect is not meant to run in parallel.")
+        # Collective abort: sys.exit on rank 0 alone would leave ranks 1..N
+        # blocking at the next collective.
+        comm.Abort(1)
 
-    zarr_group, store = utils.open_zarr_zipstore(zarr_zip_file)
+    group, store = utils.open_zarr_localstore(zarr_path, read_only=True)
+    click.echo(group.tree())
+    click.echo("-" * 80)
 
-    click.echo(zarr_group.tree())
-
-    click.echo(80* "-")
-    for array_name in zarr_group.array_keys():
+    for array_name in group.array_keys():
+        z = group[array_name]
         click.echo(f"Array: {array_name}")
-        click.echo(zarr_group[array_name].info_complete())
-        click.echo(zarr_group[array_name][:])
-        click.echo(80* "-")
+        click.echo(z.info_complete())
+        if head > 0:
+            slicer = tuple(slice(0, min(head, s)) for s in z.shape)
+            click.echo(f"Head slice {slicer}:")
+            click.echo(z[slicer])
+        click.echo("-" * 80)
 
-    store.close()
 
-
-@cli.command("from_zarr_zip_to_netcdf")
-@click.argument("zarr_zip_file", type=click.Path(exists=True, dir_okay=False))
+@cli.command("from_zarr_to_netcdf")
+@click.argument("zarr_path", type=click.Path(exists=True, dir_okay=True, file_okay=False))
 @click.option("--out", "out_nc", type=click.Path(dir_okay=False), default=None,
               help="Output NetCDF file. Defaults to INPUT with .nc extension.")
-def from_zarr_zip_to_netcdf(zarr_zip_file: str, out_nc: str | None):
+@click.option("--max-size", default="50GB", callback=_size_option_callback,
+              show_default=True,
+              help="Refuse to write if logical output would exceed this size. "
+                   "NetCDF4 is not a great container for very large data; "
+                   "for >50GB consider keeping the .zarr as-is.")
+@click.option("--compression", default="zlib", show_default=True,
+              help="NetCDF variable compression (zlib/none).")
+@click.option("--complevel", default=4, show_default=True, help="zlib compression level.")
+def from_zarr_to_netcdf(zarr_path: str, out_nc: str | None,
+                        max_size: int, compression: str, complevel: int):
     """
-    Convert a Zarr Zipped file to netcdf.
-
-    \b
-    Args:
-        zarr_zip_file (str): Path to the Zarr file.
-        out_nc (str): Output NetCDF file.
+    Convert a zarr v3 LocalStore (.zarr directory) to a NetCDF4 file.
+    Writes are streamed via dask so the full dataset is never held in memory.
     """
     comm = MPI.COMM_WORLD
     rank = comm.Get_rank()
     size = comm.Get_size()
     if size > 1:
         if rank == 0:
-            click.echo("This command is not meant to be run in parallel. Please run it with a single process.")
-        sys.exit(1)
+            click.echo("from_zarr_to_netcdf is not meant to run in parallel.")
+        # Collective abort: sys.exit on rank 0 alone would leave ranks 1..N
+        # blocking at the next collective.
+        comm.Abort(1)
 
     if out_nc is None:
-        out_nc = os.path.splitext(zarr_zip_file)[0] + ".nc"
+        out_nc = str(Path(zarr_path).with_suffix(".nc"))
 
-    zgroup, store = utils.open_zarr_zipstore(zarr_zip_file)
+    # Load via xarray; this preserves dims/coords if consolidated metadata exists.
+    # The previous heuristic (Path(zarr_path)/"zarr.json").exists() was wrong:
+    # every zarr v3 store has a zarr.json, consolidated or not.  Consolidation
+    # in v3 is a `consolidated_metadata` field *inside* that zarr.json.  We try
+    # consolidated first (fast path) and fall back to a metadata scan if the
+    # store wasn't processed by `merge_compressed_fields`.
     try:
-        names = list(zgroup.array_keys())
-        if not names:
-            raise click.ClickException("No arrays found in the Zarr store.")
-        ds = xr.Dataset({
-            n: xr.DataArray(dask.array.from_zarr(zgroup[n]),
-                            dims=[f"{n}_d{i}" for i in range(zgroup[n].ndim)],
-                            name=n)
-            for n in names
-        })
-        ds.to_netcdf(out_nc, engine="h5netcdf")
-        click.echo(f"Wrote NetCDF: {out_nc}")
-    finally:
-        store.close()
+        ds = xr.open_zarr(zarr_path, chunks="auto", consolidated=True)
+    except Exception:
+        ds = xr.open_zarr(zarr_path, chunks="auto", consolidated=False)
+
+    logical_bytes = int(ds.nbytes)
+    click.echo(f"[zarr->nc] logical size = {humanize.naturalsize(logical_bytes, binary=True)}")
+    if logical_bytes > max_size:
+        click.echo(
+            f"Refusing to write: logical size exceeds --max-size "
+            f"({humanize.naturalsize(max_size, binary=True)}). "
+            f"Raise --max-size to proceed, or keep the data in .zarr."
+        )
+        comm.Abort(1)
+
+    # Per-variable encoding: preserve dask chunks as NetCDF chunks, add compression.
+    encoding = {}
+    for name, var in ds.data_vars.items():
+        enc = {}
+        if isinstance(var.data, dask.array.Array):
+            # Use one dask chunk per netcdf chunk.  Caps each chunk at the
+            # first block shape to avoid overly large chunks.
+            enc["chunksizes"] = tuple(b[0] for b in var.data.chunks)
+        if compression == "zlib":
+            enc["zlib"] = True
+            enc["complevel"] = int(complevel)
+        encoding[name] = enc
+
+    click.echo(f"[zarr->nc] writing {out_nc} ...")
+    ds.to_netcdf(out_nc, engine="h5netcdf", encoding=encoding)
+    click.echo(f"[zarr->nc] wrote {out_nc}")
 
 
 @cli.command("perform_clustering")
@@ -502,6 +1029,15 @@ def perform_clustering(npy_file: str, l_error: str):
         npy_file (str): npy file with L-errors and compression ratios results for each combination of compressor, filter, and serializer
         l_error (str): choose between "L1", "L2", "LInf" to generate the plot
     """
+    # Lazy imports: kept out of the module top-level so `evaluate_combos` /
+    # `compress_with_optimal` don't pay the matplotlib+sklearn+tqdm import
+    # cost on every invocation.  See the comment block near the top of this
+    # file for the rationale.
+    from tqdm import tqdm
+    from sklearn.cluster import KMeans
+    from sklearn.metrics import silhouette_score
+    import matplotlib.pyplot as plt
+
     scored_results = np.load(npy_file, allow_pickle=True)
 
     scored_results_pd = pd.DataFrame(scored_results)
@@ -543,7 +1079,18 @@ def perform_clustering(npy_file: str, l_error: str):
 
 @cli.command("analyze_clustering")
 @click.argument("npy_file", type=click.Path(exists=True, dir_okay=False))
-def analyze_clustering(npy_file: str):
+@click.option("--where-to-write", "where_to_write", required=True,
+              type=click.Path(exists=True, dir_okay=True, file_okay=False),
+              help="Directory containing the `config_space_{var}.csv` written by "
+                   "evaluate_combos.  Must be the same directory passed as "
+                   "--where-to-write to evaluate_combos for this run.")
+@click.option("--var", "var", required=True, type=str,
+              help="Variable (field) name to analyse.  Must match the `var` used "
+                   "in the evaluate_combos run that produced the .npy and the "
+                   "config_space_{var}.csv file (so for a field named 't' it's "
+                   "`--var t`, and the tool will read "
+                   "`{where_to_write}/config_space_t.csv`).")
+def analyze_clustering(npy_file: str, where_to_write: str, var: str):
     """
     Performs clustering on all 3 L-errors, can be executed only after evaluate_combos.
     It can be executed only after evaluate_combos.
@@ -556,8 +1103,35 @@ def analyze_clustering(npy_file: str):
     \b
     Args:
         npy_file (str): npy file with L-errors and compression ratios results for each combination of compressor, filter, and serializer
+        where_to_write (str): --where-to-write
+        var (str): --var
     """
-    config_idxs = pd.read_csv("config_space.csv")
+    # Lazy imports: see the comment near the top of this file.
+    from sklearn.cluster import KMeans
+    import plotly.io as pio
+    import plotly.express as px
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+
+    # evaluate_combos now writes config_space_{var}.csv into {where_to_write}
+    # (renamed from the old cwd-relative `config_space.csv`).  Resolve it
+    # explicitly from the required flags so analyze_clustering can be run
+    # from any working directory.  Both flags are required — no magic
+    # fallback to cwd — because guessing would reintroduce the same
+    # footgun: the old `pd.read_csv("config_space.csv")` silently picked
+    # up whatever happened to be in cwd (possibly a stale file from a
+    # different run).
+    config_csv_path = Path(where_to_write) / f"config_space_{var}.csv"
+    if not config_csv_path.is_file():
+        raise click.FileError(
+            str(config_csv_path),
+            hint=(
+                f"Expected `config_space_{var}.csv` in {where_to_write}. "
+                f"Run `dc_toolkit evaluate_combos ... --where-to-write {where_to_write}` "
+                f"first, and confirm --var matches the field-to-compress used there."
+            ),
+        )
+    config_idxs = pd.read_csv(config_csv_path)
     scored_results = np.load(str(npy_file), allow_pickle=True)
 
     scored_results_pd = pd.DataFrame(scored_results)
@@ -619,79 +1193,79 @@ def analyze_clustering(npy_file: str):
     for trace in fig_l1.data:
         fig.add_trace(trace, row=1, col=1)
 
-        # L2 clustering
-        clean_arr_l2_filtered = np.column_stack((clean_arr_l2[:, 0].astype(float), clean_arr_l2[:, 1].astype(float)))
+    # L2 clustering
+    clean_arr_l2_filtered = np.column_stack((clean_arr_l2[:, 0].astype(float), clean_arr_l2[:, 1].astype(float)))
 
-        df_l2 = pd.DataFrame(clean_arr_l2_filtered, columns=["Ratio", "L2"])
-        df_l2["compressor"] = clean_arr_l2[:, 2]
-        df_l2["filter"] = clean_arr_l2[:, 3]
-        df_l2["serializer"] = clean_arr_l2[:, 4]
-        df_l2["compressor_idx"] = utils.get_indexes(clean_arr_l2[:, 2], config_idxs['0'])
-        df_l2["filter_idx"] = utils.get_indexes(clean_arr_l2[:, 3], config_idxs['1'])
-        df_l2["serializer_idx"] = utils.get_indexes(clean_arr_l2[:, 4], config_idxs['2'])
+    df_l2 = pd.DataFrame(clean_arr_l2_filtered, columns=["Ratio", "L2"])
+    df_l2["compressor"] = clean_arr_l2[:, 2]
+    df_l2["filter"] = clean_arr_l2[:, 3]
+    df_l2["serializer"] = clean_arr_l2[:, 4]
+    df_l2["compressor_idx"] = utils.get_indexes(clean_arr_l2[:, 2], config_idxs['0'])
+    df_l2["filter_idx"] = utils.get_indexes(clean_arr_l2[:, 3], config_idxs['1'])
+    df_l2["serializer_idx"] = utils.get_indexes(clean_arr_l2[:, 4], config_idxs['2'])
 
-        y_kmeans = kmeans.fit_predict(pd.DataFrame(df_l2, columns=["Ratio", "L2"]))
-        color = np.ones(y_kmeans.shape) if len(np.unique(y_kmeans)) == 1 else y_kmeans
+    y_kmeans = kmeans.fit_predict(pd.DataFrame(df_l2, columns=["Ratio", "L2"]))
+    color = np.ones(y_kmeans.shape) if len(np.unique(y_kmeans)) == 1 else y_kmeans
 
-        fig_l2 = px.scatter(df_l2, x="Ratio", y="L2", color=color,
-                            title="L2 VS Ratio KMeans Clustering",
-                            hover_data=["compressor", "filter", "serializer", "compressor_idx", "filter_idx", "serializer_idx"])
+    fig_l2 = px.scatter(df_l2, x="Ratio", y="L2", color=color,
+                        title="L2 VS Ratio KMeans Clustering",
+                        hover_data=["compressor", "filter", "serializer", "compressor_idx", "filter_idx", "serializer_idx"])
 
-        fig.add_trace(
-            go.Scatter(
-                x=kmeans.cluster_centers_[:, 0],
-                y=kmeans.cluster_centers_[:, 1],
-                mode="markers+text",
-                marker=dict(color="black", size=12, symbol="x"),
-                textposition="top center",
-                name="Centroids",
-                showlegend=False
-            ),
-            row=2,
-            col=1
-        )
-        fig.update_xaxes(title_text="Ratio", row=2, col=1)
-        fig.update_yaxes(title_text="L2", row=2, col=1)
-        for trace in fig_l2.data:
-            fig.add_trace(trace, row=2, col=1)
+    fig.add_trace(
+        go.Scatter(
+            x=kmeans.cluster_centers_[:, 0],
+            y=kmeans.cluster_centers_[:, 1],
+            mode="markers+text",
+            marker=dict(color="black", size=12, symbol="x"),
+            textposition="top center",
+            name="Centroids",
+            showlegend=False
+        ),
+        row=2,
+        col=1
+    )
+    fig.update_xaxes(title_text="Ratio", row=2, col=1)
+    fig.update_yaxes(title_text="L2", row=2, col=1)
+    for trace in fig_l2.data:
+        fig.add_trace(trace, row=2, col=1)
 
-        # LInf clustering
-        clean_arr_linf_filtered = np.column_stack(
-            (clean_arr_linf[:, 0].astype(float), clean_arr_linf[:, 1].astype(float)))
+    # LInf clustering
+    clean_arr_linf_filtered = np.column_stack(
+        (clean_arr_linf[:, 0].astype(float), clean_arr_linf[:, 1].astype(float)))
 
-        df_linf = pd.DataFrame(clean_arr_linf_filtered, columns=["Ratio", "LInf"])
-        df_linf["compressor"] = clean_arr_linf[:, 2]
-        df_linf["filter"] = clean_arr_linf[:, 3]
-        df_linf["serializer"] = clean_arr_linf[:, 4]
-        df_linf["compressor_idx"] = utils.get_indexes(clean_arr_linf[:, 2], config_idxs['0'])
-        df_linf["filter_idx"] = utils.get_indexes(clean_arr_linf[:, 3], config_idxs['1'])
-        df_linf["serializer_idx"] = utils.get_indexes(clean_arr_linf[:, 4], config_idxs['2'])
+    df_linf = pd.DataFrame(clean_arr_linf_filtered, columns=["Ratio", "LInf"])
+    df_linf["compressor"] = clean_arr_linf[:, 2]
+    df_linf["filter"] = clean_arr_linf[:, 3]
+    df_linf["serializer"] = clean_arr_linf[:, 4]
+    df_linf["compressor_idx"] = utils.get_indexes(clean_arr_linf[:, 2], config_idxs['0'])
+    df_linf["filter_idx"] = utils.get_indexes(clean_arr_linf[:, 3], config_idxs['1'])
+    df_linf["serializer_idx"] = utils.get_indexes(clean_arr_linf[:, 4], config_idxs['2'])
 
-        y_kmeans = kmeans.fit_predict(pd.DataFrame(df_linf, columns=["Ratio", "LInf"]))
-        color = np.ones(y_kmeans.shape) if len(np.unique(y_kmeans)) == 1 else y_kmeans
+    y_kmeans = kmeans.fit_predict(pd.DataFrame(df_linf, columns=["Ratio", "LInf"]))
+    color = np.ones(y_kmeans.shape) if len(np.unique(y_kmeans)) == 1 else y_kmeans
 
-        fig_linf = px.scatter(df_linf, x="Ratio", y="LInf", color=color,
-                              title="LInf VS Ratio KMeans Clustering",
-                              hover_data=["compressor", "filter", "serializer", "compressor_idx", "filter_idx",
-                                          "serializer_idx"])
+    fig_linf = px.scatter(df_linf, x="Ratio", y="LInf", color=color,
+                          title="LInf VS Ratio KMeans Clustering",
+                          hover_data=["compressor", "filter", "serializer", "compressor_idx", "filter_idx",
+                                      "serializer_idx"])
 
-        fig.add_trace(
-            go.Scatter(
-                x=kmeans.cluster_centers_[:, 0],
-                y=kmeans.cluster_centers_[:, 1],
-                mode="markers+text",
-                marker=dict(color="black", size=12, symbol="x"),
-                textposition="top center",
-                name="Centroids",
-                showlegend=False
-            ),
-            row=3,
-            col=1
-        )
-        fig.update_xaxes(title_text="Ratio", row=3, col=1)
-        fig.update_yaxes(title_text="LInf", row=3, col=1)
-        for trace in fig_linf.data:
-            fig.add_trace(trace, row=3, col=1)
+    fig.add_trace(
+        go.Scatter(
+            x=kmeans.cluster_centers_[:, 0],
+            y=kmeans.cluster_centers_[:, 1],
+            mode="markers+text",
+            marker=dict(color="black", size=12, symbol="x"),
+            textposition="top center",
+            name="Centroids",
+            showlegend=False
+        ),
+        row=3,
+        col=1
+    )
+    fig.update_xaxes(title_text="Ratio", row=3, col=1)
+    fig.update_yaxes(title_text="LInf", row=3, col=1)
+    for trace in fig_linf.data:
+        fig.add_trace(trace, row=3, col=1)
 
     fig.update_layout(
         title="",
@@ -754,6 +1328,8 @@ def plot_compression_errors(dataset_file: str, where_to_write: str, field_to_com
         with_numcodecs_wasm: --with-numcodecs-wasm/--without-numcodecs-wasm
         with_ebcc: --with-ebcc/--without-ebcc
     """
+    # Lazy import: see the comment near the top of this file.
+    import matplotlib.pyplot as plt
 
     #############
     # GET COMBO #
@@ -765,7 +1341,9 @@ def plot_compression_errors(dataset_file: str, where_to_write: str, field_to_com
     if size > 1:
         if rank == 0:
             click.echo("This command is not meant to be run in parallel. Please run it with a single process.")
-        sys.exit(1)
+        # Collective abort: sys.exit on rank 0 alone would leave ranks 1..N
+        # blocking at the next collective.
+        comm.Abort(1)
 
     os.makedirs(where_to_write, exist_ok=True)
 
@@ -777,13 +1355,13 @@ def plot_compression_errors(dataset_file: str, where_to_write: str, field_to_com
 
     if not utils.is_lat_lon(da):
         click.echo(f"Field {field_to_compress} should be in lat-lon form, i.e. dimensions (lat, lon)! It currently has dimensions: {da.dims}.")
-        sys.exit(1)
+        comm.Abort(1)
 
     mem_threshold = 2.5  # GiB
     if da_memsize / (1024 ** 3) > mem_threshold:
         click.echo(f"Field {field_to_compress} is too large ({humanize.naturalsize(da_memsize, binary=True)}). "
                    f"To avoid high memory usage we only support fields up to {mem_threshold} GiB.")
-        sys.exit(1)
+        comm.Abort(1)
 
     compressors = utils.compressor_space(da, with_lossy, with_numcodecs_wasm, with_ebcc, compressor_class)
     filters = utils.filter_space(da, with_lossy, with_numcodecs_wasm, with_ebcc, filter_class)
@@ -793,17 +1371,17 @@ def plot_compression_errors(dataset_file: str, where_to_write: str, field_to_com
         pass
     else:
         click.echo(f"Invalid comp_idx: {comp_idx}")
-        sys.exit(1)
+        comm.Abort(1)
     if -1 <= filt_idx < len(filters):
         pass
     else:
         click.echo(f"Invalid filt_idx: {filt_idx}")
-        sys.exit(1)
+        comm.Abort(1)
     if -1 <= ser_idx < len(serializers):
         pass
     else:
         click.echo(f"Invalid ser_idx: {ser_idx}")
-        sys.exit(1)
+        comm.Abort(1)
 
     selected_compressor = compressors[comp_idx][1] if comp_idx != -1 else None
     selected_filter = filters[filt_idx][1] if filt_idx != -1 else None

@@ -7,3 +7,4 @@ EBCC/
 venv/
 out-*
 *.csv
+*.parquet
