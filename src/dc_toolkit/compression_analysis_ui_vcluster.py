@@ -75,7 +75,7 @@ def find_file(base_path, file_name):
 
 @st.cache_data
 def load_scored_results(file_name: str, params_str: list[str]):
-    return np.load(file_name + params_str + "_scored_results_with_names.npy", allow_pickle=True)
+    return np.load("./out/" + file_name + params_str + "_scored_results_with_names.npy", allow_pickle=True)
 
 
 @st.cache_resource
@@ -312,6 +312,10 @@ if uploaded_file is not None and uploaded_file.name.endswith(".nc"):
     with_lossy_option = "--with-lossy" if lossy_class == "with" else "--without-lossy"
     with_numcodecs_option = "--with-numcodecs-wasm" if numcodecs_wasm_class == "with" else "--without-numcodecs-wasm"
     with_ebcc_option = "--with-ebcc" if ebcc_class == "with" else "--without-ebcc"
+
+    # create ./out dir if it doesn't exist, to place all generated files there
+    if not os.path.exists("out"):
+        os.makedirs("out")
     if st.button("Analyze compressors"):
         if predefined_l1:
             cmd_compress = [
@@ -326,7 +330,7 @@ if uploaded_file is not None and uploaded_file.name.endswith(".nc"):
                 "dc_toolkit",
                 "evaluate_combos",
                 display_file_name,
-                os.getcwd(),
+                "--where-to-write=out",
                 "--field-to-compress=" + field_to_compress,
                 "--compressor-class=" + compressor_class,
                 "--filter-class=" + filter_class,
@@ -346,7 +350,7 @@ if uploaded_file is not None and uploaded_file.name.endswith(".nc"):
                 "dc_toolkit",
                 "evaluate_combos",
                 parse_args().uploaded_file,
-                os.getcwd(),
+                "--where-to-write=out",
                 "--field-to-compress=" + field_to_compress,
                 "--compressor-class=" + compressor_class,
                 "--filter-class=" + filter_class,

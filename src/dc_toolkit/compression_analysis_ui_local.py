@@ -36,7 +36,7 @@ from dc_toolkit import utils
 import zipfile
 
 def load_scored_results(file_name: str, params_str: list[str]):
-    return np.load(file_name + params_str + "_scored_results_with_names.npy", allow_pickle=True)
+    return np.load("./out/" + file_name + params_str + "_scored_results_with_names.npy", allow_pickle=True)
 
 def create_cluster_plots(clean_arr_l1, clean_arr_l2, clean_arr_linf, n_clusters):
     config_idxs = pd.read_csv("config_space.csv")
@@ -419,15 +419,18 @@ class CompressionAnalysisUI(QMainWindow):
         with_options_ls.append("--with-numcodecs-wasm") if self.options_numcodecs_wasm.currentText() == "with" else with_options_ls.append("--without-numcodecs-wasm")
         with_options_ls.append("--with-ebcc") if self.options_ebcc.currentText() == "with" else with_options_ls.append("--without-ebcc")
 
+        # create ./out dir if it doesn't exist, to place all generated files there
+        if not os.path.exists("out"):
+            os.makedirs("out")
         if self.predefined_l1.isChecked():
             cmd = [
                 "mpirun",
                 "-n",
-                "8",
+                "1",
                 "dc_toolkit",
                 "evaluate_combos",
                 self.modified_file_path,
-                os.getcwd(),
+                "--where-to-write=out",
                 "--field-to-compress=" + selected_var,
                 "--compressor-class=" + compressor_class,
                 "--filter-class=" + filter_class,
