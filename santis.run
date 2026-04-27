@@ -23,11 +23,11 @@ source venv/bin/activate
 # nested-parallelism oversubscription.
 export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 BLOSC_NTHREADS=1 NUMBA_NUM_THREADS=1
 
-srun dc_toolkit \
+srun -n 1 dc_toolkit \
      evaluate_combos \
-     /capstor/store/cscs/userlab/cwp03/ppothapa/Data_Dyamond_PostProcessed/DYAMOND_R02B10L120_main/out_15/temp_20200410T000000Z.nc \
+     /capstor/store1/cscs/userlab/cwp03/zemanc/Data_Dyamond_PostProcessed_R02B06/out_1_1/remap_qv_20230121T000000Z.nc \
      --where-to-write ./res_folder \
-     --field-to-compress temp \
+     --field-to-compress qv \
      --eval-data-size-limit 5GB \
      --override-existing-l1-error 0.002 \
      --compressor-class Zlib \
@@ -44,7 +44,7 @@ srun dc_toolkit \
 #
 # srun -n 1 dc_toolkit \
 #      compress_with_optimal \
-#      /capstor/store/cscs/userlab/cwp03/ppothapa/Data_Dyamond_PostProcessed/DYAMOND_R02B10L120_main/out_15/temp_20200410T000000Z.nc \
+#      /capstor/store1/cscs/userlab/cwp03/zemanc/Data_Dyamond_PostProcessed_R02B06/out_1_1/remap_qv_20230121T000000Z.nc \
 #      ./res_folder \
 #      temp \
 #      2 0 9 \
