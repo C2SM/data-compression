@@ -23,7 +23,7 @@ source venv/bin/activate
 # nested-parallelism oversubscription.
 export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 BLOSC_NTHREADS=1 NUMBA_NUM_THREADS=1
 
-srun -n 1 dc_toolkit \
+srun dc_toolkit \
      evaluate_combos \
      /capstor/store1/cscs/userlab/cwp03/zemanc/Data_Dyamond_PostProcessed_R02B06/out_1_1/remap_qv_20230121T000000Z.nc \
      --where-to-write ./res_folder \
