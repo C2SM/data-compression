@@ -2126,6 +2126,199 @@ def open_zarr_and_inspect(zarr_path: str, head: int):
         click.echo("-" * 80)
 
 
+@cli.command("from_nc_to_zarr")
+@click.argument("nc_path", type=click.Path(exists=True, dir_okay=False, file_okay=True))
+@click.option("--out", "out_zarr", type=click.Path(dir_okay=True, file_okay=False), default=None,
+              help="Output .zarr directory. Defaults to INPUT with .zarr extension.")
+@click.option("--overwrite/--no-overwrite", default=False, show_default=True,
+              help="If set, remove the output directory before writing.")
+@click.option("--consolidated/--no-consolidated", default=True, show_default=True,
+              help="Write consolidated metadata so xr.open_zarr can do a fast open.")
+@click.option("--preserve-source-chunks/--no-preserve-source-chunks",
+              default=True, show_default=True,
+              help="If set (default), open the netCDF with chunks={} so each "
+                   "dask chunk maps 1:1 to an HDF5 chunk in the source and to "
+                   "a single chunk-file in the output zarr.  This is the most "
+                   "faithful per-chunk mapping for filesystem dedup.  Pass "
+                   "--no-preserve-source-chunks to use xarray's chunks='auto' "
+                   "instead - only useful for netCDF-3 sources or contiguous "
+                   "netCDF-4 variables, where there is no native chunk "
+                   "geometry to preserve.")
+@click.option("--mask-and-scale/--no-mask-and-scale",
+              default=False, show_default=True,
+              help="Whether to apply CF mask_and_scale decoding (scale_factor, "
+                   "add_offset, _FillValue) at read time.  Default: OFF for "
+                   "this command (xarray's normal default is ON), because "
+                   "decoding promotes packed int8/int16 variables to float "
+                   "and quadruples their byte count, which confounds both the "
+                   "absolute-storage and the dedup-ratio numbers in the VAST "
+                   "experiment.  The encoding attrs ride along in var.attrs "
+                   "regardless, so a downstream reader that opens the output "
+                   "zarr with mask_and_scale=True (xarray's default) still "
+                   "gets the decoded floats - no information is lost, the "
+                   "values are just stored on disk in their packed form.")
+@click.option("--decode-times/--no-decode-times",
+              default=False, show_default=True,
+              help="Whether to apply CF time decoding (units like 'days since "
+                   "1970-01-01', calendar) at read time.  Default: OFF for "
+                   "this command (xarray's normal default is ON), for "
+                   "symmetry with --mask-and-scale: every on-disk numeric "
+                   "form is preserved regardless of what CF says it "
+                   "represents.  Effect on dedup is tiny (the time coord is "
+                   "usually a single 1-D array of a few KB), but flipping it "
+                   "off also sidesteps cftime/datetime64 round-trip variance "
+                   "across xarray versions for non-standard calendars.  "
+                   "Encoding attrs ride along in var.attrs, so a downstream "
+                   "reader passing decode_times=True (xarray default) still "
+                   "gets datetime64/cftime objects with no information loss.")
+def from_nc_to_zarr(nc_path: str, out_zarr: str | None,
+                    overwrite: bool, consolidated: bool,
+                    preserve_source_chunks: bool,
+                    mask_and_scale: bool,
+                    decode_times: bool):
+    """
+    Convert a NetCDF file (.nc) to a zarr v3 LocalStore (.zarr directory)
+    with NO compression, NO filters, and NO sharding.  Intended for
+    filesystem-level deduplication experiments (e.g. VAST FS).
+
+    Every data variable AND every coordinate is written with
+    `compressors=None, filters=None`; the only codec left in the pipeline
+    is the default bytes serializer, which is just an identity
+    dtype/endianness step (not a compressor).  Coordinate arrays are
+    explicitly included because lat/lon/time are usually identical across
+    the files in a series, and a default-compressed coord would mask the
+    dedup signal we're trying to measure on the storage side.
+
+    Sharding is intentionally NOT applied (zarr v3's default when no
+    `shards` key is passed): each chunk lands in its own file, so VAST
+    sees chunk-level granularity.  Sharding would bundle multiple chunks
+    per file with chunk offsets that depend on neighboring chunks, which
+    would degrade chunk-level dedup into FS-block-level dedup.
+
+    CF mask_and_scale decoding is OFF by default for this command
+    (xarray's normal default is ON).  Packed integer dtypes (int8/int16
+    with scale_factor/add_offset) stay packed on disk, which avoids both
+    the int->float byte-count quadrupling and the float-bit fragility
+    where two chunks with identical packed values could produce slightly
+    different decoded floats if scale_factor/add_offset attrs drift across
+    the file series.  Encoding attrs ride along in var.attrs, so a
+    downstream reader passing mask_and_scale=True (xarray default) still
+    gets the decoded floats with no information loss.
+
+    CF decode_times is OFF by default for the same family of reasons:
+    every on-disk numeric form is preserved regardless of what CF says it
+    represents.  Effect on dedup is tiny (time coords are typically a few
+    KB), but flipping it off also sidesteps cftime/datetime64 round-trip
+    variance across xarray versions for non-standard calendars.
+
+    Caveats
+    -------
+    - Any compression that was applied INSIDE the netCDF source file is
+      undone at read time by the netCDF reader.  We never see the on-disk
+      compressed bytes; we see the decoded array.  So "without any
+      compression" here means: nothing on the zarr write side, regardless
+      of how the netCDF was authored.
+    - With --preserve-source-chunks (default), the output zarr's chunk
+      structure mirrors the source's HDF5 chunk structure exactly.  For
+      netCDF-3 or contiguous netCDF-4 variables this still works (xarray
+      picks a single chunk covering the whole variable) but the per-chunk
+      dedup story becomes less interesting.
+    - --preserve-source-chunks gives chunk-level dedup ONLY when every
+      file in the series shares the same HDF5 chunk shape.  Differing
+      chunk shapes across the series would need a forced canonical
+      rechunk; not implemented here.
+    """
+    comm = MPI.COMM_WORLD
+    rank = comm.Get_rank()
+    size = comm.Get_size()
+    if size > 1:
+        if rank == 0:
+            click.echo("from_nc_to_zarr is not meant to run in parallel.")
+        # Collective abort: sys.exit on rank 0 alone would leave ranks 1..N
+        # blocking at the next collective.
+        comm.Abort(1)
+
+    if Path(nc_path).suffix.lower() != ".nc":
+        click.echo(
+            f"Expected a .nc file, got {nc_path}.  This command only "
+            f"handles netCDF input; use from_zarr_to_netcdf for the "
+            f"reverse direction."
+        )
+        comm.Abort(1)
+
+    if out_zarr is None:
+        out_zarr = str(Path(nc_path).with_suffix(".zarr"))
+
+    out_path = Path(out_zarr)
+    if out_path.exists():
+        if overwrite:
+            import shutil
+            click.echo(f"[nc->zarr] removing existing {out_zarr} (--overwrite).")
+            shutil.rmtree(out_zarr)
+        else:
+            click.echo(
+                f"Output already exists: {out_zarr}.  "
+                f"Pass --overwrite to replace, or pick a different --out."
+            )
+            comm.Abort(1)
+
+    click.echo(f"[nc->zarr] reading {nc_path} ...")
+    # chunks={} -> dask chunks track HDF5 chunks 1:1 (the default for this
+    # command).  chunks="auto" -> dask picks a chunking, used as a fallback
+    # for non-chunked sources.  We never use chunks=None because that would
+    # eagerly materialise the whole field in RAM, and there's no need: we
+    # always want lazy reads paired with the streaming to_zarr write.
+    chunks = {} if preserve_source_chunks else "auto"
+    # mask_and_scale=False keeps packed int dtypes packed; decode_times=False
+    # keeps time coords as raw numerics.  See the docstring and the option
+    # help text for why these are the dedup-friendly defaults.
+    ds = xr.open_dataset(
+        nc_path,
+        chunks=chunks,
+        mask_and_scale=mask_and_scale,
+        decode_times=decode_times,
+    )
+    logical_bytes = int(ds.nbytes)
+    click.echo(
+        f"[nc->zarr] logical size = {humanize.naturalsize(logical_bytes, binary=True)} "
+        f"| chunks = {'source-native' if preserve_source_chunks else 'auto'} "
+        f"| mask_and_scale = {mask_and_scale} "
+        f"| decode_times = {decode_times}"
+    )
+
+    # Per-variable encoding override.  Two layers of defense:
+    # 1. Clear .encoding on every variable so any netCDF-side encoding keys
+    #    (zlib, shuffle, chunksizes, _FillValue, ...) inherited from
+    #    xr.open_dataset don't leak into xarray's encoding-translation layer.
+    # 2. Pass an explicit `compressors=None, filters=None` per variable to
+    #    `to_zarr`, which wins over anything still residual.
+    # We iterate over ds.variables (data_vars + coords) so coordinate arrays
+    # are included; see the docstring for why.
+    encoding = {}
+    for name in ds.variables:
+        ds[name].encoding = {}
+        encoding[name] = {
+            "compressors": None,
+            "filters": None,
+        }
+
+    click.echo(
+        f"[nc->zarr] writing {out_zarr} (compressors=None, filters=None, "
+        f"{len(encoding)} variable(s)) ..."
+    )
+    # mode="w-" = create-only; we already short-circuited on the
+    # exists-and-not-overwrite path above, so this just guards against a
+    # race with another process between the check and the write.
+    ds.to_zarr(
+        out_zarr,
+        mode="w-",
+        encoding=encoding,
+        zarr_format=3,
+        consolidated=consolidated,
+    )
+    click.echo(f"[nc->zarr] wrote {out_zarr}")
+
+
 @cli.command("from_zarr_to_netcdf")
 @click.argument("zarr_path", type=click.Path(exists=True, dir_okay=True, file_okay=False))
 @click.option("--out", "out_nc", type=click.Path(dir_okay=False), default=None,
