@@ -105,7 +105,7 @@ def _version_banner(component_name: str) -> str:
     )
 
 
-def _check_memory_headroom(required_bytes: int, label: str, threshold: float = 0.60) -> None:
+def _check_memory_headroom(required_bytes: int, label: str, threshold: float = 0.80) -> None:
     """
     Refuse to allocate `required_bytes` if it would exceed `threshold` of
     currently-available RAM.  Aborts the whole MPI world on violation.
@@ -115,11 +115,32 @@ def _check_memory_headroom(required_bytes: int, label: str, threshold: float = 0
     large shards on a RAM-starved box.  Catches the error before numpy /
     dask raise a MemoryError halfway through a long run.
 
+    Default threshold is 0.80: leaves ~25% headroom over our `required_bytes`
+    estimate to absorb (a) rechunk transients, which the topology banner
+    notes can push real peak 1.5-2x above the documented threads * shard_mib
+    figure; (b) Python / dask / MPI / numpy overhead not in the estimate;
+    (c) other processes on the same node.  Going above 0.80 is risky
+    because the documented rechunk transient alone can exceed the remaining
+    buffer; the function emits a one-time warning when called above that.
+
+    Caveat: psutil.virtual_memory().available reports HOST memory, not the
+    cgroup limit when running inside a container or a slurm allocation with
+    --mem set.  In that case the kernel/slurm OOM-killer is the real guard,
+    not this function.
+
     psutil is a hard dependency (see pyproject.toml), so the query itself
     is always available; we only wrap the call in try/except to tolerate
     the rare environment where /proc is unreadable (unusual containers)
     and treat it as "unable to check" rather than crashing.
     """
+    if threshold > 0.80 and not getattr(_check_memory_headroom, "_warned_high", False):
+        click.echo(
+            f"[memcheck] WARNING: threshold {threshold:.2f} exceeds the "
+            f"recommended 0.80 ceiling.  The 1.5-2x rechunk transient "
+            f"documented for the write peak can fit inside the remaining "
+            f"buffer up to ~0.80 but not above; OOM risk increases sharply."
+        )
+        _check_memory_headroom._warned_high = True
     try:
         avail = psutil.virtual_memory().available
     except Exception as e:
@@ -135,7 +156,8 @@ def _check_memory_headroom(required_bytes: int, label: str, threshold: float = 0
             f"exceeds {int(threshold*100)}% of currently-available RAM "
             f"({humanize.naturalsize(avail, binary=True)}).\n"
             f"  Reduce the relevant flag (e.g. --eval-data-size-limit, "
-            f"--threads, --shard-mib) or run on a larger node."
+            f"--threads, --shard-mib), raise --memory-threshold (max 0.80 "
+            f"recommended), or run on a larger node."
         )
         MPI.COMM_WORLD.Abort(1)
 
@@ -231,6 +253,13 @@ def _signature_path(where_to_write: str, var: str) -> Path:
 @click.option("--oversubscription-check/--no-oversubscription-check", default=True,
               show_default=True,
               help="At startup, warn/abort if OMP/BLOSC/MKL thread vars aren't pinned to 1.")
+@click.option("--memory-threshold", type=click.FloatRange(0.05, 0.95), default=0.80,
+              show_default=True,
+              help="Fraction of currently-available RAM that any single tracked "
+                   "allocation is allowed to occupy before the run is aborted.  "
+                   "Defaults to 0.80; values above 0.80 emit a one-time warning "
+                   "because the documented 1.5-2x rechunk transient can exceed "
+                   "the remaining buffer.  Hard upper bound 0.95.")
 @click.option("--override-existing-l1-error", type=float, default=None,
               help="Override the existing L1 error threshold from the lookup table.")
 @click.option("--compressor-class", default="all",
@@ -253,6 +282,7 @@ def evaluate_combos(dataset_file,
                     field_to_compress, eval_data_size_limit,
                     threads_per_rank, inner_chunk_mib,
                     oversubscription_check,
+                    memory_threshold,
                     override_existing_l1_error,
                     compressor_class, filter_class, serializer_class,
                     with_lossy, with_numcodecs_wasm, with_ebcc,
@@ -433,6 +463,7 @@ def evaluate_combos(dataset_file,
                 multiplier * actual_sample_bytes,
                 label=f"sample for '{var}' on rank {rank} "
                       f"({humanize.naturalsize(actual_sample_bytes, binary=True)})",
+                threshold=memory_threshold,
             )
 
             if rank == 0:
@@ -1038,6 +1069,13 @@ def evaluate_combos(dataset_file,
 @click.option("--oversubscription-check/--no-oversubscription-check", default=True,
               show_default=True,
               help="At startup, warn/abort if OMP/BLOSC/MKL thread vars aren't pinned to 1.")
+@click.option("--memory-threshold", type=click.FloatRange(0.05, 0.95), default=0.80,
+              show_default=True,
+              help="Fraction of currently-available RAM that any single tracked "
+                   "allocation is allowed to occupy before the run is aborted.  "
+                   "Defaults to 0.80; values above 0.80 emit a one-time warning "
+                   "because the documented 1.5-2x rechunk transient can exceed "
+                   "the remaining buffer.  Hard upper bound 0.95.")
 @click.option("--verify/--no-verify", default=True, show_default=True,
               help="After the write finishes, re-read the persisted store and "
                    "recompute the relative L1/L2/Linf error norms and Euclidean "
@@ -1067,7 +1105,8 @@ def compress_with_optimal(dataset_file, where_to_write, field_to_compress,
                           comp_idx, filt_idx, ser_idx,
                           eval_data_size_limit,
                           inner_chunk_mib, shard_mib,
-                          threads, oversubscription_check, verify,
+                          threads, oversubscription_check, memory_threshold,
+                          verify,
                           compressor_class, filter_class, serializer_class,
                           with_lossy, with_numcodecs_wasm, with_ebcc,
                           force):
@@ -1241,21 +1280,11 @@ def compress_with_optimal(dataset_file, where_to_write, field_to_compress,
         abort_if_unsafe=oversubscription_check, rank=rank,
     )
 
-    # Memory guardrail for the write: documented peak is threads * shard_mib.
-    # In practice rechunk transients can push 1.5-2x above that; we check
-    # against the documented peak as a floor.  If it's already too big, the
-    # real peak will definitely be too big.
-    write_peak_bytes = int(threads) * int(shard_mib) * 2**20
-    _check_memory_headroom(
-        write_peak_bytes,
-        label=f"compress_with_optimal write peak (threads x shard_mib "
-              f"= {threads} x {shard_mib} MiB)",
-    )
-    # The codec-space sample guard is deferred until after the dataset is
-    # opened, so we can check against the ACTUAL sample size (field bytes
-    # capped by the limit) rather than the full budget.  Checking the budget
-    # here would spuriously abort tiny fields when a large default limit is
-    # configured.
+    # Both memory guardrails (write peak + codec-space sample) are deferred
+    # until after the dataset is opened, so we can check against the ACTUAL
+    # data size rather than a configuration upper bound.  Checking the
+    # raw `threads * shard_mib` here would spuriously abort tiny fields
+    # whose total bytes are smaller than a single shard.
 
     # Scope the scheduler + worker-count settings to this function so they
     # don't leak if compress_with_optimal is imported and called from a
@@ -1275,15 +1304,31 @@ def compress_with_optimal(dataset_file, where_to_write, field_to_compress,
         # compressed; the sample below is used only to build the codec space.
         ds = utils.open_dataset(dataset_file, field_to_compress)
         da = ds[field_to_compress]
+        field_bytes = int(da.dtype.itemsize) * int(np.prod(da.shape))
+
+        # Memory guardrail for the write: documented peak is threads * shard_mib,
+        # but capped by field_bytes - you cannot have more transient working
+        # memory than there is data to process.  For a field smaller than one
+        # shard, the real peak is ~field_bytes; for a multi-GB field, it
+        # saturates at threads * shard_mib.  Rechunk transients can push
+        # 1.5-2x above that; we check against the documented peak as a floor.
+        write_peak_bytes = min(int(threads) * int(shard_mib) * 2**20, field_bytes)
+        _check_memory_headroom(
+            write_peak_bytes,
+            label=f"compress_with_optimal write peak for '{field_to_compress}' "
+                  f"(min(threads x shard_mib, field bytes) = "
+                  f"{humanize.naturalsize(write_peak_bytes, binary=True)})",
+            threshold=memory_threshold,
+        )
 
         # Now that `da` is known, check the ACTUAL sample allocation size
         # against available RAM (not the budget-as-upper-bound).
-        field_bytes = int(da.dtype.itemsize) * int(np.prod(da.shape))
         actual_sample_bytes = min(field_bytes, int(eval_data_size_limit))
         _check_memory_headroom(
             actual_sample_bytes,
             label=f"codec-space sample for '{field_to_compress}' "
                   f"({humanize.naturalsize(actual_sample_bytes, binary=True)})",
+            threshold=memory_threshold,
         )
 
         # Build the codec space from a representative sample of the field.
@@ -1557,6 +1602,13 @@ def compress_with_optimal(dataset_file, where_to_write, field_to_compress,
               help="Dask workers for the write.  Default: auto-detected.")
 @click.option("--oversubscription-check/--no-oversubscription-check", default=True,
               show_default=True)
+@click.option("--memory-threshold", type=click.FloatRange(0.05, 0.95), default=0.80,
+              show_default=True,
+              help="Fraction of currently-available RAM that any single tracked "
+                   "allocation is allowed to occupy before the run is aborted.  "
+                   "Defaults to 0.80; values above 0.80 emit a one-time warning "
+                   "because the documented 1.5-2x rechunk transient can exceed "
+                   "the remaining buffer.  Hard upper bound 0.95.")
 @click.option("--verify/--no-verify", default=True, show_default=True)
 @click.option("--compressor-class", default="all")
 @click.option("--filter-class", default="all")
@@ -1572,7 +1624,8 @@ def compress_with_optimal(dataset_file, where_to_write, field_to_compress,
                    "rest (default).  Disable to fail the whole run on first error.")
 def compress_fields_from_results(dataset_file, where_to_write, vars_filter,
                                   eval_data_size_limit, inner_chunk_mib, shard_mib,
-                                  threads, oversubscription_check, verify,
+                                  threads, oversubscription_check, memory_threshold,
+                                  verify,
                                   compressor_class, filter_class, serializer_class,
                                   with_lossy, with_numcodecs_wasm, with_ebcc,
                                   skip_existing, continue_on_error):
@@ -1609,14 +1662,12 @@ def compress_fields_from_results(dataset_file, where_to_write, vars_filter,
     utils.check_thread_oversubscription(
         abort_if_unsafe=oversubscription_check, rank=rank,
     )
-    write_peak_bytes = int(threads) * int(shard_mib) * 2**20
-    _check_memory_headroom(
-        write_peak_bytes,
-        label=f"write peak (threads x shard_mib = {threads} x {shard_mib} MiB)",
-    )
-    # Per-variable sample memory check happens inside the loop below, once
-    # we know each variable's actual size - a single budget-based check
-    # here would spuriously abort on a mix of small and large fields.
+    # Per-variable memory checks (write peak AND codec-space sample) happen
+    # inside the loop below, once we know each variable's actual size.
+    # A single up-front `threads * shard_mib` check would spuriously abort
+    # on small fields (e.g. tigge files where the field is smaller than
+    # one shard) on memory-constrained nodes; a sum-based pre-check would
+    # miss that variables are processed sequentially, not concurrently.
 
     # --------------------------------------------------------------------
     # Resolve (var, comp_idx, filt_idx, ser_idx) list from the where_to_write
@@ -1780,15 +1831,34 @@ def compress_fields_from_results(dataset_file, where_to_write, vars_filter,
                 field_t0 = time.perf_counter()
                 da = ds[var]
 
-                # Per-variable memory guard: check the actual sample size
-                # against available RAM, not the budget (which would abort
-                # tiny fields spuriously when a large default is configured).
+                # Per-variable memory guards: check the ACTUAL allocation
+                # size against available RAM, not configuration upper bounds.
+                # Both the write peak (threads * shard_mib) and the codec-
+                # space sample (eval_data_size_limit) are upper bounds; for
+                # fields smaller than those bounds, the real allocation is
+                # capped by field_bytes.  Aborting on the upper bound would
+                # spuriously trip on tiny fields (e.g. tigge dx=2) on
+                # memory-constrained nodes.
                 field_bytes = int(da.dtype.itemsize) * int(np.prod(da.shape))
+
+                write_peak_bytes = min(
+                    int(threads) * int(shard_mib) * 2**20,
+                    field_bytes,
+                )
+                _check_memory_headroom(
+                    write_peak_bytes,
+                    label=f"write peak for '{var}' "
+                          f"(min(threads x shard_mib, field bytes) = "
+                          f"{humanize.naturalsize(write_peak_bytes, binary=True)})",
+                    threshold=memory_threshold,
+                )
+
                 actual_sample_bytes = min(field_bytes, int(eval_data_size_limit))
                 _check_memory_headroom(
                     actual_sample_bytes,
                     label=f"codec-space sample for '{var}' "
                           f"({humanize.naturalsize(actual_sample_bytes, binary=True)})",
+                    threshold=memory_threshold,
                 )
 
                 # Build codec space from the sample (same contract as
