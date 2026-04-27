@@ -1036,6 +1036,8 @@ def evaluate_combos(dataset_file,
                         f"[sweep] WARNING: could not write manifest "
                         f"{manifest_path}: {manifest_err}"
                     )
+            #np.save(os.path.basename(dataset_file) + '_best_combo.npy', np.asarray(pd.DataFrame([best_combo[0][3], best_combo[0][4], best_combo[0][5]])))
+
 
 
 @cli.command("compress_with_optimal")
