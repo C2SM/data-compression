@@ -64,5 +64,12 @@ model_eval_cscs_exclaim = 'model_eval_cscs_exclaim.cli:cli'
 [tool.setuptools]
 package-dir = {"" = "src"}
 
+[tool.setuptools.package-data]
+# Ship the L1 error threshold CSV inside the wheel.  Without this entry,
+# `pip install .` (non-editable) builds a wheel containing only the .py
+# files, and the runtime lookup at `Path(__file__).parent / "data" / ...`
+# in cli.py fails to find the local fallback.
+dc_toolkit = ["data/*.csv"]
+
 [tool.setuptools.packages.find]
 where = ["src"]

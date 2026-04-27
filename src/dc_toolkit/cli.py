@@ -225,6 +225,94 @@ def _signature_path(where_to_write: str, var: str) -> Path:
     return Path(where_to_write) / f"sample_signature_{var}.json"
 
 
+# =============================================================================
+# L1 error threshold lookup
+# =============================================================================
+# Source of truth is a Google Sheet (column layout: "Short Name", "Unit",
+# "Existing L1 error", ...).  We mirror the latest successful fetch to a
+# CSV alongside this module so offline / CI / network-degraded runs still
+# have something to consult.  The on-disk copy is intended to be checked
+# into the repo so a fresh clone has a working fallback even before the
+# first online run.
+
+_L1_THRESHOLDS_SHEET_ID = "1lHcX-HE2WpVCOeKyDvM4iFqjlWvkd14lJlA-CUoCxMM"
+_L1_THRESHOLDS_SHEET_URL = (
+    f"https://docs.google.com/spreadsheets/d/{_L1_THRESHOLDS_SHEET_ID}/export?format=csv"
+)
+_LOCAL_L1_THRESHOLDS_PATH = (
+    Path(__file__).parent / "data" / "l1_error_thresholds.csv"
+)
+
+
+def _load_l1_error_thresholds(rank: int) -> "pd.DataFrame | None":
+    """
+    Load the L1 error threshold table.
+
+    Resolution order:
+      1. Remote Google Sheet (authoritative).  On success the result is
+         mirrored to `_LOCAL_L1_THRESHOLDS_PATH` so the next offline run
+         has an up-to-date snapshot.
+      2. Local CSV at `_LOCAL_L1_THRESHOLDS_PATH` (committed to the repo).
+         Used only when the remote fetch raises - typically: no network,
+         the sheet was renamed/permissioned, or the CSV export endpoint
+         is briefly down.
+
+    Returns the DataFrame on success, or `None` if neither source yields
+    one.  The caller is responsible for aborting with a useful message in
+    that case.
+
+    Only the calling rank reads/writes; the resulting DataFrame is
+    broadcast by the caller (we do not enter MPI here so the helper stays
+    usable from non-MPI contexts as well).
+
+    The local cache write is best-effort: if the package directory is
+    read-only (e.g. installed into a system site-packages, sandboxed CI),
+    we log a note and still return the in-memory DataFrame.  The remote
+    payload is the same data, so a failed cache is not a fatal condition.
+    """
+    # ---- 1) Try remote --------------------------------------------------
+    try:
+        thresholds = pd.read_csv(_L1_THRESHOLDS_SHEET_URL)
+    except Exception as remote_err:
+        click.echo(
+            f"[Rank {rank}] Remote L1 threshold fetch failed: {remote_err}.  "
+            f"Trying local fallback at {_LOCAL_L1_THRESHOLDS_PATH}."
+        )
+    else:
+        # Refresh the on-disk fallback.  Best-effort - see docstring.
+        try:
+            _LOCAL_L1_THRESHOLDS_PATH.parent.mkdir(parents=True, exist_ok=True)
+            thresholds.to_csv(_LOCAL_L1_THRESHOLDS_PATH, index=False)
+        except Exception as cache_err:
+            click.echo(
+                f"[Rank {rank}] Note: could not refresh local L1 threshold "
+                f"cache at {_LOCAL_L1_THRESHOLDS_PATH} ({cache_err}); "
+                f"continuing with the remote copy."
+            )
+        return thresholds
+
+    # ---- 2) Try local fallback -----------------------------------------
+    if _LOCAL_L1_THRESHOLDS_PATH.is_file():
+        try:
+            thresholds = pd.read_csv(_LOCAL_L1_THRESHOLDS_PATH)
+            click.echo(
+                f"[Rank {rank}] Loaded L1 thresholds from local fallback "
+                f"({_LOCAL_L1_THRESHOLDS_PATH})."
+            )
+            return thresholds
+        except Exception as local_err:
+            click.echo(
+                f"[Rank {rank}] Local L1 threshold fallback at "
+                f"{_LOCAL_L1_THRESHOLDS_PATH} is unreadable: {local_err}."
+            )
+    else:
+        click.echo(
+            f"[Rank {rank}] No local L1 threshold fallback found at "
+            f"{_LOCAL_L1_THRESHOLDS_PATH}."
+        )
+    return None
+
+
 @cli.command("evaluate_combos")
 @click.argument("dataset_file", type=click.Path(exists=True, dir_okay=True, file_okay=True))
 @click.option("--where-to-write", "where_to_write", required=True,
@@ -389,18 +477,27 @@ def evaluate_combos(dataset_file,
         # Skipped entirely when the user has supplied --override-existing-l1-error,
         # because we'd never read from the table in that case.  Avoids the slow,
         # network-dependent Google Sheets call for offline/CI runs.
+        #
+        # `_load_l1_error_thresholds` first tries the remote Google Sheet and,
+        # on failure, falls back to the CSV cached at
+        # `_LOCAL_L1_THRESHOLDS_PATH` (committed to the repo).  Returns None
+        # if neither source yields a usable table; we then abort with a
+        # message pointing the user at --override-existing-l1-error.
         # -------------------------------------------------------------------------
         thresholds = None
         if override_existing_l1_error is None:
             if rank == 0:
-                try:
-                    sheet_id = "1lHcX-HE2WpVCOeKyDvM4iFqjlWvkd14lJlA-CUoCxMM"
-                    sheet_url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv"
-                    thresholds = pd.read_csv(sheet_url)
-                except Exception as e:
+                thresholds = _load_l1_error_thresholds(rank=rank)
+                if thresholds is None:
                     click.echo(
-                        f"[Rank 0] Failed to fetch thresholds: {e}  "
-                        f"(pass --override-existing-l1-error to skip the lookup.)"
+                        "[Rank 0] ERROR: could not load the L1 error "
+                        "threshold table from either the remote Google "
+                        "Sheet or the local fallback at "
+                        f"{_LOCAL_L1_THRESHOLDS_PATH}.\n"
+                        "  Re-run with --override-existing-l1-error <value> "
+                        "to specify a threshold explicitly, or fix "
+                        "connectivity / restore the local CSV before "
+                        "retrying."
                     )
                     comm.Abort(1)
 
@@ -445,6 +542,31 @@ def evaluate_combos(dataset_file,
                     existing_l1_error = float(raw_threshold)
             else:
                 existing_l1_error = override_existing_l1_error
+
+            # If we still couldn't pin down a threshold - either because
+            # the variable isn't in the lookup table, the units don't
+            # match, or the relevant cell is empty/NaN, AND no manual
+            # override was supplied - we have no basis for the `keep`
+            # filter that drives the whole sweep.  Letting the run
+            # continue would silently disable filtering for this variable
+            # (every combo would be marked keep=True), defeating the
+            # point of the lookup.  Abort with an actionable message.
+            if existing_l1_error is None:
+                if rank == 0:
+                    var_units = da.attrs.get("units", "N/A")
+                    click.echo(
+                        f"[var] {var} | ERROR: cannot determine an L1 "
+                        f"error threshold for this variable (no row "
+                        f"matching Short Name='{var}' with Unit="
+                        f"'{var_units}' in the threshold table, or the "
+                        f"row's 'Existing L1 error' cell is empty/NaN).\n"
+                        f"  Re-run with --override-existing-l1-error "
+                        f"<value> to specify a threshold explicitly, or "
+                        f"add an entry for '{var}' to the lookup table "
+                        f"(remote Google Sheet, or the local fallback at "
+                        f"{_LOCAL_L1_THRESHOLDS_PATH})."
+                    )
+                comm.Abort(1)
 
             if rank == 0:
                 click.echo(
