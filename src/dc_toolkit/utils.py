@@ -157,6 +157,98 @@ def is_lat_lon(da):
 # REPRESENTATIVE SAMPLING  (replaces the old corner-slice strategy)
 # =============================================================================
 
+# Time-like dim name patterns, used as a FALLBACK by build_representative_sample
+# when CF metadata isn't available.  The primary detection path uses
+# CF-conventions attributes (units, standard_name, axis, calendar) on
+# the coord variable corresponding to each dim — that's the principled
+# answer.  The regex below is a name-matching backstop for files with
+# missing or sloppy CF metadata.  Conservative on purpose: a missed
+# match falls back to "return whole field with warning", which is a
+# soft failure (slightly more memory at sweep time) rather than a
+# silent biased-sample bug.  Add patterns here if you encounter
+# datasets whose temporal axis is named differently AND lacks CF
+# metadata to identify it structurally.
+_TIME_LIKE_DIM_RE = re.compile(
+    r'^(?:time|.*_time|t|step|forecast_reference_time|forecast_period|'
+    r'ensemble|realization|member|reftime|valid_time|epoch)$',
+    re.IGNORECASE,
+)
+
+# CF time-units pattern: "<unit> since <reference time>".  CF spec allows
+# unit names like 'seconds', 'minutes', 'hours', 'days', 'months', 'years'
+# (and their abbreviations).  We deliberately don't enumerate those — any
+# alphanumeric token followed by 'since' is uniquely a time-unit string
+# in CF conventions; no other coordinate type uses this format.
+_CF_TIME_UNITS_RE = re.compile(r'^\s*\w+\s+since\s+', re.IGNORECASE)
+
+# CF standard_name values that mark a time-related axis.
+_CF_TIME_STANDARD_NAMES = frozenset({
+    'time',
+    'forecast_reference_time',
+    'forecast_period',
+})
+
+
+def _is_time_like_coord(da: xr.DataArray, dim_name: str) -> bool:
+    """Decide whether `dim_name` of `da` is a time axis.
+
+    Order of evidence (most authoritative first):
+      1. Corresponding coord variable's `units` attr starts with a CF
+         time-units pattern like 'days since', 'hours since' — this is
+         the canonical CF time signature; no other coordinate type uses
+         this format.
+      2. `standard_name` is one of the CF time-axis standard names.
+      3. `axis` attr is 'T' (CF specifies four axis-type codes:
+         X, Y, Z, T).
+      4. `calendar` attr is present.  Only time vars have calendars,
+         so this is a strong positive signal even when other CF attrs
+         are missing.
+      5. Fallback: dim NAME matches `_TIME_LIKE_DIM_RE`.
+
+    Both `coord.attrs` and `coord.encoding` are checked because
+    xarray's `decode_times=True` (the default) moves CF time attributes
+    from `attrs` to `encoding` after parsing — we have to look in both
+    to be robust to the caller's open_dataset choices.
+
+    Dims without a corresponding coord variable (which happens in
+    netCDF when a dim isn't backed by a same-name 1-D variable) skip
+    straight to the name-regex fallback.
+
+    Returns True on the first positive signal.
+    """
+    coord = da.coords.get(dim_name)
+    if coord is not None:
+        # Merge attrs and encoding; encoding wins on conflicts because
+        # decoded time vars store the original units/calendar in
+        # encoding rather than attrs.
+        merged = {**dict(coord.attrs), **dict(coord.encoding)}
+
+        units = merged.get('units')
+        if isinstance(units, str) and _CF_TIME_UNITS_RE.match(units):
+            return True
+
+        std_name = merged.get('standard_name')
+        if isinstance(std_name, str) and std_name in _CF_TIME_STANDARD_NAMES:
+            return True
+
+        if merged.get('axis') == 'T':
+            return True
+
+        if 'calendar' in merged:
+            return True
+
+    return bool(_TIME_LIKE_DIM_RE.match(dim_name))
+
+
+def _find_time_like_dim(da: xr.DataArray) -> Tuple[Optional[int], Optional[str]]:
+    """First time-like dim's (index, name) in `da.dims`, or (None, None)
+    if no dim qualifies under either CF metadata or the name fallback."""
+    for i, name in enumerate(da.dims):
+        if _is_time_like_coord(da, name):
+            return i, name
+    return None, None
+
+
 def build_representative_sample(
     da: xr.DataArray,
     size_limit_bytes: int,
@@ -169,10 +261,23 @@ def build_representative_sample(
     Strategy
     --------
     - If the whole field fits under the limit: return it unchanged.
-    - Otherwise: keep trailing spatial dims full (that's where codecs exploit
-      smoothness), stride-sample along the LEADING dim (usually time or
-      ensemble).  This preserves spatial structure and samples across the
-      leading axis instead of taking a corner.
+    - Otherwise: find the first time-like dim of `da` (using CF metadata
+      on the corresponding coord variable when available — `units`,
+      `standard_name`, `axis`, `calendar` — and falling back to a name
+      regex when CF metadata is absent), and stride-sample along it.
+      Non-time dims are kept full so codecs can still exploit spatial
+      smoothness; striding along time samples across the temporal axis
+      instead of taking a corner.  See `_is_time_like_coord` for the
+      detection rules.
+    - If NO time-like dim is present (e.g. CF coordinate-bounds arrays
+      like `clat_bnds`, or SCRIP remapping artifacts like
+      `src_grid_area`), there is no axis the sweep can meaningfully
+      stride over.  We return the whole field with a warning rather
+      than silently striding along the wrong axis (the pre-patch
+      behaviour, which produced a biased sample for these vars).  In
+      practice the variables that hit this branch are small bookkeeping
+      arrays where the size cap was never going to bite; if a large
+      variable lacks a time axis, the warning makes the case visible.
     - A deterministic `np.linspace`-style stride is used so results are
       reproducible between `evaluate_combos` and `compress_with_optimal`.
     """
@@ -187,29 +292,67 @@ def build_representative_sample(
             )
         return da
 
-    leading_dim = da.dims[0]
-    leading_size = da.sizes[leading_dim]
+    # Locate the time-like dim using CF metadata (units, standard_name,
+    # axis, calendar) on the coord variable, with a name-regex fallback.
+    # This handles three cases consistently: time at dims[0] (the common
+    # case), time at a non-leading position, and no time axis at all.
+    time_idx, time_dim = _find_time_like_dim(da)
 
-    # Per-slice (fixing leading index) byte cost.
-    trailing_bytes = int(da.dtype.itemsize) * int(np.prod(da.shape[1:]))
+    if time_dim is None:
+        # No axis we can stride over.  Return the field whole and warn.
+        # The variables that hit this branch in well-formed climate data
+        # are CF bounds and SCRIP remap arrays - small enough that
+        # returning them whole is safe.  A LARGE variable without a
+        # time axis would deserve human review; the warning surfaces it.
+        if rank == 0:
+            click.echo(
+                f"[sample] WARNING: variable '{da.name}' has dims {da.dims} "
+                f"with no time-like axis; cannot stride-sample.  Returning "
+                f"the full field "
+                f"({humanize.naturalsize(nbytes, binary=True)}), which "
+                f"exceeds the "
+                f"{humanize.naturalsize(size_limit_bytes, binary=True)} "
+                f"cap.  This is normal for small bookkeeping arrays "
+                f"(coord bounds, remap weights); investigate if the "
+                f"variable is large and downstream OOMs."
+            )
+        return da
+
+    leading_size = da.sizes[time_dim]
+
+    # Per-slice byte cost = product of the OTHER dims' sizes * itemsize.
+    # Pre-patch this was hardcoded as `da.shape[1:]`, which assumed
+    # dims[0] was the axis being subset.  Now we exclude whichever
+    # position the time-like axis sits at, so e.g. (height, time, lat,
+    # lon) computes trailing across (height, lat, lon) and strides
+    # along time at position 1.
+    trailing_shape = tuple(s for i, s in enumerate(da.shape) if i != time_idx)
+    trailing_bytes = int(da.dtype.itemsize) * int(np.prod(trailing_shape))
     if trailing_bytes == 0:
         return da  # degenerate; nothing to sample
 
     max_slices = max(1, size_limit_bytes // trailing_bytes)
     max_slices = int(min(max_slices, leading_size))
 
-    # Evenly-spaced indices spanning [0, leading_size-1].
+    # Evenly-spaced indices spanning [0, leading_size-1].  Deterministic
+    # so evaluate_combos and compress_with_optimal reproduce the same
+    # sample given the same size_limit_bytes.
     indices = np.linspace(0, leading_size - 1, num=max_slices, dtype=int)
     indices = np.unique(indices).tolist()
 
-    sampled = da.isel({leading_dim: indices})
+    sampled = da.isel({time_dim: indices})
 
     if rank == 0:
+        position_note = (
+            "" if time_idx == 0
+            else f" (at dim position {time_idx}, not leading)"
+        )
         click.echo(
             f"[sample] field is "
             f"{humanize.naturalsize(nbytes, binary=True)} > limit "
             f"{humanize.naturalsize(size_limit_bytes, binary=True)}; "
-            f"sampled {len(indices)}/{leading_size} along '{leading_dim}' "
+            f"sampled {len(indices)}/{leading_size} along "
+            f"'{time_dim}'{position_note} "
             f"-> {humanize.naturalsize(sampled.nbytes, binary=True)}."
         )
 
