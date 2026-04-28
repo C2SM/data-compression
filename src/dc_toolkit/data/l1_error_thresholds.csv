@@ -25,13 +25,13 @@ Near IR albedo for diffuse radiation (climatological),alnid,18,dimensionless,Sin
 Lake cover,cl,26,dimensionless,Single/Surface,0,1,"0,00000005960464478",Other,"0,00001",,,"0,01",,,,Energy,,Margarita Choulga
 Low vegetation cover,cvl,27,dimensionless,Single/Surface,0,1,"0,00000005960464478",Other,"0,00001",,,"0,01",,,,Energy,,
 High vegetation cover,cvh,28,dimensionless,Single/Surface,0,1,"0,00000005960464478",Other,"0,00001",,,"0,01",,,,Energy,,
-Type of low vegetation,tvl,29,(Code table 4.234),Single/Surface,0,17,"0,0002593994141",Other,N/A,N/A,N/A,N/A,N/A,N/A,N/A,,,The vegetation type values are integers - there shouldn't be an error associated with them.
-Type of high vegetation,tvh,30,(Code table 4.234),Single/Surface,0,19,"0,0002899169922",Other,N/A,N/A,N/A,N/A,N/A,N/A,N/A,,,The vegetation type values are integers - there shouldn't be an error associated with them.
+Type of low vegetation,tvl,29,(Code table 4.234),Single/Surface,0,17,"0,0002593994141",Other,,,,,,,,,,The vegetation type values are integers - there shouldn't be an error associated with them.
+Type of high vegetation,tvh,30,(Code table 4.234),Single/Surface,0,19,"0,0002899169922",Other,,,,,,,,,,The vegetation type values are integers - there shouldn't be an error associated with them.
 Sea ice area fraction,ci,31,dimensionless,Single/Surface,0,1,"0,00001525878906",Other,"0,05",,,"0,01",,"0,05",,,,
 Snow albedo,asn,32,dimensionless,Single/Surface,"0,5199999","0,8800079","0,000005493286153",Normal,"0,001",,,"0,001",,,,Energy,Both Energy and water budget,Ask Gabriele Arduini
 Snow density,rsn,33,kg m**-3,Single/Surface,"99,999985",450,"0,005340576172",Normal,"0,1",,,"0,01",,,,,,
 Sea surface temperature,sst,34,K,Single/Surface,"267,95508","311,38647","0,0006627105176",Normal,"0,01",,"0,01",,,,,,,Peter B. recommends 0.01K for T fields for long integrations to make budgets
-Soil type,slt,43,(Code table 4.213),Single/Surface,0,7,"0,0000004172325134",Other,N/A,N/A,N/A,N/A,N/A,N/A,N/A,,,The soil type values are integers - there shouldn't be an error associated with them.
+Soil type,slt,43,(Code table 4.213),Single/Surface,0,7,"0,0000004172325134",Other,,,,,,,,,,The soil type values are integers - there shouldn't be an error associated with them.
 Snow evaporation,es,44,m of water equivalent,Single/Surface,"-0,0006759828","0,00046391226","0,00000001739341826",Other,"0,00001",,,"0,01",,,,,,
 Snowmelt,smlt,45,m of water equivalent,Single/Surface,0,"0,014152765","0,00000021595406",,"0,00001",,,"0,01",,,,,,
 Maximum 10 metre wind gust since previous post-processing,10fg,49,m s**-1,Single/Surface,"0,41986078","54,995937","0,0008327648393",,"0,5",,"0,5",,,,,,,

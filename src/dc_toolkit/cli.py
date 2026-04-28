@@ -338,6 +338,21 @@ def _load_l1_error_thresholds(rank: int) -> "pd.DataFrame | None":
               help="Target size of a zarr chunk (in MiB) during in-memory evaluation. "
                    "For the measured compression ratio to reflect production conditions, "
                    "pass the same value to compress_with_optimal.")
+@click.option("--max-inner-chunk-mib", type=int, default=256, show_default=True,
+              help="Hard ceiling on inner chunk size (in MiB).  Only enforced "
+                   "with --no-spatial-split: when one timestep already exceeds "
+                   "--inner-chunk-mib and spatial splitting is disabled, the "
+                   "resulting chunk may be very large; if it also exceeds this "
+                   "ceiling we emit a warning.  Codec internals (zstd block "
+                   "limit, blosc memory) start to misbehave around the GB mark, "
+                   "so leaving the default at 256 is a safety net.")
+@click.option("--spatial-split/--no-spatial-split", default=True, show_default=True,
+              help="When one timestep already exceeds --inner-chunk-mib, split "
+                   "spatial dims (horizontal/cell first, vertical last -- "
+                   "hiopy approach) until the chunk fits the target.  Disable "
+                   "with --no-spatial-split to keep one timestep per chunk "
+                   "with full spatial extent (matches the hiopy on-disk "
+                   "layout, but produces oversized chunks).")
 @click.option("--oversubscription-check/--no-oversubscription-check", default=True,
               show_default=True,
               help="At startup, warn/abort if OMP/BLOSC/MKL thread vars aren't pinned to 1.")
@@ -369,6 +384,7 @@ def evaluate_combos(dataset_file,
                     where_to_write,
                     field_to_compress, eval_data_size_limit,
                     threads_per_rank, inner_chunk_mib,
+                    max_inner_chunk_mib, spatial_split,
                     oversubscription_check,
                     memory_threshold,
                     override_existing_l1_error,
@@ -786,10 +802,34 @@ def evaluate_combos(dataset_file,
                     serializer_ = "auto"
                     local_ser_idx = -1
 
-                # Chunks for the eval memory store (configurable via --inner-chunk-mib)
+                # Chunks for the eval memory store.  Same algorithm as the
+                # persist path (compute_chunk_and_shard_shape) so the measured
+                # compression ratio reflects production conditions.  When
+                # --no-spatial-split is set, chunks may exceed --inner-chunk-mib
+                # (one timestep, full spatial); a warning is emitted once if
+                # they also exceed --max-inner-chunk-mib.
                 eval_chunks = utils.compute_chunk_shape_for_eval(
-                    data_np.shape, data_np.dtype, target_mib=inner_chunk_mib,
+                    data_np.shape, data_np.dtype,
+                    target_mib=inner_chunk_mib,
+                    dims=dims,
+                    max_target_mib=max_inner_chunk_mib,
+                    allow_spatial_split=spatial_split,
                 )
+                _eval_chunk_bytes = int(np.dtype(data_np.dtype).itemsize) \
+                                    * int(np.prod(eval_chunks))
+                if (not spatial_split
+                        and _eval_chunk_bytes > max_inner_chunk_mib * 2**20
+                        and not getattr(_evaluate_one, "_warned_oversize", False)):
+                    click.echo(
+                        f"[chunks] WARNING: --no-spatial-split produced an eval "
+                        f"chunk of "
+                        f"{humanize.naturalsize(_eval_chunk_bytes, binary=True)} "
+                        f"(shape {eval_chunks}), which exceeds "
+                        f"--max-inner-chunk-mib ({max_inner_chunk_mib} MiB).  "
+                        f"Codec internals may misbehave at this size.  "
+                        f"Re-enable spatial splitting or lower the field size."
+                    )
+                    _evaluate_one._warned_oversize = True
 
                 ratio, errors, eucd = utils.evaluate_codec_pipeline(
                     data_np, dims,
@@ -1096,6 +1136,8 @@ def evaluate_combos(dataset_file,
                         "eval_data_size_limit": int(eval_data_size_limit),
                         "threads_per_rank": int(threads_per_rank),
                         "inner_chunk_mib": int(inner_chunk_mib),
+                        "max_inner_chunk_mib": int(max_inner_chunk_mib),
+                        "spatial_split": bool(spatial_split),
                         "compressor_class": compressor_class,
                         "filter_class": filter_class,
                         "serializer_class": serializer_class,
@@ -1181,9 +1223,26 @@ def evaluate_combos(dataset_file,
               help="Target size of a zarr inner chunk, in MiB. "
                    "For the measured compression ratio in evaluate_combos to reflect "
                    "production conditions, pass the same value here.")
+@click.option("--max-inner-chunk-mib", type=int, default=256, show_default=True,
+              help="Hard ceiling on inner chunk size (in MiB).  Only enforced "
+                   "with --no-spatial-split: when one timestep already exceeds "
+                   "--inner-chunk-mib and spatial splitting is disabled, the "
+                   "resulting chunk may be very large; if it also exceeds this "
+                   "ceiling we emit a warning.")
+@click.option("--spatial-split/--no-spatial-split", default=True, show_default=True,
+              help="When one timestep already exceeds --inner-chunk-mib, split "
+                   "spatial dims (horizontal/cell first, vertical last -- "
+                   "hiopy approach) until the chunk fits the target.  Disable "
+                   "with --no-spatial-split to keep one timestep per chunk "
+                   "with full spatial extent (matches the hiopy on-disk "
+                   "layout, but produces oversized chunks AND skips sharding "
+                   "since one shard would only bundle one chunk).")
 @click.option("--shard-mib", type=int, default=512, show_default=True,
               help="Target shard size in MiB. Each shard contains an integer "
-                   "number of inner chunks.")
+                   "number of inner chunks.  When one inner chunk already "
+                   "meets or exceeds this target, sharding is skipped "
+                   "automatically (a shard bundling <= 1 chunk would add "
+                   "only index overhead).")
 @click.option("--threads", type=int, default=None,
               help="Number of dask workers used for the parallel write. "
                    "Default: auto-detected from visible cores. "
@@ -1226,7 +1285,8 @@ def evaluate_combos(dataset_file,
 def compress_with_optimal(dataset_file, where_to_write, field_to_compress,
                           comp_idx, filt_idx, ser_idx,
                           eval_data_size_limit,
-                          inner_chunk_mib, shard_mib,
+                          inner_chunk_mib, max_inner_chunk_mib,
+                          spatial_split, shard_mib,
                           threads, oversubscription_check, memory_threshold,
                           verify,
                           compressor_class, filter_class, serializer_class,
@@ -1584,11 +1644,34 @@ def compress_with_optimal(dataset_file, where_to_write, field_to_compress,
         if optimal_serializer is None:
             serializer_ = "auto"
 
-        # Compute sharding geometry for the FULL field
+        # Compute sharding geometry for the FULL field.  Passes dim names so
+        # vertical-like dims are kept whole when spatial splitting is needed
+        # (hiopy approach).  shards may come back as None -- that signals
+        # "skip sharding" because one inner chunk already meets the shard
+        # target (a shard would bundle <= 1 chunk and add only index overhead).
         inner_chunks, shards = utils.compute_chunk_and_shard_shape(
             data_to_persist.shape, data_to_persist.dtype,
             inner_mib=inner_chunk_mib, shard_mib=shard_mib,
+            dims=tuple(data_to_persist.dims),
+            max_inner_mib=max_inner_chunk_mib,
+            allow_spatial_split=spatial_split,
         )
+
+        _itemsize = int(data_to_persist.dtype.itemsize)
+        _inner_bytes = _itemsize * int(np.prod(inner_chunks))
+        _shard_bytes = (_itemsize * int(np.prod(shards))
+                        if shards is not None else _inner_bytes)
+        if (not spatial_split
+                and _inner_bytes > max_inner_chunk_mib * 2**20
+                and rank == 0):
+            click.echo(
+                f"[chunks] WARNING: --no-spatial-split produced an inner chunk of "
+                f"{humanize.naturalsize(_inner_bytes, binary=True)} "
+                f"(shape {inner_chunks}), exceeding --max-inner-chunk-mib "
+                f"({max_inner_chunk_mib} MiB).  Codec internals (zstd block "
+                f"limit, blosc memory) may misbehave at this size.  Consider "
+                f"re-enabling spatial splitting."
+            )
 
         # Open (or create) the shared merged store.  mode='a' means new fields are
         # added alongside any fields previously written.
@@ -1605,9 +1688,36 @@ def compress_with_optimal(dataset_file, where_to_write, field_to_compress,
             )
             raise
 
-        click.echo(
-            f"[persist] {field_to_compress} -> {merged_path} "
-            f"(inner chunks={inner_chunks}, shards={shards})"
+        if shards is None:
+            click.echo(
+                f"[persist] {field_to_compress} -> {merged_path} "
+                f"(inner chunks={inner_chunks}, "
+                f"{humanize.naturalsize(_inner_bytes, binary=True)}; "
+                f"sharding skipped -- one chunk >= shard target)"
+            )
+        else:
+            click.echo(
+                f"[persist] {field_to_compress} -> {merged_path} "
+                f"(inner chunks={inner_chunks}, "
+                f"{humanize.naturalsize(_inner_bytes, binary=True)}; "
+                f"shards={shards}, "
+                f"{humanize.naturalsize(_shard_bytes, binary=True)})"
+            )
+
+        # Refined memory guardrail using ACTUAL write-unit bytes (one task =
+        # one shard if sharded, one chunk otherwise).  The earlier check at
+        # the top of the dask context used `threads * shard_mib` as an
+        # upper-bound estimate, but that can under-count when chunks are
+        # oversized (--no-spatial-split + huge timestep) or over-count when
+        # the field is small.  Now that we know the real geometry, re-check.
+        _write_unit_bytes = _shard_bytes  # == _inner_bytes when shards is None
+        _real_write_peak = min(int(threads) * int(_write_unit_bytes), field_bytes)
+        _check_memory_headroom(
+            _real_write_peak,
+            label=f"compress_with_optimal real write peak for "
+                  f"'{field_to_compress}' (threads x write-unit-bytes = "
+                  f"{humanize.naturalsize(_real_write_peak, binary=True)})",
+            threshold=memory_threshold,
         )
 
         persist_t0 = time.perf_counter()
@@ -1661,6 +1771,8 @@ def compress_with_optimal(dataset_file, where_to_write, field_to_compress,
                 "ser_idx":  int(ser_idx),
                 "eval_data_size_limit": int(eval_data_size_limit),
                 "inner_chunk_mib": int(inner_chunk_mib),
+                "max_inner_chunk_mib": int(max_inner_chunk_mib),
+                "spatial_split": bool(spatial_split),
                 "shard_mib": int(shard_mib),
                 "threads": int(threads),
                 "verify": bool(verify),
@@ -1670,7 +1782,10 @@ def compress_with_optimal(dataset_file, where_to_write, field_to_compress,
                 "serializer_class": serializer_class,
             },
             "inner_chunks": list(inner_chunks),
-            "shards": list(shards),
+            "inner_chunk_bytes": int(_inner_bytes),
+            "shards": (list(shards) if shards is not None else None),
+            "shard_bytes": (int(_shard_bytes) if shards is not None else None),
+            "sharding_skipped": bool(shards is None),
             "compressor": str(optimal_compressor),
             "filter":     str(optimal_filter),
             "serializer": str(optimal_serializer),
@@ -1719,6 +1834,15 @@ def compress_with_optimal(dataset_file, where_to_write, field_to_compress,
               show_default=True,
               help="Must match the value used in the prior evaluate_combos run.")
 @click.option("--inner-chunk-mib", type=int, default=16, show_default=True)
+@click.option("--max-inner-chunk-mib", type=int, default=256, show_default=True,
+              help="Hard ceiling on inner chunk size (MiB).  Triggers a warning "
+                   "if exceeded under --no-spatial-split.")
+@click.option("--spatial-split/--no-spatial-split", default=True, show_default=True,
+              help="When one timestep already exceeds --inner-chunk-mib, split "
+                   "spatial dims (horizontal/cell first, vertical last) until "
+                   "the chunk fits target.  Pass --no-spatial-split to keep "
+                   "one timestep per chunk regardless of size (hiopy-style "
+                   "layout; sharding is then skipped automatically).")
 @click.option("--shard-mib", type=int, default=512, show_default=True)
 @click.option("--threads", type=int, default=None,
               help="Dask workers for the write.  Default: auto-detected.")
@@ -1745,7 +1869,8 @@ def compress_with_optimal(dataset_file, where_to_write, field_to_compress,
               help="If compressing one field fails, log and continue with the "
                    "rest (default).  Disable to fail the whole run on first error.")
 def compress_fields_from_results(dataset_file, where_to_write, vars_filter,
-                                  eval_data_size_limit, inner_chunk_mib, shard_mib,
+                                  eval_data_size_limit, inner_chunk_mib,
+                                  max_inner_chunk_mib, spatial_split, shard_mib,
                                   threads, oversubscription_check, memory_threshold,
                                   verify,
                                   compressor_class, filter_class, serializer_class,
@@ -2073,6 +2198,37 @@ def compress_fields_from_results(dataset_file, where_to_write, vars_filter,
                 inner_chunks, shards = utils.compute_chunk_and_shard_shape(
                     data_to_persist.shape, data_to_persist.dtype,
                     inner_mib=inner_chunk_mib, shard_mib=shard_mib,
+                    dims=tuple(data_to_persist.dims),
+                    max_inner_mib=max_inner_chunk_mib,
+                    allow_spatial_split=spatial_split,
+                )
+
+                _itemsize = int(data_to_persist.dtype.itemsize)
+                _inner_bytes = _itemsize * int(np.prod(inner_chunks))
+                _shard_bytes = (_itemsize * int(np.prod(shards))
+                                if shards is not None else _inner_bytes)
+                if (not spatial_split
+                        and _inner_bytes > max_inner_chunk_mib * 2**20
+                        and rank == 0):
+                    click.echo(
+                        f"[chunks] WARNING: --no-spatial-split for '{var}' "
+                        f"produced an inner chunk of "
+                        f"{humanize.naturalsize(_inner_bytes, binary=True)} "
+                        f"(shape {inner_chunks}), exceeding "
+                        f"--max-inner-chunk-mib ({max_inner_chunk_mib} MiB).  "
+                        f"Codec internals may misbehave at this size."
+                    )
+
+                # Refined memory guardrail using ACTUAL write-unit bytes.
+                _write_unit_bytes = _shard_bytes
+                _real_write_peak = min(int(threads) * int(_write_unit_bytes),
+                                       field_bytes)
+                _check_memory_headroom(
+                    _real_write_peak,
+                    label=f"real write peak for '{var}' "
+                          f"(threads x write-unit-bytes = "
+                          f"{humanize.naturalsize(_real_write_peak, binary=True)})",
+                    threshold=memory_threshold,
                 )
 
                 store = zarr.storage.LocalStore(merged_path, read_only=False)
@@ -2084,10 +2240,21 @@ def compress_fields_from_results(dataset_file, where_to_write, vars_filter,
                             f"[persist] ERROR opening group at {merged_path}: {e}"
                         )
                         raise
-                    click.echo(
-                        f"[persist] {var} -> {merged_path} "
-                        f"(inner chunks={inner_chunks}, shards={shards})"
-                    )
+                    if shards is None:
+                        click.echo(
+                            f"[persist] {var} -> {merged_path} "
+                            f"(inner chunks={inner_chunks}, "
+                            f"{humanize.naturalsize(_inner_bytes, binary=True)}; "
+                            f"sharding skipped)"
+                        )
+                    else:
+                        click.echo(
+                            f"[persist] {var} -> {merged_path} "
+                            f"(inner chunks={inner_chunks}, "
+                            f"{humanize.naturalsize(_inner_bytes, binary=True)}; "
+                            f"shards={shards}, "
+                            f"{humanize.naturalsize(_shard_bytes, binary=True)})"
+                        )
                     ratio, errors, eucd = utils.persist_with_codec_pipeline(
                         data_to_persist, store,
                         component=var,

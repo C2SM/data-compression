@@ -363,20 +363,165 @@ def build_representative_sample(
 # CHUNK & SHARD SIZING
 # =============================================================================
 
-def compute_chunk_shape_for_eval(shape, dtype, target_mib: int = 16):
+# -----------------------------------------------------------------------------
+# Vertical-dim recognition (for hiopy-style shrink order: shrink horizontal
+# spatial dims first, keep vertical levels whole as long as possible).
+#
+# Vertical structure in climate fields is the most compressible axis (strong
+# correlation across levels), so splitting levels destroys a lot of ratio.
+# When forced to split spatially, prefer to shrink the horizontal/cell dim
+# first.  Recognition is name-based only -- the caller supplies `dims`
+# (tuple of dim names) when it has them; if not, we fall back to plain
+# C-order (last dim first).
+# -----------------------------------------------------------------------------
+_VERTICAL_DIM_NAMES = {
+    "lev", "level", "levels", "plev", "plevs", "pressure", "pressure_level",
+    "height", "altitude", "alt", "depth", "z",
+    "model_level", "model_level_number", "ml",
+    "vertical", "vert",
+    "bottom_top", "bottom_top_stag",
+    "mlev", "ilev", "lev_p", "lev_l", "soil_layers_stag",
+    "isobaric", "isobaric1", "isobaric2",
+    "sigma", "sigma_level",
+    "hybrid", "hybrid_level",
+}
+
+
+def _is_vertical_like_dim(name) -> bool:
+    """True if `name` looks like a vertical (level/height/depth) dim."""
+    if name is None:
+        return False
+    n = str(name).lower().strip()
+    if n in _VERTICAL_DIM_NAMES:
+        return True
+    if n.startswith(("lev", "plev", "ilev", "mlev")):
+        return True
+    if n.endswith(("_lev", "_level", "_levels")):
+        return True
+    return False
+
+
+def _shrink_order(shape, dims) -> list:
     """
-    Pick a simple chunk shape for in-memory evaluation.  Target ~target_mib
-    per chunk.  Chunks the leading dim; keeps trailing dims whole.
+    Return axis indices in the order they should be shrunk when the chunk
+    is over target.  Skips axis 0 (the leading dim, handled separately).
+
+    hiopy approach: shrink non-vertical (horizontal/cell) dims first, last
+    spatial dim first (C-order); shrink vertical dims last.  When `dims`
+    is None or empty, fall back to plain last-dim-first.
     """
-    itemsize = np.dtype(dtype).itemsize
-    trailing = int(np.prod(shape[1:])) if len(shape) > 1 else 1
+    ndim = len(shape)
+    if ndim <= 1:
+        return []
+    if dims is None or len(dims) != ndim:
+        return list(range(ndim - 1, 0, -1))
+
+    horizontal, vertical = [], []
+    for i, name in enumerate(dims):
+        if i == 0:
+            continue
+        (vertical if _is_vertical_like_dim(name) else horizontal).append(i)
+    # Within each group, shrink the LAST (fastest-varying) dim first.
+    return sorted(horizontal, reverse=True) + sorted(vertical, reverse=True)
+
+
+def _compute_inner_chunk_shape(
+    shape,
+    dtype,
+    dims,
+    target_bytes: int,
+    allow_spatial_split: bool = True,
+) -> Tuple[Tuple[int, ...], str]:
+    """
+    Core inner-chunk sizing algorithm.  Returns (inner_chunk_shape, mode).
+
+    `mode` is a short string describing which branch was taken, suitable
+    for logging:
+      - "leading-fits"   : one leading slice fits in target; chunked along leading
+      - "spatial-split"  : leading slice exceeds target; spatial dims also shrunk
+      - "temporal-only"  : leading slice exceeds target but split was disabled;
+                           one timestep per chunk, full spatial (may exceed target)
+
+    Algorithm:
+      1. If one slice along the leading dim fits in target, pack as many
+         leading slices as fit.
+      2. Else set leading=1.  If allow_spatial_split is False, return now
+         (caller is responsible for any oversize warning).
+      3. Else walk spatial dims in `_shrink_order` and reduce each until
+         the chunk fits in target_bytes.
+    """
+    itemsize = int(np.dtype(dtype).itemsize)
+    shape = tuple(int(s) for s in shape)
+    ndim = len(shape)
+    if ndim == 0:
+        return (), "leading-fits"
+
+    inner = list(shape)
+
+    # Bytes for one leading slice (the full trailing tile).
+    trailing = int(np.prod(shape[1:])) if ndim > 1 else 1
     bytes_per_leading = itemsize * trailing
     if bytes_per_leading == 0:
-        return tuple(shape)
-    target_bytes = target_mib * 2**20
-    leading_chunk = max(1, target_bytes // bytes_per_leading)
-    leading_chunk = int(min(leading_chunk, shape[0]))
-    return (leading_chunk,) + tuple(shape[1:])
+        return tuple(inner), "leading-fits"
+
+    if bytes_per_leading <= target_bytes:
+        leading = max(1, target_bytes // bytes_per_leading)
+        inner[0] = int(min(shape[0], leading))
+        return tuple(int(x) for x in inner), "leading-fits"
+
+    # One leading slice already exceeds target.
+    inner[0] = 1
+
+    if not allow_spatial_split:
+        return tuple(int(x) for x in inner), "temporal-only"
+
+    # Walk spatial dims in hiopy shrink order, reducing each until we fit.
+    for axis in _shrink_order(shape, dims):
+        chunk_bytes = itemsize * int(np.prod(inner))
+        if chunk_bytes <= target_bytes:
+            break
+        per_row = chunk_bytes // inner[axis] if inner[axis] > 0 else chunk_bytes
+        if per_row <= 0:
+            inner[axis] = 1
+            continue
+        new_size = max(1, target_bytes // per_row)
+        inner[axis] = int(min(inner[axis], new_size))
+
+    return tuple(int(x) for x in inner), "spatial-split"
+
+
+def compute_chunk_shape_for_eval(
+    shape,
+    dtype,
+    target_mib: int = 16,
+    dims=None,
+    max_target_mib: int = 256,
+    allow_spatial_split: bool = True,
+):
+    """
+    Pick a chunk shape for in-memory evaluation.  Same algorithm as the
+    persist path so the measured compression ratio reflects production.
+
+    Parameters
+    ----------
+    shape, dtype : array geometry.
+    target_mib : soft target chunk size in MiB.
+    dims : tuple of dim names (used to keep vertical-like dims whole when
+           spatial splitting is needed).  Pass None to fall back to plain
+           last-dim-first ordering.
+    max_target_mib : hard ceiling in MiB.  Only relevant when
+           allow_spatial_split=False (in that case we may emit a chunk
+           larger than target_mib; we warn once if it also exceeds this
+           ceiling).  Caller is responsible for the warning.
+    allow_spatial_split : if False, never split spatial dims; keep
+           (1, ...full spatial...) and accept oversized chunks.
+    """
+    target_bytes = int(target_mib) * 2**20
+    inner, _mode = _compute_inner_chunk_shape(
+        shape, dtype, dims, target_bytes,
+        allow_spatial_split=allow_spatial_split,
+    )
+    return inner
 
 
 def compute_chunk_and_shard_shape(
@@ -384,44 +529,64 @@ def compute_chunk_and_shard_shape(
     dtype,
     inner_mib: int = 16,
     shard_mib: int = 512,
-) -> Tuple[Tuple[int, ...], Tuple[int, ...]]:
+    dims=None,
+    max_inner_mib: int = 256,
+    allow_spatial_split: bool = True,
+) -> Tuple[Tuple[int, ...], Optional[Tuple[int, ...]]]:
     """
     Auto-compute (inner_chunk_shape, shard_shape) for zarr v3 sharding.
 
-    Rules of thumb:
-      - Inner chunks: ~inner_mib (good for partial reads).
-      - Shards:       ~shard_mib (amortizes per-file overhead; big write unit).
-      - Shard is an integer multiple of inner on every axis.
+    Returns
+    -------
+    (inner, shards) where:
+      - `inner` is the inner chunk shape.
+      - `shards` is the shard shape, OR `None` to signal "skip sharding"
+        (the inner chunk already meets/exceeds the shard target, so a
+        shard would bundle <= 1 chunk and add only index overhead).
+
+    Parameters
+    ----------
+    inner_mib : soft target for inner chunk (MiB).
+    shard_mib : soft target for shard (MiB).  Each shard must contain an
+                integer number of inner chunks on every axis.
+    dims : optional tuple of dim names.  When provided, vertical-like
+           dims are shrunk last (hiopy approach).
+    max_inner_mib : hard ceiling on inner chunk size in MiB.  Used by the
+           caller to decide whether to warn; the algorithm itself respects
+           inner_mib when allow_spatial_split=True.
+    allow_spatial_split : if True (default), spatial dims are split when a
+           single timestep already exceeds inner_mib.  If False, chunks
+           remain (1, ...full spatial...) and may exceed the target.
     """
-    itemsize = np.dtype(dtype).itemsize
-    ndim = len(shape)
+    itemsize = int(np.dtype(dtype).itemsize)
+    inner_target_bytes = int(inner_mib) * 2**20
+    shard_target_bytes = int(shard_mib) * 2**20
 
-    # ---- inner chunk shape: target inner_mib bytes ----
-    inner_target_bytes = inner_mib * 2**20
-    inner = list(shape)
-    # Reduce the leading dim first; keep trailing dims whole where possible.
-    trailing = int(np.prod(shape[1:])) if ndim > 1 else 1
-    bytes_per_leading = itemsize * trailing
-    if bytes_per_leading > 0:
-        inner[0] = max(1, min(shape[0], inner_target_bytes // bytes_per_leading))
-    inner = tuple(int(x) for x in inner)
+    inner, _mode = _compute_inner_chunk_shape(
+        shape, dtype, dims, inner_target_bytes,
+        allow_spatial_split=allow_spatial_split,
+    )
 
-    # ---- shard shape: integer multiple of inner, target shard_mib ----
+    # ---- shard shape ----
+    # Skip sharding when one chunk already fills (or exceeds) a shard:
+    # bundling a single chunk in a shard buys nothing and costs index bytes.
     inner_bytes = itemsize * int(np.prod(inner))
-    if inner_bytes == 0:
-        return inner, inner
-    shard_target_bytes = shard_mib * 2**20
-    multiplier = max(1, shard_target_bytes // inner_bytes)
+    if inner_bytes == 0 or inner_bytes >= shard_target_bytes:
+        return inner, None
 
-    # Grow the leading dim by `multiplier`, capped by the array extent.
+    multiplier = shard_target_bytes // inner_bytes
+    if multiplier <= 1:
+        return inner, None
+
     shard = list(inner)
-    shard[0] = min(shape[0], inner[0] * multiplier)
-    # Round down to an exact multiple of inner[0].
+    shard[0] = min(int(shape[0]), inner[0] * int(multiplier))
+    # Must be an integer multiple of inner[0].
     shard[0] = (shard[0] // inner[0]) * inner[0]
     shard[0] = max(shard[0], inner[0])
-    shard = tuple(int(x) for x in shard)
-
-    return inner, shard
+    shard_t = tuple(int(x) for x in shard)
+    if shard_t == inner:
+        return inner, None
+    return inner, shard_t
 
 
 # -----------------------------------------------------------------------------
@@ -889,33 +1054,46 @@ def persist_with_codec_pipeline(
 
     - If `shards` is given: Dask chunks are rechunked to the shard shape so
       each Dask task writes exactly one shard (no write-amplification).
+    - If `shards` is None: sharding is skipped entirely (the `shards=` kwarg
+      is NOT passed to zarr.create_array).  This happens automatically when
+      one inner chunk already meets or exceeds the shard target -- a shard
+      would bundle <= 1 chunk and add only index overhead.  Dask is then
+      rechunked to the inner chunk shape (each task writes one chunk).
     - Uses `overwrite=True` as the dask-level kwarg (replaces the deprecated
       v2-era `mode='w'` shape).  `chunks`, `shards`, codec kwargs,
       `dimension_names`, `zarr_format=3` are passed through **zarr_array_kwargs
       and forwarded by dask to zarr.create_array.  `mode=` is NOT accepted by
-      zarr v3's create_array — it's a storage-level concept, not an array one.
+      zarr v3's create_array -- it's a storage-level concept, not an array one.
     """
     assert isinstance(da.data, dask.array.Array), \
         "persist_with_codec_pipeline expects a dask-backed xr.DataArray"
 
     # Auto-size chunks/shards if not provided.
     if inner_chunks is None or shards is None:
-        auto_inner, auto_shard = compute_chunk_and_shard_shape(da.shape, da.dtype)
-        inner_chunks = inner_chunks or auto_inner
-        shards       = shards       or auto_shard
+        auto_inner, auto_shard = compute_chunk_and_shard_shape(
+            da.shape, da.dtype, dims=tuple(da.dims),
+        )
+        if inner_chunks is None:
+            inner_chunks = auto_inner
+        if shards is None:
+            shards = auto_shard  # may itself be None -> skip sharding
 
     codec_kwargs = _codec_kwargs(filters, compressors, serializer)
 
-    # Align Dask chunks with shard shape so each write = one shard.
-    dask_arr = da.data.rechunk(shards)
+    # Pick the dask write unit:
+    #   - With sharding: one task per shard (avoids partial-shard rewrites).
+    #   - Without sharding: one task per inner chunk.
+    write_unit = shards if shards is not None else inner_chunks
+    dask_arr = da.data.rechunk(write_unit)
 
     zarr_kwargs = dict(
         zarr_format=3,
         dimension_names=tuple(da.dims),
         chunks=inner_chunks,
-        shards=shards,
         **codec_kwargs,
     )
+    if shards is not None:
+        zarr_kwargs["shards"] = shards
 
     with Timer("dask.array.to_zarr"):
         dask.array.to_zarr(
@@ -942,8 +1120,9 @@ def persist_with_codec_pipeline(
     euclidean_distance = None
     if verify:
         with Timer("compute_errors_distances"):
-            # Load back with shard-aligned chunks for efficient reads.
-            z_dask = dask.array.from_zarr(z, chunks=shards)
+            # Load back with shard-aligned (or inner-aligned) chunks for
+            # efficient reads.
+            z_dask = dask.array.from_zarr(z, chunks=write_unit)
             _pprint, errors, euclidean_distance, _nrm = \
                 compute_errors_distances(z_dask, da.data)
         if verbose and rank == 0:
