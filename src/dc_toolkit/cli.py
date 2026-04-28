@@ -374,7 +374,7 @@ def _load_l1_error_thresholds(rank: int) -> "pd.DataFrame | None":
 @click.option("--with-lossy/--without-lossy", default=True, show_default=True)
 @click.option("--with-numcodecs-wasm/--without-numcodecs-wasm", default=True, show_default=True)
 @click.option("--with-ebcc/--without-ebcc", default=True, show_default=True)
-@click.option("--resume/--no-resume", default=False, show_default=True,
+@click.option("--resume/--no-resume", default=True, show_default=True,
               help="If set and a `config_space_{var}_rank{rank}.csv` already "
                    "exists in --where-to-write, skip combos already present in "
                    "it (matched by (comp_idx, filt_idx, ser_idx)).  Useful for "
