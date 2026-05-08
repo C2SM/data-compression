@@ -10,6 +10,7 @@ import json
 import math
 import os
 import io
+import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -50,6 +51,19 @@ warnings.filterwarnings(
     "ignore", message="Engine 'cfgrib' loading failed", category=RuntimeWarning,
 )
 warnings.filterwarnings("ignore", message="overflow encountered in square")
+# Cosmetic: at MPI step teardown, each rank's multiprocessing.resource_tracker
+# logs a "leaked semaphore" UserWarning because the parent dies before the
+# tracker has reaped its /dev/shm semaphores.  The semaphores are reclaimed
+# by the kernel at SLURM step end regardless, so the message is purely
+# noise; on a 256-rank job it produces several hundred lines that drown out
+# real warnings.  Suppress only this one specific message - leave the rest
+# of the UserWarning class active in case a real one appears elsewhere.
+warnings.filterwarnings(
+    "ignore",
+    message=r".*leaked semaphore objects.*",
+    category=UserWarning,
+    module=r"multiprocessing\.resource_tracker",
+)
 
 
 @click.group()
@@ -105,42 +119,241 @@ def _version_banner(component_name: str) -> str:
     )
 
 
+def _abort(code: int = 1) -> None:
+    """Abort cleanly: comm.Abort under multi-rank, sys.exit otherwise."""
+    if MPI.COMM_WORLD.Get_size() > 1:
+        MPI.COMM_WORLD.Abort(code)
+    else:
+        sys.exit(code)
+
+
+def _apply_codec_threads(codec_threads: int, rank: int = 0) -> None:
+    """
+    Apply --codec-threads at runtime.  Blosc respects set_nthreads live;
+    OpenMP/MKL/OpenBLAS read env vars at lib-init and need shell exports.
+    """
+    if codec_threads is None or int(codec_threads) <= 1:
+        return
+    n = int(codec_threads)
+    env_vars = [
+        "OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS",
+        "BLOSC_NTHREADS", "NUMBA_NUM_THREADS",
+        "VECLIB_MAXIMUM_THREADS", "OMP_THREAD_LIMIT",
+    ]
+    mismatched = [(v, os.environ.get(v)) for v in env_vars
+                  if os.environ.get(v) != str(n)]
+    if mismatched and rank == 0:
+        click.echo(
+            f"[codec-threads] requested {n}; for full effect, export the "
+            f"following in your shell BEFORE running (Blosc is set live; "
+            f"OpenMP/MKL/OpenBLAS need shell exports):"
+        )
+        for v, cur in mismatched:
+            shown = "<unset>" if cur is None else cur
+            click.echo(f"  {v}={shown} -> export {v}={n}")
+    try:
+        import numcodecs.blosc as _blosc
+        _blosc.set_nthreads(n)
+    except Exception as e:
+        if rank == 0:
+            click.echo(f"[codec-threads] WARNING: blosc.set_nthreads failed: {e}")
+
+
+def _check_thread_product(threads: int, codec_threads: int, rank: int = 0) -> None:
+    """Abort if --threads * --codec-threads exceeds physical cores."""
+    cores = utils.detect_cores_available()
+    product = int(threads) * max(1, int(codec_threads or 1))
+    if product > cores:
+        if rank == 0:
+            click.echo(
+                f"[oversubscription] --threads * --codec-threads = "
+                f"{int(threads)} * {int(codec_threads or 1)} = {product} "
+                f"exceeds physical cores ({cores}). Reduce one of the flags."
+            )
+        _abort(1)
+
+
+def _per_rank_steady_estimate_bytes(
+    sample_bytes: int,
+    threads_per_rank: int,
+    inner_chunk_mib: int,
+    include_ebcc_overhead: bool = False,
+) -> int:
+    """
+    Steady-state memory footprint of one MPI rank during the codec sweep.
+
+    Components, in order of size:
+      sample_bytes           : the broadcast sample buffer, alive for the
+                               entire sweep.
+      sample_bytes (decode)  : evaluate_codec_pipeline keeps one decompressed
+                               copy alive across decode -> metrics, then
+                               drops it via `del decomp_full`.
+      threads * 2 * chunk    : ThreadPoolExecutor working set; each thread
+                               touches at most one inner chunk at a time,
+                               and the float64 promotion in metrics doubles
+                               that chunk briefly.
+      sample_bytes (EBCC)    : optional - EBCC needs a float32 working copy
+                               of the sample when the source dtype isn't
+                               already float32.  Only fired transiently per
+                               EBCC combo; only included here if the caller
+                               knows EBCC is in the search space.
+
+    This is the SAME formula the rank-0 [memory] banner prints; centralised
+    here so the early-abort check and the user-facing banner can never
+    drift apart.
+    """
+    decode_cache = sample_bytes
+    thread_pool  = max(1, threads_per_rank) * 2 * max(1, inner_chunk_mib) * (2 ** 20)
+    ebcc         = sample_bytes if include_ebcc_overhead else 0
+    return sample_bytes + decode_cache + thread_pool + ebcc
+
+
+def _detect_node_memory_budget() -> tuple[int, str]:
+    """
+    Return (bytes_available, source_description) for the effective
+    node-memory budget.
+
+    Order of preference:
+      1. cgroup v2 limit (/sys/fs/cgroup/memory.max).  This is what
+         actually OOM-kills tasks under SLURM when --mem or
+         --mem-per-cpu is set, or under containers; psutil cannot
+         see it.
+      2. cgroup v1 limit (/sys/fs/cgroup/memory/memory.limit_in_bytes).
+         cgroup v1 stores a sentinel (~2^63) for "unlimited"; we
+         treat any value larger than 2x the host total as unlimited
+         and fall through.
+      3. sysconf SC_PHYS_PAGES * SC_PAGE_SIZE - the raw host total.
+         Last resort, accurate on bare metal.
+
+    Why not psutil.virtual_memory().available: that reports HOST
+    memory and ignores the cgroup limit.  On Santis the production
+    OOMs (job 843234) happened with ~290 GiB peak across 32 ranks
+    on a node nominally rated 480 GiB - the actual binding constraint
+    was the per-task cgroup, not the host total, and psutil missed it.
+    """
+    # cgroup v2 (unified hierarchy)
+    try:
+        with open("/sys/fs/cgroup/memory.max") as fh:
+            val = fh.read().strip()
+        if val and val != "max":
+            return int(val), "cgroup v2 memory.max"
+    except (OSError, ValueError):
+        pass
+
+    # cgroup v1 (legacy hierarchy)
+    for path in (
+        "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+        "/sys/fs/cgroup/memory.limit_in_bytes",
+    ):
+        try:
+            with open(path) as fh:
+                val = int(fh.read().strip())
+        except (OSError, ValueError):
+            continue
+        # cgroup v1 reports a near-2^63 sentinel for "unlimited"; if
+        # the value is wildly larger than the host total, treat it as
+        # unset and fall through.
+        try:
+            host_total = os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+        except (OSError, ValueError):
+            host_total = 0
+        if host_total and val < host_total * 2:
+            return val, f"cgroup v1 ({path})"
+        # else: looks like the unlimited sentinel; fall through
+
+    # sysconf host total
+    try:
+        return (
+            os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE"),
+            "host total RAM (sysconf)",
+        )
+    except (OSError, ValueError):
+        # Extremely rare; psutil as last resort.
+        return psutil.virtual_memory().total, "psutil host total"
+
+
+def _check_node_memory_headroom(
+    per_rank_steady_bytes: int,
+    ranks_on_node: int,
+    rank: int,
+    label: str,
+    threshold: float = 0.80,
+) -> None:
+    """
+    Memory check that adapts to whether the budget is per-task or per-node.
+
+    Under SLURM with cgroup-v2 task plugin, /sys/fs/cgroup/memory.max is
+    PER-TASK: each rank has its own cgroup with that limit, so the right
+    comparison is `per_rank_steady > threshold * budget`.  Under host-total
+    (no cgroup), all ranks share node RAM and the right comparison is
+    `ranks_on_node * per_rank_steady > threshold * budget`.
+
+    Only rank 0 evaluates and emits; comm.Abort propagates termination.
+    """
+    if rank != 0:
+        return
+
+    available, source = _detect_node_memory_budget()
+    is_cgroup = source.startswith("cgroup")
+
+    if is_cgroup:
+        required = per_rank_steady_bytes
+        scope_label = "per-rank (cgroup is per-task under SLURM)"
+    else:
+        required = max(1, ranks_on_node) * per_rank_steady_bytes
+        scope_label = f"per-node ({ranks_on_node} rank(s) x per-rank)"
+
+    if required > threshold * available:
+        click.echo(
+            f"[memcheck] REFUSING to start sweep: memory requirement "
+            f"{humanize.naturalsize(required, binary=True)} "
+            f"({scope_label}, "
+            f"{humanize.naturalsize(per_rank_steady_bytes, binary=True)} "
+            f"steady-state per rank) exceeds {int(threshold*100)}% of the "
+            f"detected budget {humanize.naturalsize(available, binary=True)} "
+            f"({source}).\n"
+            f"  Context: {label}\n"
+            f"  Fixes (any one):\n"
+            f"    - lower --ntasks-per-node in SBATCH\n"
+            f"    - lower --eval-data-size-limit (smaller sample buffer)\n"
+            f"    - request more RAM with #SBATCH --mem=0 (whole node) or "
+            f"--mem=<n>G\n"
+            f"    - drop --allow-multi-rank-per-node (1 rank/node + threads)\n"
+            f"  Override: raise --memory-threshold (default 0.80, max 0.95)."
+        )
+        _abort(1)
+
+
+_MEMCHECK_WARNED_HIGH = False
+
+
+def _reset_memcheck_state() -> None:
+    """Reset module-level memcheck state.  Call at the start of each command."""
+    global _MEMCHECK_WARNED_HIGH
+    _MEMCHECK_WARNED_HIGH = False
+
+
 def _check_memory_headroom(required_bytes: int, label: str, threshold: float = 0.80) -> None:
     """
     Refuse to allocate `required_bytes` if it would exceed `threshold` of
     currently-available RAM.  Aborts the whole MPI world on violation.
 
-    This is defense-in-depth against user misconfiguration, e.g. passing
-    `--eval-data-size-limit 50GB` on a 64 GB node or `--threads 256` with
-    large shards on a RAM-starved box.  Catches the error before numpy /
-    dask raise a MemoryError halfway through a long run.
-
-    Default threshold is 0.80: leaves ~25% headroom over our `required_bytes`
-    estimate to absorb (a) rechunk transients, which the topology banner
-    notes can push real peak 1.5-2x above the documented threads * shard_mib
-    figure; (b) Python / dask / MPI / numpy overhead not in the estimate;
-    (c) other processes on the same node.  Going above 0.80 is risky
-    because the documented rechunk transient alone can exceed the remaining
-    buffer; the function emits a one-time warning when called above that.
+    Default threshold is 0.80: leaves headroom for rechunk transients
+    (1.5-2x), Python/dask/MPI overhead, and other processes.
 
     Caveat: psutil.virtual_memory().available reports HOST memory, not the
     cgroup limit when running inside a container or a slurm allocation with
-    --mem set.  In that case the kernel/slurm OOM-killer is the real guard,
-    not this function.
-
-    psutil is a hard dependency (see pyproject.toml), so the query itself
-    is always available; we only wrap the call in try/except to tolerate
-    the rare environment where /proc is unreadable (unusual containers)
-    and treat it as "unable to check" rather than crashing.
+    --mem set.  In that case the kernel/slurm OOM-killer is the real guard.
     """
-    if threshold > 0.80 and not getattr(_check_memory_headroom, "_warned_high", False):
+    global _MEMCHECK_WARNED_HIGH
+    if threshold > 0.80 and not _MEMCHECK_WARNED_HIGH:
         click.echo(
             f"[memcheck] WARNING: threshold {threshold:.2f} exceeds the "
             f"recommended 0.80 ceiling.  The 1.5-2x rechunk transient "
             f"documented for the write peak can fit inside the remaining "
             f"buffer up to ~0.80 but not above; OOM risk increases sharply."
         )
-        _check_memory_headroom._warned_high = True
+        _MEMCHECK_WARNED_HIGH = True
     try:
         avail = psutil.virtual_memory().available
     except Exception as e:
@@ -156,10 +369,10 @@ def _check_memory_headroom(required_bytes: int, label: str, threshold: float = 0
             f"exceeds {int(threshold*100)}% of currently-available RAM "
             f"({humanize.naturalsize(avail, binary=True)}).\n"
             f"  Reduce the relevant flag (e.g. --eval-data-size-limit, "
-            f"--threads, --shard-mib), raise --memory-threshold (max 0.80 "
-            f"recommended), or run on a larger node."
+            f"--threads, --shard-mib), raise --memory-threshold (max 0.95), "
+            f"or run on a larger node."
         )
-        MPI.COMM_WORLD.Abort(1)
+        _abort(1)
 
 
 def _sample_signature(
@@ -228,12 +441,8 @@ def _signature_path(where_to_write: str, var: str) -> Path:
 # =============================================================================
 # L1 error threshold lookup
 # =============================================================================
-# Source of truth is a Google Sheet (column layout: "Short Name", "Unit",
-# "Existing L1 error", ...).  We mirror the latest successful fetch to a
-# CSV alongside this module so offline / CI / network-degraded runs still
-# have something to consult.  The on-disk copy is intended to be checked
-# into the repo so a fresh clone has a working fallback even before the
-# first online run.
+# Source of truth: a Google Sheet ("Short Name", "Unit", "Existing L1 error").
+# Mirrored to a CSV next to this module for offline / CI fallback.
 
 _L1_THRESHOLDS_SHEET_ID = "1lHcX-HE2WpVCOeKyDvM4iFqjlWvkd14lJlA-CUoCxMM"
 _L1_THRESHOLDS_SHEET_URL = (
@@ -325,46 +534,40 @@ def _load_l1_error_thresholds(rank: int) -> "pd.DataFrame | None":
               help="Field to compress [if not given, all fields will be evaluated].")
 @click.option("--eval-data-size-limit", default="5GB", callback=_size_option_callback,
               show_default=True,
-              help="Representative-sample size budget (e.g. '5GB', '512MiB'). "
-                   "If the field fits under this, the full field is used; otherwise "
-                   "a strided subsample along the leading dim is used.  "
-                   "The same sample is used to compute data-derived codec parameters "
-                   "(Asinh.linear_width, FixedOffsetScale.offset/scale, etc.), so "
-                   "`compress_with_optimal` must be invoked with the same value for "
-                   "codec-space indices to resolve to identical codec objects.")
+              help="Sample size budget (e.g. '5GB', '512MiB').  If the field "
+                   "fits, the full field is used; otherwise a strided "
+                   "subsample along the leading dim.  Must match the value "
+                   "passed to compress_with_optimal for codec-space indices "
+                   "to resolve identically.")
 @click.option("--threads-per-rank", type=int, default=None,
               help="Threads per MPI rank.  Default: auto-detected from cores/rank.")
+@click.option("--codec-threads", type=int, default=1, show_default=True,
+              help="Internal threads per codec call (Blosc set live; for "
+                   "OpenMP/MKL/OpenBLAS export the matching env vars in the "
+                   "shell BEFORE running). --threads-per-rank * --codec-threads "
+                   "must be <= physical cores; oversubscription-check is "
+                   "skipped when this is > 1.")
 @click.option("--inner-chunk-mib", type=int, default=16, show_default=True,
-              help="Target size of a zarr chunk (in MiB) during in-memory evaluation. "
-                   "For the measured compression ratio to reflect production conditions, "
-                   "pass the same value to compress_with_optimal.")
+              help="Target zarr chunk size (MiB) during evaluation.  Pass "
+                   "the same value to compress_with_optimal for measured "
+                   "ratios to reflect production.")
 @click.option("--max-inner-chunk-mib", type=int, default=256, show_default=True,
-              help="Hard ceiling on inner chunk size (in MiB).  Only enforced "
-                   "with --no-spatial-split: when one timestep already exceeds "
-                   "--inner-chunk-mib and spatial splitting is disabled, the "
-                   "resulting chunk may be very large; if it also exceeds this "
-                   "ceiling we emit a warning.  Codec internals (zstd block "
-                   "limit, blosc memory) start to misbehave around the GB mark, "
-                   "so leaving the default at 256 is a safety net.")
+              help="Hard ceiling on inner chunk size (MiB) when "
+                   "--no-spatial-split is set; warns if exceeded.")
 @click.option("--spatial-split/--no-spatial-split", default=True, show_default=True,
-              help="When one timestep already exceeds --inner-chunk-mib, split "
-                   "spatial dims (horizontal/cell first, vertical last -- "
-                   "hiopy approach) until the chunk fits the target.  Disable "
-                   "with --no-spatial-split to keep one timestep per chunk "
-                   "with full spatial extent (matches the hiopy on-disk "
-                   "layout, but produces oversized chunks).")
+              help="Split spatial dims when one timestep exceeds "
+                   "--inner-chunk-mib (horizontal first, vertical last).")
 @click.option("--oversubscription-check/--no-oversubscription-check", default=True,
               show_default=True,
               help="At startup, warn/abort if OMP/BLOSC/MKL thread vars aren't pinned to 1.")
 @click.option("--memory-threshold", type=click.FloatRange(0.05, 0.95), default=0.80,
               show_default=True,
-              help="Fraction of currently-available RAM that any single tracked "
-                   "allocation is allowed to occupy before the run is aborted.  "
-                   "Defaults to 0.80; values above 0.80 emit a one-time warning "
-                   "because the documented 1.5-2x rechunk transient can exceed "
-                   "the remaining buffer.  Hard upper bound 0.95.")
+              help="Fraction of available RAM any single tracked allocation "
+                   "may occupy before the run aborts.  Values above 0.80 "
+                   "emit a one-time warning.")
 @click.option("--override-existing-l1-error", type=float, default=None,
-              help="Override the existing L1 error threshold from the lookup table.")
+              help="L1 error threshold fallback when the variable isn't in "
+                   "the lookup table.  Table values win when present.")
 @click.option("--compressor-class", default="all",
               help="Compressor class (case-insensitive) or 'none' to skip.")
 @click.option("--filter-class", default="all",
@@ -372,25 +575,41 @@ def _load_l1_error_thresholds(rank: int) -> "pd.DataFrame | None":
 @click.option("--serializer-class", default="all",
               help="Serializer class (case-insensitive) or 'none' to skip.")
 @click.option("--with-lossy/--without-lossy", default=True, show_default=True)
-@click.option("--with-numcodecs-wasm/--without-numcodecs-wasm", default=True, show_default=True)
-@click.option("--with-ebcc/--without-ebcc", default=True, show_default=True)
+@click.option("--with-numcodecs-wasm/--without-numcodecs-wasm", default=False, show_default=True)
+@click.option("--with-ebcc/--without-ebcc", default=False, show_default=True)
 @click.option("--resume/--no-resume", default=True, show_default=True,
-              help="If set and a `config_space_{var}_rank{rank}.csv` already "
-                   "exists in --where-to-write, skip combos already present in "
-                   "it (matched by (comp_idx, filt_idx, ser_idx)).  Useful for "
-                   "picking up a sweep that died partway.  The streaming CSV "
-                   "is appended rather than overwritten in resume mode.")
+              help="If a `config_space_{var}_rank{rank}.csv` already exists, "
+                   "skip combos already present in it (matched by indices).")
+@click.option("--max-evals", type=int, default=None,
+              help="Cap total evaluations across all ranks.  Useful for "
+                   "quick test runs.  Slicing happens before rank partition.")
+@click.option("--allow-multi-rank-per-node/--no-allow-multi-rank-per-node",
+              default=False, show_default=True,
+              help="Allow more than one MPI rank to share a node.  Each rank "
+                   "holds its own copy of the sample, so per-node memory "
+                   "scales as ranks_on_node * sample_size — ensure the node "
+                   "has the headroom.")
+@click.option("--bypass-zarr-sync/--no-bypass-zarr-sync", default=True, show_default=True,
+              help="Route codec dispatch through zarr's async API on per-"
+                   "thread persistent event loops (shared bounded executor "
+                   "as default).  Bypasses zarr 3's sync() loop which "
+                   "otherwise serialises threads.  Required for thread-only "
+                   "topologies (1 rank x N threads); on by default to match "
+                   "the production HPC strategy.  Aborts at startup if "
+                   "zarr.api.asynchronous is not importable.")
 def evaluate_combos(dataset_file,
                     where_to_write,
                     field_to_compress, eval_data_size_limit,
-                    threads_per_rank, inner_chunk_mib,
+                    threads_per_rank, codec_threads,
+                    inner_chunk_mib,
                     max_inner_chunk_mib, spatial_split,
                     oversubscription_check,
                     memory_threshold,
                     override_existing_l1_error,
                     compressor_class, filter_class, serializer_class,
                     with_lossy, with_numcodecs_wasm, with_ebcc,
-                    resume):
+                    resume, max_evals, allow_multi_rank_per_node,
+                    bypass_zarr_sync):
     """
     Sweep compressor x filter x serializer combinations on a representative
     sample of the field to find the best configuration.
@@ -415,28 +634,39 @@ def evaluate_combos(dataset_file,
     # -------------------------------------------------------------------------
     # Topology + dask config
     # -------------------------------------------------------------------------
+    _reset_memcheck_state()
     comm = MPI.COMM_WORLD
     rank = comm.Get_rank()
     size = comm.Get_size()
 
     node_comm, ranks_on_node, _local_rank = utils.detect_node_topology(comm)
 
-    # ---- Enforce 1 MPI rank per node --------------------------------------
-    # The refactor is designed around shared-memory threading within the node.
-    # Multi-rank-per-node launches are silently wasteful (sample duplication,
-    # redundant MPI broadcasts) so we reject them outright.
-    if ranks_on_node > 1:
+    # ---- 1 MPI rank per node: opt-in bypass -----------------------------
+    # The original design intends shared-memory threading within each node
+    # (1 Python process / 1 GIL).  In practice the GIL + codec config registry
+    # + glibc malloc arenas serialize so heavily on aarch64 (Grace) that
+    # multiple Python processes per node beat threads despite paying for
+    # sample duplication.  --allow-multi-rank-per-node is the explicit knob
+    # for that case.
+    if ranks_on_node > 1 and not allow_multi_rank_per_node:
         if rank == 0:
             click.echo(
                 f"[topology] ERROR: detected {ranks_on_node} MPI rank(s) per node.\n"
-                f"  This toolkit requires exactly 1 rank per node; within-node\n"
+                f"  This toolkit defaults to exactly 1 rank per node; within-node\n"
                 f"  parallelism is provided by threads, not MPI.\n"
-                f"  Relaunch with:\n"
-                f"    mpirun -n <NODES> --ntasks-per-node=1 dc_toolkit evaluate_combos ...\n"
-                f"  (or on Slurm:\n"
-                f"    srun --nodes=<N> --ntasks-per-node=1 dc_toolkit evaluate_combos ...)"
+                f"  Relaunch with one of:\n"
+                f"    --ntasks-per-node=1   (default behaviour, threading only)\n"
+                f"    --allow-multi-rank-per-node   (opt in - acknowledges sample\n"
+                f"                                   duplication; recommended on Grace\n"
+                f"                                   when GIL serialization dominates)\n"
             )
         comm.Abort(1)
+    if ranks_on_node > 1 and rank == 0:
+        click.echo(
+            f"[topology] NOTE: running {ranks_on_node} MPI rank(s) per node "
+            f"(--allow-multi-rank-per-node is set).  Each rank will hold its "
+            f"own copy of the sample; per-node memory ~ {ranks_on_node} * sample_size."
+        )
 
     try:
         node_comm.Free()
@@ -447,85 +677,81 @@ def evaluate_combos(dataset_file,
     if threads_per_rank is None:
         threads_per_rank = utils.compute_default_threads_per_rank(ranks_on_node, cores_avail)
 
-    utils.check_thread_oversubscription(
-        abort_if_unsafe=oversubscription_check, rank=rank,
-    )
+    if bypass_zarr_sync:
+        try:
+            utils.AsyncBypass.enable(threads_per_rank=threads_per_rank)
+        except RuntimeError as e:
+            if rank == 0:
+                click.echo(f"[bypass-zarr-sync] ERROR: {e}")
+            comm.Abort(1)
+        if rank == 0:
+            click.echo("[bypass-zarr-sync] enabled.")
+
+    _apply_codec_threads(codec_threads, rank=rank)
+    _check_thread_product(threads_per_rank, codec_threads, rank=rank)
+    if int(codec_threads or 1) <= 1:
+        utils.check_thread_oversubscription(
+            abort_if_unsafe=oversubscription_check, rank=rank,
+        )
 
     # Create the output directory once on rank 0, then barrier so all ranks
-    # see it before anyone tries to write into it.  `exist_ok=True` so repeat
-    # runs don't fail; the barrier avoids a rank-1..N race against rank 0 on
-    # filesystems that don't handle concurrent creation gracefully (certain
-    # Lustre / NFS configurations).
+    # see it before anyone tries to write into it.
     if rank == 0:
         os.makedirs(where_to_write, exist_ok=True)
     comm.Barrier()
 
-    # `array.chunk-size` must be set BEFORE any xarray open() that uses
-    # `chunks="auto"` for the setting to be honored by the dask graph builder.
-    # The threaded dask scheduler is used for the sample read and codec-space
-    # construction below (both go through dask.compute).  We switch to the
-    # synchronous scheduler right before the ThreadPoolExecutor (nested
-    # `with` inside the sweep) so the per-combo threads do not nest thread
-    # pools.
-    #
-    # Wrapping in `with` scopes these settings to evaluate_combos; they
-    # revert on function exit instead of leaking into the parent process.
-    # Matters for notebook/compose use; no-op for single-command CLI runs.
+    # `array.chunk-size` must be set before any open() that uses chunks="auto".
+    # This outer block governs only the dataset open and the rank-0 sample
+    # .compute(); the inner sweep below opens its own
+    # `with dask.config.set(scheduler="synchronous")` so per-combo threads
+    # don't nest dask thread pools.
     with dask.config.set({
         "array.chunk-size": "512MiB",
         "scheduler": "threads",
         "num_workers": threads_per_rank,
     }):
 
-        # Topology banner is printed later, after the config_space is built, so we
-        # can report the EFFECTIVE parallelism (min(size*threads, num_loops))
-        # rather than an overstated theoretical peak.
-
-        # Version + environment banner (rank 0 only) — surfaces the exact
-        # zarr/numpy/dask combination that ran so a regression in compression
-        # ratio can be pinned to a library upgrade.
         if rank == 0:
             click.echo(_version_banner("evaluate_combos"))
 
-        # -------------------------------------------------------------------------
-        # Fetch threshold table (rank 0) and broadcast
-        #
-        # Skipped entirely when the user has supplied --override-existing-l1-error,
-        # because we'd never read from the table in that case.  Avoids the slow,
-        # network-dependent Google Sheets call for offline/CI runs.
-        #
-        # `_load_l1_error_thresholds` first tries the remote Google Sheet and,
-        # on failure, falls back to the CSV cached at
-        # `_LOCAL_L1_THRESHOLDS_PATH` (committed to the repo).  Returns None
-        # if neither source yields a usable table; we then abort with a
-        # message pointing the user at --override-existing-l1-error.
-        # -------------------------------------------------------------------------
+        # Fetch threshold table on rank 0, broadcast.  Falls back to a local
+        # CSV if the remote sheet fails; ultimate fallback is the per-call
+        # --override-existing-l1-error value.
         thresholds = None
-        if override_existing_l1_error is None:
-            if rank == 0:
-                thresholds = _load_l1_error_thresholds(rank=rank)
-                if thresholds is None:
-                    click.echo(
-                        "[Rank 0] ERROR: could not load the L1 error "
-                        "threshold table from either the remote Google "
-                        "Sheet or the local fallback at "
-                        f"{_LOCAL_L1_THRESHOLDS_PATH}.\n"
-                        "  Re-run with --override-existing-l1-error <value> "
-                        "to specify a threshold explicitly, or fix "
-                        "connectivity / restore the local CSV before "
-                        "retrying."
-                    )
-                    comm.Abort(1)
+        if rank == 0:
+            thresholds = _load_l1_error_thresholds(rank=rank)
+            if thresholds is None and override_existing_l1_error is None:
+                click.echo(
+                    "[Rank 0] ERROR: could not load the L1 error "
+                    "threshold table from either the remote Google "
+                    "Sheet or the local fallback at "
+                    f"{_LOCAL_L1_THRESHOLDS_PATH}, and no "
+                    "--override-existing-l1-error was supplied as a "
+                    "fallback.\n"
+                    "  Re-run with --override-existing-l1-error <value> "
+                    "to specify a fallback threshold explicitly, or fix "
+                    "connectivity / restore the local CSV before "
+                    "retrying."
+                )
+                comm.Abort(1)
 
+            if thresholds is not None:
                 buffer = io.BytesIO()
                 thresholds.to_parquet(buffer, index=False)
                 data_bytes = buffer.getvalue()
             else:
-                data_bytes = None
+                # Table unavailable but a fallback override is set; broadcast
+                # an empty payload so non-root ranks know to skip the lookup.
+                data_bytes = b""
+        else:
+            data_bytes = None
 
-            data_bytes = comm.bcast(data_bytes, root=0)
-            if rank != 0:
-                thresholds = pd.read_parquet(io.BytesIO(data_bytes))
+        data_bytes = comm.bcast(data_bytes, root=0)
+        if rank != 0:
+            thresholds = (
+                pd.read_parquet(io.BytesIO(data_bytes))
+                if data_bytes else None
+            )
 
         # -------------------------------------------------------------------------
         # Open dataset (lazy; shared by all ranks; each rank gets its own handle)
@@ -540,7 +766,12 @@ def evaluate_combos(dataset_file,
                 continue
             da = ds[var]
 
-            if override_existing_l1_error is None:
+            # Try the lookup table first.  Fall back to
+            # --override-existing-l1-error only when the variable is missing
+            # from the table, the units don't match, or the cell is empty / NaN.
+            existing_l1_error = None
+            threshold_source = None
+            if thresholds is not None:
                 threshold_row = thresholds[thresholds["Short Name"] == var]
                 matching_units = (
                     threshold_row.iloc[0]["Unit"] == da.attrs.get("units", None)
@@ -550,23 +781,21 @@ def evaluate_combos(dataset_file,
                     threshold_row.iloc[0]["Existing L1 error"]
                     if not threshold_row.empty and matching_units else None
                 )
-                if raw_threshold is None or (isinstance(raw_threshold, float) and math.isnan(raw_threshold)):
-                    existing_l1_error = None
-                elif isinstance(raw_threshold, str):
-                    existing_l1_error = float(raw_threshold.replace(",", "."))
-                else:
-                    existing_l1_error = float(raw_threshold)
-            else:
-                existing_l1_error = override_existing_l1_error
+                if raw_threshold is not None and not (
+                    isinstance(raw_threshold, float) and math.isnan(raw_threshold)
+                ):
+                    if isinstance(raw_threshold, str):
+                        existing_l1_error = float(raw_threshold.replace(",", "."))
+                    else:
+                        existing_l1_error = float(raw_threshold)
+                    threshold_source = "lookup table"
 
-            # If we still couldn't pin down a threshold - either because
-            # the variable isn't in the lookup table, the units don't
-            # match, or the relevant cell is empty/NaN, AND no manual
-            # override was supplied - we have no basis for the `keep`
-            # filter that drives the whole sweep.  Letting the run
-            # continue would silently disable filtering for this variable
-            # (every combo would be marked keep=True), defeating the
-            # point of the lookup.  Abort with an actionable message.
+            if existing_l1_error is None and override_existing_l1_error is not None:
+                existing_l1_error = override_existing_l1_error
+                threshold_source = "--override-existing-l1-error fallback"
+
+            # No threshold resolved (no table row + no override): the keep
+            # filter has no basis, so we'd silently keep every combo.  Abort.
             if existing_l1_error is None:
                 if rank == 0:
                     var_units = da.attrs.get("units", "N/A")
@@ -587,13 +816,16 @@ def evaluate_combos(dataset_file,
             if rank == 0:
                 click.echo(
                     f"[var] {var} | units={da.attrs.get('units', 'N/A')} | "
-                    f"Existing L1 error={existing_l1_error}"
+                    f"Existing L1 error={existing_l1_error} "
+                    f"(source: {threshold_source})"
                 )
 
             # -------------------------------------------------------------------------
             # Build representative sample ONCE on rank 0, broadcast to others.
             # -------------------------------------------------------------------------
-            # Memory guardrail before the sample broadcast.
+            # Memory guardrail before the sample broadcast.  No post-open
+            # refinement here (unlike the compress commands): evaluate_combos
+            # writes nothing, so there are no shard bytes to re-check against.
             field_bytes = int(da.dtype.itemsize) * int(np.prod(da.shape))
             actual_sample_bytes = min(field_bytes, int(eval_data_size_limit))
             multiplier = 2 if (rank == 0 and size > 1) else 1
@@ -601,6 +833,29 @@ def evaluate_combos(dataset_file,
                 multiplier * actual_sample_bytes,
                 label=f"sample for '{var}' on rank {rank} "
                       f"({humanize.naturalsize(actual_sample_bytes, binary=True)})",
+                threshold=memory_threshold,
+            )
+
+            # Node-aggregate guardrail: the per-rank check above doesn't see
+            # other ranks on the same node or SLURM cgroup limits.  Fires only
+            # from rank 0.
+            per_rank_steady = _per_rank_steady_estimate_bytes(
+                sample_bytes=actual_sample_bytes,
+                threads_per_rank=threads_per_rank,
+                inner_chunk_mib=inner_chunk_mib,
+                # EBCC needs a float32 working copy on every rank that runs
+                # an EBCC combo (not just rank 0); upper bound, since we
+                # don't yet know whether EBCC will be selected.
+                include_ebcc_overhead=(
+                    bool(with_ebcc) and da.dtype != np.float32
+                ),
+            )
+            _check_node_memory_headroom(
+                per_rank_steady_bytes=per_rank_steady,
+                ranks_on_node=ranks_on_node,
+                rank=rank,
+                label=f"variable '{var}', sample "
+                      f"{humanize.naturalsize(actual_sample_bytes, binary=True)}",
                 threshold=memory_threshold,
             )
 
@@ -631,15 +886,9 @@ def evaluate_combos(dataset_file,
             if rank == 0:
                 del sample_np_local
 
-            # ----------------------------------------------------------------
-            # Sample reproducibility hash (M5).
-            #
-            # Rank 0 hashes the broadcast buffer and writes a
-            # sample_signature_{var}.json next to the sweep results.
-            # `compress_with_optimal` will re-hash and refuse to proceed on
-            # mismatch, closing the "silent wrong combo" footgun from a
-            # --eval-data-size-limit drift between the two commands.
-            # ----------------------------------------------------------------
+            # Sample reproducibility hash: rank 0 writes
+            # sample_signature_{var}.json so compress_with_optimal can
+            # refuse mismatching reuse.
             if rank == 0:
                 try:
                     sig = _sample_signature(
@@ -689,11 +938,33 @@ def evaluate_combos(dataset_file,
 
             num_loops = len(compressors) * len(filters) * len(serializers)
             config_space = list(itertools.product(compressors, filters, serializers))
+            # --max-evals: optional global cap for quick test runs.  Applied
+            # BEFORE the rank partition so all ranks see the same truncated
+            # space and the partition (configs[rank::size]) divides it evenly.
+            # The full config_space CSV written below is also truncated to
+            # match - that file is the audit trail of what was actually run.
+            if max_evals is not None and max_evals < num_loops:
+                if rank == 0:
+                    click.echo(
+                        f"[max-evals] capping config space at {max_evals} "
+                        f"(of {num_loops} possible) for a quick test run."
+                    )
+                config_space = config_space[:max_evals]
+                num_loops = len(config_space)
+            # Deterministic shuffle before stride partition: breaks up runs
+            # of similar-cost combos (e.g. consecutive EBCC entries) so each
+            # rank gets a representative mix.  Seed depends only on num_loops
+            # so --resume sees the same order across restarts.
+            _rng = np.random.default_rng(seed=int(num_loops) & 0xFFFFFFFF)
+            _perm = _rng.permutation(len(config_space)).tolist()
+            config_space = [config_space[i] for i in _perm]
             configs_for_rank = config_space[rank::size]
 
             if rank == 0:
-                # Honest topology banner: if the sweep is smaller than the theoretical
-                # peak parallelism, say so rather than overstating.
+                # Topology banner: report nodes / ranks-per-node / threads-per-rank
+                # separately, and mark the case where the sweep is smaller than
+                # the theoretical peak parallelism.
+                n_nodes = size // ranks_on_node if ranks_on_node else 1
                 theoretical_peak = size * threads_per_rank
                 effective = min(theoretical_peak, num_loops)
                 trailer = ""
@@ -703,26 +974,37 @@ def evaluate_combos(dataset_file,
                         f"{num_loops} combos total)"
                     )
                 click.echo(
-                    f"[topology] {size} node(s) | {cores_avail} core(s)/node | "
-                    f"{threads_per_rank} thread(s)/node -> peak {theoretical_peak} "
-                    f"parallel evaluations{trailer}."
+                    f"[topology] {n_nodes} node(s) x {ranks_on_node} rank(s)/node x "
+                    f"{threads_per_rank} thread(s)/rank = {theoretical_peak} parallel "
+                    f"evaluations ({cores_avail} core(s)/rank){trailer}."
                 )
-                # Memory budget banner — mirror of the one in compress_with_optimal.
-                # Rank-0 transient peak is 2x sample_size (local + broadcast buffer
-                # briefly alive together, then dropped).  Steady state per rank is
-                # sample + optional EBCC float32 copy + per-thread working set.
+                # Memory budget banner: numbers come from
+                # _per_rank_steady_estimate_bytes() so the abort check (fired
+                # pre-broadcast) and this user-facing estimate cannot drift.
                 steady_mib = int(sample_np.nbytes / 2**20)
                 ebcc_overhead_mib = int(sample_np.nbytes / 2**20) if (
                     any(_is_ebcc_serializer(ser) for (_, ser) in serializers)
                     and sample_np.dtype != np.float32
                 ) else 0
+                # Decode caching: evaluate_codec_pipeline keeps one decompressed
+                # copy of the sample alive during the metrics loop.  Released via
+                # `del decomp_full` at end of metrics.
+                decode_cache_mib = steady_mib
                 thread_pool_mib = threads_per_rank * max(1, inner_chunk_mib) * 2
+                _per_rank_total_bytes = _per_rank_steady_estimate_bytes(
+                    sample_bytes=int(sample_np.nbytes),
+                    threads_per_rank=threads_per_rank,
+                    inner_chunk_mib=inner_chunk_mib,
+                    include_ebcc_overhead=(ebcc_overhead_mib > 0),
+                )
                 click.echo(
                     f"[memory] rank-0 transient peak ~= "
                     f"{int(2 * sample_np.nbytes / 2**20)} MiB (during Bcast); "
                     f"per-rank steady ~= {steady_mib + ebcc_overhead_mib} MiB "
-                    f"(sample + EBCC copy) + ~{thread_pool_mib} MiB (threads x "
-                    f"2 x inner_chunk_mib)."
+                    f"(sample + EBCC copy) + ~{decode_cache_mib} MiB "
+                    f"(decompressed cache) + ~{thread_pool_mib} MiB "
+                    f"(threads x 2 x inner_chunk_mib) = "
+                    f"{humanize.naturalsize(_per_rank_total_bytes, binary=True)} total."
                 )
                 # If the caller omitted --field-to-compress, flag the per-var
                 # Bcast cost so they're not surprised by 30 variables x 5 GB
@@ -856,7 +1138,6 @@ def evaluate_combos(dataset_file,
             raw_values_explicit_with_names = []
             failures = []
 
-            total_local = len(configs_for_rank)
             var_sweep_t0 = time.perf_counter()
 
             # ----- Resume support --------------------------------------------
@@ -905,20 +1186,15 @@ def evaluate_combos(dataset_file,
                 cfg for cfg in configs_for_rank
                 if _cfg_key(cfg) not in already_done
             ]
+            # Post-resume total: progress bar's 100% line can only fire when
+            # `done == total_local`, so this must reflect what will actually
+            # be submitted, not the pre-resume count.
+            total_local = max(1, len(configs_pending))
 
-            # ----- Streaming CSVs --------------------------------------------
-            # partial_csv: one row per successful eval (kept or filtered-out)
-            # failures_csv: one row per failure (exception).  Both are flushed
-            # every FLUSH_EVERY rows to keep MDS pressure down while still
-            # giving crash-safety.  Header written iff the file doesn't yet
-            # exist (or is empty), so resume-mode appends cleanly to a prior
-            # run AND still produces a valid CSV when only one of the two
-            # files was created before the crash.
+            # Streaming CSVs: partial = one row per success, failures = one
+            # row per exception.  Header written iff file is empty (resume-safe).
+            # Batched flush every FLUSH_EVERY rows to keep MDS pressure low.
             FLUSH_EVERY = 100
-            # Batched flushing reduces Lustre MDS round-trips from one-per-row
-            # to roughly one-per-FLUSH_EVERY-rows (10k combos -> 100 flushes
-            # instead of 10k).  Still flushes on normal exit via the `with`
-            # block, so a clean finish leaves the CSV fully on disk.
             rows_since_flush = 0
             failed_rows_since_flush = 0
 
@@ -960,6 +1236,7 @@ def evaluate_combos(dataset_file,
                         future_to_cfg = {
                             pool.submit(_evaluate_one, cfg): cfg for cfg in configs_pending
                         }
+
                         for fut in as_completed(future_to_cfg):
                             cfg = future_to_cfg[fut]
 
@@ -1135,6 +1412,7 @@ def evaluate_combos(dataset_file,
                     "args": {
                         "eval_data_size_limit": int(eval_data_size_limit),
                         "threads_per_rank": int(threads_per_rank),
+                        "codec_threads": int(codec_threads or 1),
                         "inner_chunk_mib": int(inner_chunk_mib),
                         "max_inner_chunk_mib": int(max_inner_chunk_mib),
                         "spatial_split": bool(spatial_split),
@@ -1155,6 +1433,9 @@ def evaluate_combos(dataset_file,
                     "num_combos": int(num_loops),
                     "num_passed": int(len(results_gather)),
                     "num_failed_total": int(total_failures or 0),
+                    "num_filtered": int(
+                        num_loops - len(results_gather) - (total_failures or 0)
+                    ),
                     "var_sweep_seconds": float(var_sweep_seconds),
                     "env": {
                         "zarr": getattr(zarr, "__version__", None),
@@ -1247,6 +1528,12 @@ def evaluate_combos(dataset_file,
               help="Number of dask workers used for the parallel write. "
                    "Default: auto-detected from visible cores. "
                    "Peak memory use during the write is roughly threads * shard_mib.")
+@click.option("--codec-threads", type=int, default=1, show_default=True,
+              help="Internal threads per codec call (Blosc set live; for "
+                   "OpenMP/MKL/OpenBLAS export the matching env vars in the "
+                   "shell BEFORE running). --threads * --codec-threads must "
+                   "be <= physical cores; oversubscription-check is skipped "
+                   "when this is > 1.")
 @click.option("--oversubscription-check/--no-oversubscription-check", default=True,
               show_default=True,
               help="At startup, warn/abort if OMP/BLOSC/MKL thread vars aren't pinned to 1.")
@@ -1273,8 +1560,8 @@ def evaluate_combos(dataset_file,
 @click.option("--filter-class", default="all")
 @click.option("--serializer-class", default="all")
 @click.option("--with-lossy/--without-lossy", default=True, show_default=True)
-@click.option("--with-numcodecs-wasm/--without-numcodecs-wasm", default=True, show_default=True)
-@click.option("--with-ebcc/--without-ebcc", default=True, show_default=True)
+@click.option("--with-numcodecs-wasm/--without-numcodecs-wasm", default=False, show_default=True)
+@click.option("--with-ebcc/--without-ebcc", default=False, show_default=True)
 @click.option("--force/--no-force", default=False, show_default=True,
               help="Suppress the warning emitted when the (comp_idx, filt_idx, "
                    "ser_idx) you pass does not match the best combo recorded in "
@@ -1287,7 +1574,8 @@ def compress_with_optimal(dataset_file, where_to_write, field_to_compress,
                           eval_data_size_limit,
                           inner_chunk_mib, max_inner_chunk_mib,
                           spatial_split, shard_mib,
-                          threads, oversubscription_check, memory_threshold,
+                          threads, codec_threads,
+                          oversubscription_check, memory_threshold,
                           verify,
                           compressor_class, filter_class, serializer_class,
                           with_lossy, with_numcodecs_wasm, with_ebcc,
@@ -1349,36 +1637,11 @@ def compress_with_optimal(dataset_file, where_to_write, field_to_compress,
 
     os.makedirs(where_to_write, exist_ok=True)
 
-    # Version + environment banner (for parity with evaluate_combos).
     click.echo(_version_banner("compress_with_optimal"))
 
-    # -------------------------------------------------------------------------
-    # -------------------------------------------------------------------------
-    # Manifest cross-checks (best combo + library versions).
-    #
-    # evaluate_combos writes `manifest_{var}.json` containing the winning
-    # (comp_idx, filt_idx, ser_idx) triple AND the zarr / numpy / dask
-    # versions that produced the sweep.  We check both here:
-    #
-    #   1. If the user's triple differs from the manifest's best, warn
-    #      (non-fatal) - catches typos and stale indices without blocking
-    #      legitimate "I want to try a different combo" workflows.
-    #   2. If the library versions differ from the sweep's, warn (non-
-    #      fatal) - a decode-path change across versions could shift the
-    #      sample bytes and make the sample-signature hash check trip for
-    #      reasons unrelated to user error.  This is defense-in-depth:
-    #      the hash check itself still catches the mismatch; the warning
-    #      just helps the user understand WHY it happened.
-    #
-    # --force suppresses both warnings (it's the "I know what I'm doing"
-    # escape hatch).
-    #
-    # Both warnings are emitted here (not from the sample-hash block
-    # further down) so users see them BEFORE the expensive work
-    # (dataset open, .compute() of the sample) even starts.  Cheap to
-    # read a JSON file; lets a user abort fast if they realise they
-    # fat-fingered an index or loaded the wrong environment module.
-    # -------------------------------------------------------------------------
+    # Manifest cross-checks: warn if the user's (comp_idx,filt_idx,ser_idx)
+    # differs from the recorded best, or if zarr/numpy/dask versions changed
+    # since the sweep.  --force suppresses both warnings.
     manifest_path = Path(where_to_write) / f"manifest_{field_to_compress}.json"
     if manifest_path.is_file() and not force:
         try:
@@ -1455,12 +1718,16 @@ def compress_with_optimal(dataset_file, where_to_write, field_to_compress,
     # codec pipeline across shards.  We make the worker count explicit so the
     # user can control peak memory (roughly: threads * shard_mib).
     # -------------------------------------------------------------------------
+    _reset_memcheck_state()
     cores_avail = utils.detect_cores_available()
     if threads is None:
         threads = cores_avail
-    utils.check_thread_oversubscription(
-        abort_if_unsafe=oversubscription_check, rank=rank,
-    )
+    _apply_codec_threads(codec_threads)
+    _check_thread_product(threads, codec_threads)
+    if int(codec_threads or 1) <= 1:
+        utils.check_thread_oversubscription(
+            abort_if_unsafe=oversubscription_check, rank=rank,
+        )
 
     # Both memory guardrails (write peak + codec-space sample) are deferred
     # until after the dataset is opened, so we can check against the ACTUAL
@@ -1513,36 +1780,18 @@ def compress_with_optimal(dataset_file, where_to_write, field_to_compress,
             threshold=memory_threshold,
         )
 
-        # Build the codec space from a representative sample of the field.
-        #
-        # The sample here has ONE purpose: to make compressor_space / filter_space /
-        # serializer_space produce the same pre-instantiated codec objects as
-        # evaluate_combos produced (those builders compute data-dependent parameters
-        # like Asinh.linear_width, FixedOffsetScale.offset/scale, EBCC chunk geometry).
-        # `build_representative_sample` is deterministic, so as long as the user
-        # passes the same --eval-data-size-limit to both commands, both commands
-        # see the same sample and produce identical codec objects.
-        #
-        # The sample is NOT what gets compressed - we compress `da` (the full field)
-        # below.  This flag does not control write behavior.
+        # Sample for codec-space construction.  Same --eval-data-size-limit
+        # as the sweep -> identical pre-instantiated codec objects, so
+        # comp_idx/filt_idx/ser_idx resolve consistently.  This sample is
+        # NOT what gets compressed (we compress `da` below).
         sample_for_codec_space = utils.build_representative_sample(
             da, eval_data_size_limit,
         ).compute()
 
-        # --------------------------------------------------------------------
-        # Sample reproducibility hash (M5 verification side).
-        #
-        # If evaluate_combos wrote a sample_signature_{var}.json in this
-        # directory, recompute the hash here and compare.  Mismatch means
-        # the codec-space objects won't match the ones that won the sweep,
-        # so comp_idx / filt_idx / ser_idx resolve to a DIFFERENT codec
-        # than the user thinks.  Refuse to continue.
-        #
-        # The signature file being ABSENT is not an error — evaluate_combos
-        # may have been run with an older version of this toolkit, or the
-        # user may have hand-picked indices from another source.  In that
-        # case we warn once and proceed on trust.
-        # --------------------------------------------------------------------
+        # Sample reproducibility hash: if evaluate_combos wrote a signature,
+        # recompute and compare.  Mismatch means codec-space indices resolve
+        # to different objects than the sweep measured — refuse to continue.
+        # Absent signature: warn once and proceed (older sweep, manual indices).
         sig_path = _signature_path(where_to_write, str(field_to_compress))
         if sig_path.is_file():
             try:
@@ -1556,9 +1805,6 @@ def compress_with_optimal(dataset_file, where_to_write, field_to_compress,
                     eval_data_size_limit=int(eval_data_size_limit),
                     sample_np=sample_np_view,
                 )
-                # Compare the meaningful fields.  `dataset_stem` and `var`
-                # must match.  `shape`/`dtype`/`nbytes`/`sha256` must match.
-                # `eval_data_size_limit` mismatch is the most common cause.
                 fields_to_check = (
                     "dataset_stem", "var", "eval_data_size_limit",
                     "shape", "dtype", "nbytes", "sha256",
@@ -1578,13 +1824,10 @@ def compress_with_optimal(dataset_file, where_to_write, field_to_compress,
                             f"observed={observed.get(f)}"
                         )
                     click.echo(
-                        "  The codec-space indices written by evaluate_combos "
-                        "will resolve to different codec objects than the "
-                        "sweep measured.  Most common cause: different "
-                        "--eval-data-size-limit between the two commands.  "
-                        "Re-run compress_with_optimal with the matching flag."
+                        "  Most common cause: different --eval-data-size-limit "
+                        "between sweep and reuse.  Re-run with matching flag."
                     )
-                    comm.Abort(1)
+                    sys.exit(1)
                 else:
                     click.echo(
                         f"[sample-hash] OK, matches {sig_path.name} "
@@ -1618,7 +1861,7 @@ def compress_with_optimal(dataset_file, where_to_write, field_to_compress,
                                ("ser_idx",  ser_idx,  serializers)]:
             if not (-1 <= idx < len(arr)):
                 click.echo(f"Invalid {name}: {idx} (must be in [-1, {len(arr) - 1}])")
-                comm.Abort(1)
+                sys.exit(1)
 
         optimal_compressor = compressors[comp_idx][1] if comp_idx != -1 else None
         optimal_filter     = filters[filt_idx][1]     if filt_idx != -1 else None
@@ -1846,6 +2089,12 @@ def compress_with_optimal(dataset_file, where_to_write, field_to_compress,
 @click.option("--shard-mib", type=int, default=512, show_default=True)
 @click.option("--threads", type=int, default=None,
               help="Dask workers for the write.  Default: auto-detected.")
+@click.option("--codec-threads", type=int, default=1, show_default=True,
+              help="Internal threads per codec call (Blosc set live; for "
+                   "OpenMP/MKL/OpenBLAS export the matching env vars in the "
+                   "shell BEFORE running). --threads * --codec-threads must "
+                   "be <= physical cores; oversubscription-check is skipped "
+                   "when this is > 1.")
 @click.option("--oversubscription-check/--no-oversubscription-check", default=True,
               show_default=True)
 @click.option("--memory-threshold", type=click.FloatRange(0.05, 0.95), default=0.80,
@@ -1860,8 +2109,8 @@ def compress_with_optimal(dataset_file, where_to_write, field_to_compress,
 @click.option("--filter-class", default="all")
 @click.option("--serializer-class", default="all")
 @click.option("--with-lossy/--without-lossy", default=True, show_default=True)
-@click.option("--with-numcodecs-wasm/--without-numcodecs-wasm", default=True, show_default=True)
-@click.option("--with-ebcc/--without-ebcc", default=True, show_default=True)
+@click.option("--with-numcodecs-wasm/--without-numcodecs-wasm", default=False, show_default=True)
+@click.option("--with-ebcc/--without-ebcc", default=False, show_default=True)
 @click.option("--skip-existing/--no-skip-existing", default=True, show_default=True,
               help="If a field is already present in the merged store, skip it. "
                    "Disable with --no-skip-existing to force re-compression.")
@@ -1871,7 +2120,8 @@ def compress_with_optimal(dataset_file, where_to_write, field_to_compress,
 def compress_fields_from_results(dataset_file, where_to_write, vars_filter,
                                   eval_data_size_limit, inner_chunk_mib,
                                   max_inner_chunk_mib, spatial_split, shard_mib,
-                                  threads, oversubscription_check, memory_threshold,
+                                  threads, codec_threads,
+                                  oversubscription_check, memory_threshold,
                                   verify,
                                   compressor_class, filter_class, serializer_class,
                                   with_lossy, with_numcodecs_wasm, with_ebcc,
@@ -1903,12 +2153,16 @@ def compress_fields_from_results(dataset_file, where_to_write, vars_filter,
     click.echo(_version_banner("compress_fields_from_results"))
 
     # Thread + dask config (same pattern as compress_with_optimal)
+    _reset_memcheck_state()
     cores_avail = utils.detect_cores_available()
     if threads is None:
         threads = cores_avail
-    utils.check_thread_oversubscription(
-        abort_if_unsafe=oversubscription_check, rank=rank,
-    )
+    _apply_codec_threads(codec_threads)
+    _check_thread_product(threads, codec_threads)
+    if int(codec_threads or 1) <= 1:
+        utils.check_thread_oversubscription(
+            abort_if_unsafe=oversubscription_check, rank=rank,
+        )
     # Per-variable memory checks (write peak AND codec-space sample) happen
     # inside the loop below, once we know each variable's actual size.
     # A single up-front `threads * shard_mib` check would spuriously abort
@@ -1916,16 +2170,9 @@ def compress_fields_from_results(dataset_file, where_to_write, vars_filter,
     # one shard) on memory-constrained nodes; a sum-based pre-check would
     # miss that variables are processed sequentially, not concurrently.
 
-    # --------------------------------------------------------------------
-    # Resolve (var, comp_idx, filt_idx, ser_idx) list from the where_to_write
-    # directory.  Prefer manifest_{var}.json because it encodes exact codec
-    # spellings and was designed for this; fall back to best-ratio from
-    # results_{var}.parquet if the manifest is missing.
-    #
-    # We also capture the env block from the first manifest we read so we
-    # can warn once if the sweep ran with different library versions than
-    # this batch run (decode-path drift -> signature mismatches later).
-    # --------------------------------------------------------------------
+    # Resolve (var, comp_idx, filt_idx, ser_idx) from where_to_write.  Prefer
+    # manifest_{var}.json; fall back to best-ratio in results_{var}.parquet.
+    # Capture sweep env from the first manifest for a one-time version warn.
     wtw = Path(where_to_write)
     candidates = []
     sweep_env = None
@@ -2019,7 +2266,7 @@ def compress_fields_from_results(dataset_file, where_to_write, vars_filter,
             "[batch] ERROR: no variables to compress. Did evaluate_combos run "
             "against the same --where-to-write?"
         )
-        comm.Abort(1)
+        sys.exit(1)
 
     click.echo(
         f"[batch] will compress {len(candidates)} field(s): "
@@ -2072,7 +2319,7 @@ def compress_fields_from_results(dataset_file, where_to_write, vars_filter,
                 else:
                     click.echo(f"[batch] ERROR: {msg}; aborting (use "
                                f"--continue-on-error to skip).")
-                    comm.Abort(1)
+                    sys.exit(1)
 
             try:
                 field_t0 = time.perf_counter()
@@ -2147,7 +2394,7 @@ def compress_fields_from_results(dataset_file, where_to_write, vars_filter,
                                 )
                                 results_by_var[var] = {"status": "signature-mismatch"}
                                 continue
-                            comm.Abort(1)
+                            sys.exit(1)
                     except Exception as sig_err:
                         click.echo(
                             f"[sample-hash] WARNING {var}: {sig_err}; proceeding."
@@ -2317,7 +2564,7 @@ def compress_fields_from_results(dataset_file, where_to_write, vars_filter,
         click.echo(f"[batch] WARNING: could not write batch manifest: {bmf_err}")
 
     if any_error and not continue_on_error:
-        comm.Abort(1)
+        sys.exit(1)
 
 
 @cli.command("merge_compressed_fields")
@@ -2353,7 +2600,7 @@ def merge_compressed_fields(dataset_file: str, compressed_files_location: str):
         click.echo(f"Expected merged store not found: {merged_path}")
         click.echo("Did compress_with_optimal run at least once with the same "
                    "`where_to_write`?")
-        comm.Abort(1)
+        sys.exit(1)
 
     # Open in a try/finally so the LocalStore handles are released even if
     # consolidate_metadata or the subsequent array listing raises.  Zarr v3's
@@ -2460,11 +2707,15 @@ def open_zarr_and_inspect(zarr_path: str, head: int):
                    "Encoding attrs ride along in var.attrs, so a downstream "
                    "reader passing decode_times=True (xarray default) still "
                    "gets datetime64/cftime objects with no information loss.")
+@click.option("--threads", type=int, default=None,
+              help="Dask workers for parallel HDF5 reads + zarr writes. "
+                   "Default: auto-detected.")
 def from_nc_to_zarr(nc_path: str, out_zarr: str | None,
                     overwrite: bool, consolidated: bool,
                     preserve_source_chunks: bool,
                     mask_and_scale: bool,
-                    decode_times: bool):
+                    decode_times: bool,
+                    threads: int | None):
     """
     Convert a NetCDF file (.nc) to a zarr v3 LocalStore (.zarr directory)
     with NO compression, NO filters, and NO sharding.  Intended for
@@ -2533,7 +2784,7 @@ def from_nc_to_zarr(nc_path: str, out_zarr: str | None,
             f"handles netCDF input; use from_zarr_to_netcdf for the "
             f"reverse direction."
         )
-        comm.Abort(1)
+        sys.exit(1)
 
     if out_zarr is None:
         out_zarr = str(Path(nc_path).with_suffix(".zarr"))
@@ -2549,7 +2800,10 @@ def from_nc_to_zarr(nc_path: str, out_zarr: str | None,
                 f"Output already exists: {out_zarr}.  "
                 f"Pass --overwrite to replace, or pick a different --out."
             )
-            comm.Abort(1)
+            sys.exit(1)
+
+    if threads is None:
+        threads = utils.detect_cores_available()
 
     click.echo(f"[nc->zarr] reading {nc_path} ...")
     # chunks={} -> dask chunks track HDF5 chunks 1:1 (the default for this
@@ -2561,50 +2815,52 @@ def from_nc_to_zarr(nc_path: str, out_zarr: str | None,
     # mask_and_scale=False keeps packed int dtypes packed; decode_times=False
     # keeps time coords as raw numerics.  See the docstring and the option
     # help text for why these are the dedup-friendly defaults.
-    ds = xr.open_dataset(
-        nc_path,
-        chunks=chunks,
-        mask_and_scale=mask_and_scale,
-        decode_times=decode_times,
-    )
-    logical_bytes = int(ds.nbytes)
-    click.echo(
-        f"[nc->zarr] logical size = {humanize.naturalsize(logical_bytes, binary=True)} "
-        f"| chunks = {'source-native' if preserve_source_chunks else 'auto'} "
-        f"| mask_and_scale = {mask_and_scale} "
-        f"| decode_times = {decode_times}"
-    )
+    with dask.config.set(scheduler="threads", num_workers=int(threads)):
+        ds = xr.open_dataset(
+            nc_path,
+            chunks=chunks,
+            mask_and_scale=mask_and_scale,
+            decode_times=decode_times,
+        )
+        logical_bytes = int(ds.nbytes)
+        click.echo(
+            f"[nc->zarr] logical size = {humanize.naturalsize(logical_bytes, binary=True)} "
+            f"| chunks = {'source-native' if preserve_source_chunks else 'auto'} "
+            f"| mask_and_scale = {mask_and_scale} "
+            f"| decode_times = {decode_times} "
+            f"| dask workers = {threads}"
+        )
 
-    # Per-variable encoding override.  Two layers of defense:
-    # 1. Clear .encoding on every variable so any netCDF-side encoding keys
-    #    (zlib, shuffle, chunksizes, _FillValue, ...) inherited from
-    #    xr.open_dataset don't leak into xarray's encoding-translation layer.
-    # 2. Pass an explicit `compressors=None, filters=None` per variable to
-    #    `to_zarr`, which wins over anything still residual.
-    # We iterate over ds.variables (data_vars + coords) so coordinate arrays
-    # are included; see the docstring for why.
-    encoding = {}
-    for name in ds.variables:
-        ds[name].encoding = {}
-        encoding[name] = {
-            "compressors": None,
-            "filters": None,
-        }
+        # Per-variable encoding override.  Two layers of defense:
+        # 1. Clear .encoding on every variable so any netCDF-side encoding keys
+        #    (zlib, shuffle, chunksizes, _FillValue, ...) inherited from
+        #    xr.open_dataset don't leak into xarray's encoding-translation layer.
+        # 2. Pass an explicit `compressors=None, filters=None` per variable to
+        #    `to_zarr`, which wins over anything still residual.
+        # We iterate over ds.variables (data_vars + coords) so coordinate arrays
+        # are included; see the docstring for why.
+        encoding = {}
+        for name in ds.variables:
+            ds[name].encoding = {}
+            encoding[name] = {
+                "compressors": None,
+                "filters": None,
+            }
 
-    click.echo(
-        f"[nc->zarr] writing {out_zarr} (compressors=None, filters=None, "
-        f"{len(encoding)} variable(s)) ..."
-    )
-    # mode="w-" = create-only; we already short-circuited on the
-    # exists-and-not-overwrite path above, so this just guards against a
-    # race with another process between the check and the write.
-    ds.to_zarr(
-        out_zarr,
-        mode="w-",
-        encoding=encoding,
-        zarr_format=3,
-        consolidated=consolidated,
-    )
+        click.echo(
+            f"[nc->zarr] writing {out_zarr} (compressors=None, filters=None, "
+            f"{len(encoding)} variable(s)) ..."
+        )
+        # mode="w-" = create-only; we already short-circuited on the
+        # exists-and-not-overwrite path above, so this just guards against a
+        # race with another process between the check and the write.
+        ds.to_zarr(
+            out_zarr,
+            mode="w-",
+            encoding=encoding,
+            zarr_format=3,
+            consolidated=consolidated,
+        )
     click.echo(f"[nc->zarr] wrote {out_zarr}")
 
 
@@ -2620,8 +2876,17 @@ def from_nc_to_zarr(nc_path: str, out_zarr: str | None,
 @click.option("--compression", default="zlib", show_default=True,
               help="NetCDF variable compression (zlib/none).")
 @click.option("--complevel", default=4, show_default=True, help="zlib compression level.")
+@click.option("--threads", type=int, default=None,
+              help="Dask workers for parallel zarr reads + netCDF writes. "
+                   "Default: auto-detected.")
+@click.option("--codec-threads", type=int, default=1, show_default=True,
+              help="Internal threads per codec call (Blosc decode is set "
+                   "live; for OpenMP/MKL/OpenBLAS export the matching env "
+                   "vars in the shell BEFORE running). --threads * "
+                   "--codec-threads must be <= physical cores.")
 def from_zarr_to_netcdf(zarr_path: str, out_nc: str | None,
-                        max_size: int, compression: str, complevel: int):
+                        max_size: int, compression: str, complevel: int,
+                        threads: int | None, codec_threads: int):
     """
     Convert a zarr v3 LocalStore (.zarr directory) to a NetCDF4 file.
     Writes are streamed via dask so the full dataset is never held in memory.
@@ -2639,42 +2904,52 @@ def from_zarr_to_netcdf(zarr_path: str, out_nc: str | None,
     if out_nc is None:
         out_nc = str(Path(zarr_path).with_suffix(".nc"))
 
+    if threads is None:
+        threads = utils.detect_cores_available()
+    _apply_codec_threads(codec_threads)
+    _check_thread_product(threads, codec_threads)
+
     # Load via xarray; this preserves dims/coords if consolidated metadata exists.
     # The previous heuristic (Path(zarr_path)/"zarr.json").exists() was wrong:
     # every zarr v3 store has a zarr.json, consolidated or not.  Consolidation
     # in v3 is a `consolidated_metadata` field *inside* that zarr.json.  We try
     # consolidated first (fast path) and fall back to a metadata scan if the
     # store wasn't processed by `merge_compressed_fields`.
-    try:
-        ds = xr.open_zarr(zarr_path, chunks="auto", consolidated=True)
-    except Exception:
-        ds = xr.open_zarr(zarr_path, chunks="auto", consolidated=False)
+    with dask.config.set(scheduler="threads", num_workers=int(threads)):
+        try:
+            ds = xr.open_zarr(zarr_path, chunks="auto", consolidated=True)
+        except Exception:
+            ds = xr.open_zarr(zarr_path, chunks="auto", consolidated=False)
 
-    logical_bytes = int(ds.nbytes)
-    click.echo(f"[zarr->nc] logical size = {humanize.naturalsize(logical_bytes, binary=True)}")
-    if logical_bytes > max_size:
+        logical_bytes = int(ds.nbytes)
         click.echo(
-            f"Refusing to write: logical size exceeds --max-size "
-            f"({humanize.naturalsize(max_size, binary=True)}). "
-            f"Raise --max-size to proceed, or keep the data in .zarr."
+            f"[zarr->nc] logical size = "
+            f"{humanize.naturalsize(logical_bytes, binary=True)} "
+            f"| dask workers = {threads} | codec-threads = {codec_threads}"
         )
-        comm.Abort(1)
+        if logical_bytes > max_size:
+            click.echo(
+                f"Refusing to write: logical size exceeds --max-size "
+                f"({humanize.naturalsize(max_size, binary=True)}). "
+                f"Raise --max-size to proceed, or keep the data in .zarr."
+            )
+            sys.exit(1)
 
-    # Per-variable encoding: preserve dask chunks as NetCDF chunks, add compression.
-    encoding = {}
-    for name, var in ds.data_vars.items():
-        enc = {}
-        if isinstance(var.data, dask.array.Array):
-            # Use one dask chunk per netcdf chunk.  Caps each chunk at the
-            # first block shape to avoid overly large chunks.
-            enc["chunksizes"] = tuple(b[0] for b in var.data.chunks)
-        if compression == "zlib":
-            enc["zlib"] = True
-            enc["complevel"] = int(complevel)
-        encoding[name] = enc
+        # Per-variable encoding: preserve dask chunks as NetCDF chunks, add compression.
+        encoding = {}
+        for name, var in ds.data_vars.items():
+            enc = {}
+            if isinstance(var.data, dask.array.Array):
+                # Use one dask chunk per netcdf chunk; max(b) protects against
+                # rechunks that produce a smaller leading block.
+                enc["chunksizes"] = tuple(max(b) for b in var.data.chunks)
+            if compression == "zlib":
+                enc["zlib"] = True
+                enc["complevel"] = int(complevel)
+            encoding[name] = enc
 
-    click.echo(f"[zarr->nc] writing {out_nc} ...")
-    ds.to_netcdf(out_nc, engine="h5netcdf", encoding=encoding)
+        click.echo(f"[zarr->nc] writing {out_nc} ...")
+        ds.to_netcdf(out_nc, engine="h5netcdf", encoding=encoding)
     click.echo(f"[zarr->nc] wrote {out_nc}")
 
 
@@ -2955,12 +3230,12 @@ def analyze_clustering(npy_file: str, where_to_write: str, var: str):
 @click.option("--filter-class", default="all", help="Same as in evaluate_combos.")
 @click.option("--serializer-class", default="all", help="Same as in evaluate_combos.")
 @click.option("--with-lossy/--without-lossy", default=True, show_default=True, help="Same as in evaluate_combos.")
-@click.option("--with-numcodecs-wasm/--without-numcodecs-wasm", default=True, show_default=True, help="Same as in evaluate_combos.")
-@click.option("--with-ebcc/--without-ebcc", default=True, show_default=True, help="Same as in evaluate_combos.")
+@click.option("--with-numcodecs-wasm/--without-numcodecs-wasm", default=False, show_default=True, help="Same as in evaluate_combos.")
+@click.option("--with-ebcc/--without-ebcc", default=False, show_default=True, help="Same as in evaluate_combos.")
 def plot_compression_errors(dataset_file: str, where_to_write: str, field_to_compress: str,
                             comp_idx: int, filt_idx: int, ser_idx: int, 
                             compressor_class: str = "all", filter_class: str = "all", serializer_class: str = "all",
-                            with_lossy: bool = True, with_numcodecs_wasm: bool = True, with_ebcc: bool = True):
+                            with_lossy: bool = True, with_numcodecs_wasm: bool = False, with_ebcc: bool = False):
     """
     Plot the absolute errors arising from compression+decompression of a field
     with the desired combination of compressor, filter, and serializer.

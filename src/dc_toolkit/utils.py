@@ -10,6 +10,7 @@ import math
 import click
 import humanize
 import threading
+import asyncio
 from pathlib import Path
 from typing import Tuple, Optional
 
@@ -39,6 +40,24 @@ from numcodecs_wasm_fixed_offset_scale import FixedOffsetScale
 from numcodecs_wasm_zfp import Zfp
 
 os.environ["EBCC_LOG_LEVEL"] = "4"  # ERROR (suppress WARN and below)
+
+
+class CombinationProducedNonFiniteError(Exception):
+    """
+    Raised when a codec combination's decoded sample contains NaN or
+    +/-inf values, signalling that the (compressor, filter, serializer)
+    triple is unsuitable for this field's value range.
+
+    Caught by the per-combo try/except in `cli.evaluate_combos`, which
+    routes it to `failures_<var>_rank<n>.csv` with a clear reason
+    string.  Without this exception, the float64 cast in the metrics
+    loop would raise a `RuntimeWarning: invalid value encountered in
+    cast` per non-finite chunk - the combo would still be filtered out
+    by the L1 threshold downstream, but the warning floods the SLURM
+    log (191 occurrences in production job 843234) and the failure
+    reason wouldn't be recorded explicitly.
+    """
+    pass
 
 
 # =============================================================================
@@ -157,28 +176,15 @@ def is_lat_lon(da):
 # REPRESENTATIVE SAMPLING  (replaces the old corner-slice strategy)
 # =============================================================================
 
-# Time-like dim name patterns, used as a FALLBACK by build_representative_sample
-# when CF metadata isn't available.  The primary detection path uses
-# CF-conventions attributes (units, standard_name, axis, calendar) on
-# the coord variable corresponding to each dim — that's the principled
-# answer.  The regex below is a name-matching backstop for files with
-# missing or sloppy CF metadata.  Conservative on purpose: a missed
-# match falls back to "return whole field with warning", which is a
-# soft failure (slightly more memory at sweep time) rather than a
-# silent biased-sample bug.  Add patterns here if you encounter
-# datasets whose temporal axis is named differently AND lacks CF
-# metadata to identify it structurally.
+# Time-like dim name patterns; FALLBACK when CF metadata is unavailable.
+# Primary detection uses CF-conventions attributes on the coord variable.
 _TIME_LIKE_DIM_RE = re.compile(
     r'^(?:time|.*_time|t|step|forecast_reference_time|forecast_period|'
     r'ensemble|realization|member|reftime|valid_time|epoch)$',
     re.IGNORECASE,
 )
 
-# CF time-units pattern: "<unit> since <reference time>".  CF spec allows
-# unit names like 'seconds', 'minutes', 'hours', 'days', 'months', 'years'
-# (and their abbreviations).  We deliberately don't enumerate those — any
-# alphanumeric token followed by 'since' is uniquely a time-unit string
-# in CF conventions; no other coordinate type uses this format.
+# CF time-units pattern: "<unit> since <reference time>".
 _CF_TIME_UNITS_RE = re.compile(r'^\s*\w+\s+since\s+', re.IGNORECASE)
 
 # CF standard_name values that mark a time-related axis.
@@ -364,15 +370,7 @@ def build_representative_sample(
 # =============================================================================
 
 # -----------------------------------------------------------------------------
-# Vertical-dim recognition (for hiopy-style shrink order: shrink horizontal
-# spatial dims first, keep vertical levels whole as long as possible).
-#
-# Vertical structure in climate fields is the most compressible axis (strong
-# correlation across levels), so splitting levels destroys a lot of ratio.
-# When forced to split spatially, prefer to shrink the horizontal/cell dim
-# first.  Recognition is name-based only -- the caller supplies `dims`
-# (tuple of dim names) when it has them; if not, we fall back to plain
-# C-order (last dim first).
+# Vertical-dim recognition for hiopy-style shrink order.
 # -----------------------------------------------------------------------------
 _VERTICAL_DIM_NAMES = {
     "lev", "level", "levels", "plev", "plevs", "pressure", "pressure_level",
@@ -628,15 +626,8 @@ def compute_chunks(data, min_height=0, max_height=None, min_width=0, max_width=N
                 else:
                     return (height, width, n_chunks_height, n_chunks_width)
 
-    # All loops exhausted without both dims having found a valid factoring.
-    # Before this raise, control fell off the end and the function implicitly
-    # returned None; the caller (serializer_space's EBCC branch) then tried to
-    # unpack None into 4 names and crashed with a cryptic TypeError.  Now we
-    # report the actual problem: no (height_divisor, width_divisor) of the form
-    # (n*(m+1))^p with n in {2,3,5}, m in [0..9], p in [0..7] maps both
-    # dimensions into their allowed [min_*, max_*] bands.  Typical trigger:
-    # a field with one dimension that doesn't factor cleanly into small primes
-    # (e.g. a prime width, or a dimension smaller than min_*).
+    # All loops exhausted without both dims finding a valid factoring.
+    # Raise rather than fall off the end (callers unpack into 4 names).
     raise ValueError(
         f"compute_chunks: no valid EBCC chunking found for shape "
         f"({lat_dim}, {lon_dim}) under constraints "
@@ -955,6 +946,165 @@ def _iter_chunk_slices(shape, chunk_shape):
         )
 
 
+# =============================================================================
+# ZARR SYNC-API BYPASS  (opt-in via cli --bypass-zarr-sync)
+# =============================================================================
+# zarr 3's sync wrapper (zarr.core.sync.sync) runs every coroutine on a
+# process-global event loop, serialising codec calls from concurrent worker
+# threads down to ~1 effective core (measured 5x slowdown at 1x32 vs 32x1).
+# We bypass it by calling zarr.api.asynchronous.create_array directly, with
+# a persistent event loop per worker thread.
+#
+# A single shared bounded ThreadPoolExecutor is wired as the default
+# executor on every per-thread loop.  Without that, asyncio.to_thread()
+# inside zarr's native codecs lazily creates a 32-worker default executor
+# per loop -> 32 user threads x 32 workers = ~1024 OS threads (validation
+# job 844391: 30 GB RAM, AveCPU/wall = 2.1).  The shared executor caps
+# total OS threads at user_threads + shared_workers.
+
+try:
+    from zarr.api.asynchronous import create_array as _zarr_async_create_array
+    _ASYNC_BYPASS_AVAILABLE = True
+except ImportError:
+    _zarr_async_create_array = None
+    _ASYNC_BYPASS_AVAILABLE = False
+
+
+_thread_local_loops = threading.local()
+_shared_executor = None
+_shared_executor_lock = threading.Lock()
+
+
+def _get_or_create_shared_executor(max_workers: int):
+    """Lazy, thread-safe singleton ThreadPoolExecutor."""
+    global _shared_executor
+    if _shared_executor is None:
+        with _shared_executor_lock:
+            if _shared_executor is None:
+                from concurrent.futures import ThreadPoolExecutor
+                _shared_executor = ThreadPoolExecutor(
+                    max_workers=max(1, int(max_workers)),
+                    thread_name_prefix="bypass_codec",
+                )
+    return _shared_executor
+
+
+def _shutdown_shared_executor() -> None:
+    global _shared_executor
+    with _shared_executor_lock:
+        if _shared_executor is not None:
+            _shared_executor.shutdown(wait=False, cancel_futures=False)
+            _shared_executor = None
+
+
+def _get_thread_event_loop() -> asyncio.AbstractEventLoop:
+    """
+    Return this thread's persistent asyncio loop, creating it on first call.
+    The shared bounded executor is bound as default executor on creation;
+    without this, asyncio.to_thread() inside zarr's native codecs spawns a
+    32-worker default executor PER per-thread loop.
+    """
+    loop = getattr(_thread_local_loops, "loop", None)
+    if loop is None or loop.is_closed():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        if _shared_executor is not None:
+            loop.set_default_executor(_shared_executor)
+        _thread_local_loops.loop = loop
+    return loop
+
+
+class _AsyncBypass:
+    """Toggle for the async-direct codec dispatch (cli --bypass-zarr-sync)."""
+    enabled: bool = False
+    threads_per_rank: int = 1
+
+    @classmethod
+    def enable(cls, threads_per_rank: int = 1) -> None:
+        if not _ASYNC_BYPASS_AVAILABLE:
+            raise RuntimeError(
+                "Cannot enable --bypass-zarr-sync: "
+                "zarr.api.asynchronous.create_array is not importable. "
+                "Upgrade zarr or run without the flag."
+            )
+        cls.enabled = True
+        cls.threads_per_rank = max(1, int(threads_per_rank))
+        _get_or_create_shared_executor(cls.threads_per_rank)
+
+    @classmethod
+    def disable(cls) -> None:
+        cls.enabled = False
+        _shutdown_shared_executor()
+
+
+AsyncBypass = _AsyncBypass
+
+
+async def _zarr_pipeline_async(sample_np, dims, codec_kwargs, chunks):
+    """async create + encode + info + decode."""
+    store = zarr.storage.MemoryStore()
+
+    with Timer("eval.create_array"):
+        z = await _zarr_async_create_array(
+            store=store,
+            name="_tmp_eval",
+            shape=sample_np.shape,
+            dtype=sample_np.dtype,
+            chunks=chunks,
+            zarr_format=3,
+            dimension_names=tuple(dims),
+            **codec_kwargs,
+        )
+
+    with Timer("eval.encode"):
+        await z.setitem(Ellipsis, sample_np)
+
+    with Timer("eval.info_complete"):
+        info = await z.info_complete()
+        count_bytes, count_bytes_stored = _info_bytes(info)
+        ratio = count_bytes / count_bytes_stored
+
+    with Timer("eval.decode"):
+        decomp_full = await z.getitem(Ellipsis)
+
+    return decomp_full, ratio
+
+
+def _zarr_pipeline_sync(sample_np, dims, codec_kwargs, chunks):
+    """sync create + encode + info + decode."""
+    store = zarr.storage.MemoryStore()
+
+    with Timer("eval.create_array"):
+        z = zarr.create_array(
+            store=store,
+            name="_tmp_eval",
+            shape=sample_np.shape,
+            dtype=sample_np.dtype,
+            chunks=chunks,
+            zarr_format=3,
+            dimension_names=tuple(dims),
+            **codec_kwargs,
+        )
+
+    with Timer("eval.encode"):
+        z[...] = sample_np
+
+    with Timer("eval.info_complete"):
+        info = z.info_complete()
+        count_bytes, count_bytes_stored = _info_bytes(info)
+        ratio = count_bytes / count_bytes_stored
+
+    with Timer("eval.decode"):
+        decomp_full = z[...]
+
+    return decomp_full, ratio
+
+
+# =============================================================================
+# CODEC PIPELINE - EVALUATION (no persistence, thread-safe)
+# =============================================================================
+
+
 def evaluate_codec_pipeline(
     sample_np: np.ndarray,
     dims,
@@ -965,56 +1115,69 @@ def evaluate_codec_pipeline(
 ):
     """
     Measure (compression_ratio, errors, euclidean_distance) for a codec
-    pipeline against `sample_np` (a numpy array).
+    pipeline against `sample_np`.  In-memory zarr store, no I/O.  Safe to
+    call concurrently from multiple threads.
 
-    Uses an in-memory zarr store - no disk I/O, no zip wrapping.
-    Safe to call from multiple threads concurrently: each call creates its
-    own MemoryStore and does not touch shared state.
+    The full sample is decoded once via z[...]; the metrics loop slices
+    that buffer chunk-wise to bound the float64 promotion peak.  Peak
+    per-rank memory is ~2 * sample_nbytes (original + decoded) — caller
+    must size NTASKS_PER_NODE accordingly.
 
-    Error norms are accumulated chunk-wise to avoid ever holding a full
-    decompressed copy of the sample in memory.
+    Dispatch: if AsyncBypass is enabled, the zarr operations route through
+    a per-thread persistent event loop (sidesteps zarr 3's process-global
+    sync() loop that otherwise serialises codec dispatch from concurrent
+    threads).  The metrics phase is identical in both paths.
     """
-    store = zarr.storage.MemoryStore()
-
     codec_kwargs = _codec_kwargs(filters, compressors, serializer)
 
-    z = zarr.create_array(
-        store=store,
-        name="_tmp_eval",
-        shape=sample_np.shape,
-        dtype=sample_np.dtype,
-        chunks=chunks,
-        zarr_format=3,
-        dimension_names=tuple(dims),
-        **codec_kwargs,
-    )
-    z[...] = sample_np  # triggers full codec pipeline
+    if _AsyncBypass.enabled:
+        loop = _get_thread_event_loop()
+        decomp_full, ratio = loop.run_until_complete(
+            _zarr_pipeline_async(sample_np, dims, codec_kwargs, chunks)
+        )
+    else:
+        decomp_full, ratio = _zarr_pipeline_sync(
+            sample_np, dims, codec_kwargs, chunks
+        )
 
-    # --- compression ratio ---
-    info = z.info_complete()
-    count_bytes, count_bytes_stored = _info_bytes(info)
-    ratio = count_bytes / count_bytes_stored
+    # Chunk-wise error accumulation: bounds the float64 promotion peak at
+    # one chunk's worth.  np.errstate silences NaN-cast RuntimeWarnings;
+    # we detect non-finite results explicitly below and surface them via
+    # CombinationProducedNonFiniteError so the caller can record the combo
+    # cleanly in failures_*.csv.
+    with Timer("eval.metrics"):
+        l1_err = 0.0; l2_err_sq = 0.0; linf_err = 0.0
+        l1_ori = 0.0; l2_ori_sq = 0.0; linf_ori = 0.0
 
-    # --- chunk-wise error accumulation (never holds a full decompressed copy) ---
-    l1_err = 0.0; l2_err_sq = 0.0; linf_err = 0.0
-    l1_ori = 0.0; l2_ori_sq = 0.0; linf_ori = 0.0
+        with np.errstate(invalid="ignore"):
+            for sl in _iter_chunk_slices(sample_np.shape, chunks):
+                orig = sample_np[sl]
+                decomp = decomp_full[sl]
+                err = decomp.astype(np.float64, copy=False) - orig.astype(np.float64, copy=False)
+                ori_abs = np.abs(orig, dtype=np.float64) if orig.dtype.kind in "fc" \
+                          else np.abs(orig.astype(np.float64))
+                err_abs = np.abs(err)
 
-    for sl in _iter_chunk_slices(sample_np.shape, chunks):
-        orig = sample_np[sl]
-        decomp = z[sl]
-        # promote to float64 for the accumulation only
-        err = decomp.astype(np.float64, copy=False) - orig.astype(np.float64, copy=False)
-        ori_abs = np.abs(orig, dtype=np.float64) if orig.dtype.kind in "fc" \
-                  else np.abs(orig.astype(np.float64))
-        err_abs = np.abs(err)
+                l1_err     += float(err_abs.sum())
+                l2_err_sq  += float((err * err).sum())
+                linf_err    = max(linf_err, float(err_abs.max(initial=0.0)))
 
-        l1_err     += float(err_abs.sum())
-        l2_err_sq  += float((err * err).sum())
-        linf_err    = max(linf_err, float(err_abs.max(initial=0.0)))
+                l1_ori     += float(ori_abs.sum())
+                l2_ori_sq  += float((ori_abs * ori_abs).sum())
+                linf_ori    = max(linf_ori, float(ori_abs.max(initial=0.0)))
 
-        l1_ori     += float(ori_abs.sum())
-        l2_ori_sq  += float((ori_abs * ori_abs).sum())
-        linf_ori    = max(linf_ori, float(ori_abs.max(initial=0.0)))
+        del decomp_full
+
+        # NaN/inf in the decoded sample propagates into the accumulators;
+        # one scalar isfinite() check at the end is enough.
+        if not (math.isfinite(l1_err) and math.isfinite(l2_err_sq)
+                and math.isfinite(linf_err)):
+            raise CombinationProducedNonFiniteError(
+                f"decoded sample contains non-finite values "
+                f"(l1_err={l1_err}, l2_err_sq={l2_err_sq}, linf_err={linf_err}); "
+                f"codec config produced NaN or +/-inf and is unsuitable for "
+                f"this field's value range"
+            )
 
     l2_err = math.sqrt(l2_err_sq)
     l2_ori = math.sqrt(l2_ori_sq)
@@ -1309,6 +1472,7 @@ def check_thread_oversubscription(abort_if_unsafe: bool = True, rank: int = 0, c
     env_vars = [
         "OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS",
         "BLOSC_NTHREADS", "NUMBA_NUM_THREADS",
+        "VECLIB_MAXIMUM_THREADS", "OMP_THREAD_LIMIT",
     ]
     problems = []
     for v in env_vars:
@@ -1336,7 +1500,8 @@ def check_thread_oversubscription(abort_if_unsafe: bool = True, rank: int = 0, c
             )
             click.echo(
                 "  Suggested: export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 "
-                "OPENBLAS_NUM_THREADS=1 BLOSC_NTHREADS=1 NUMBA_NUM_THREADS=1"
+                "OPENBLAS_NUM_THREADS=1 BLOSC_NTHREADS=1 NUMBA_NUM_THREADS=1 "
+                "VECLIB_MAXIMUM_THREADS=1 OMP_THREAD_LIMIT=1"
             )
             if abort_if_unsafe:
                 click.echo("  Aborting (use --no-oversubscription-check to override).")
@@ -1345,11 +1510,19 @@ def check_thread_oversubscription(abort_if_unsafe: bool = True, rank: int = 0, c
             # rank 0 alone would leave siblings hanging at the next collective.
             comm.Abort(1)
 
-    # Pin zarr v3's internal thread pool (best-effort; may not exist on older versions).
-    try:
-        zarr.config.set({"threading.max_workers": 1})
-    except Exception:
-        pass
+    # Pin zarr v3's internal thread pool only when oversubscription is a real
+    # risk: multi-rank-per-node (each rank's process otherwise spawns its own
+    # default executor of ~32 workers, giving N_ranks * 32 threads on a
+    # N-core node).  With 1 rank-per-node, no pin is needed: a single rank
+    # uses one ~32-worker pool, which matches the 32 cores it's been given.
+    # The bypass case has its own bounded shared executor — also no pin.
+    if not _AsyncBypass.enabled:
+        try:
+            _, ranks_on_node, _ = detect_node_topology(MPI.COMM_WORLD)
+            if ranks_on_node > 1:
+                zarr.config.set({"threading.max_workers": 1})
+        except Exception:
+            pass
 
 
 # =============================================================================
@@ -1440,19 +1613,15 @@ class Timer:
         return self
 
     def __exit__(self, *args):
-        duration = time.perf_counter() - self.start
         with _TIMINGS_LOCK:
-            _TIMINGS[self.label].append(duration)
+            _TIMINGS[self.label].append(time.perf_counter() - self.start)
 
 
 @atexit.register
 def print_profile_summary():
     if not _TIMINGS:
         return
-
-    comm = MPI.COMM_WORLD
-    rank = comm.Get_rank()
-    if rank != 0:
+    if MPI.COMM_WORLD.Get_rank() != 0:
         return
 
     print("\n=== Timing Summary ===")

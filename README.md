@@ -93,22 +93,31 @@ The typical pipeline is three commands:
 
 ### HPC parallelism (SLURM / MPI)
 
-`evaluate_combos` requires **exactly one MPI rank per node** — each rank drives a node-local `ThreadPoolExecutor`. To scale out, increase `--nodes` and keep `--ntasks-per-node=1`:
+> For a thorough walkthrough of how every command parallelizes work — including how the `--bypass-zarr-sync` machinery actually works, why we cap at 32 threads on a 288-core node, and the chunk-vs-shard distinction — see [`docs/PARALLELIZATION.md`](docs/PARALLELIZATION.md).
+
+`evaluate_combos` runs as **one MPI rank per node**, with each rank driving 32 user threads via the `--bypass-zarr-sync` machinery (default on).  Scale out by increasing `--nodes` and keeping `--ntasks-per-node=1`:
 
 ```bash
-srun --nodes=<N> --ntasks-per-node=1 \
-  dc_toolkit evaluate_combos input.nc \
+#SBATCH --nodes=8 --ntasks-per-node=1 --cpus-per-task=32
+
+srun --unbuffered dc_toolkit evaluate_combos input.nc \
     --where-to-write ./out \
     --field-to-compress t \
-    --eval-data-size-limit 5GB
+    --eval-data-size-limit 5GB \
+    --threads-per-rank 32
 ```
+
+This topology was selected over multi-rank-per-node (32 ranks × 1 thread, the original design) to avoid OOM on large fields — the latter duplicates the sample buffer once per rank.  See `santis.run` for the validated production driver and the inline comment block summarising the experiments behind the choice.
 
 Codec-internal thread pools must be pinned to 1 to avoid nested oversubscription (the tool checks this at startup and aborts by default; `--no-oversubscription-check` disables the guard):
 
 ```bash
 export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 \
-       BLOSC_NTHREADS=1 NUMBA_NUM_THREADS=1
+       BLOSC_NTHREADS=1 NUMBA_NUM_THREADS=1 \
+       VECLIB_MAXIMUM_THREADS=1 OMP_THREAD_LIMIT=1
 ```
+
+The `--codec-threads N` flag (default 1) is available on `evaluate_combos`, `compress_with_optimal`, `compress_fields_from_results`, and `from_zarr_to_netcdf` for use cases where codec-internal threading is genuinely needed (e.g. very large chunks on workloads that aren't memory-bandwidth-bound).  Direct testing on Santis with the production Dyamond data showed `--codec-threads > 1` does **not** help on this workload; leave it at the default unless you have a specific reason and can A/B test the change.
 
 `compress_with_optimal`, `compress_fields_from_results`, and `merge_compressed_fields` are single-process commands — launch with `srun -n 1 ...` or plain invocation. Parallelism inside the write comes from dask's threaded scheduler, tuned via `--threads` (default: auto-detected from visible cores), `--inner-chunk-mib` (default: 16), and `--shard-mib` (default: 512). `--verify/--no-verify` (default on) re-reads the store to compute error norms — skip with `--no-verify` on re-compression runs where the combo is already trusted.
 
@@ -176,7 +185,8 @@ Single-machine runs (Docker included) get their parallelism from the node-local 
 
 ```bash
 -e OMP_NUM_THREADS=1 -e MKL_NUM_THREADS=1 -e OPENBLAS_NUM_THREADS=1 \
--e BLOSC_NTHREADS=1 -e NUMBA_NUM_THREADS=1
+-e BLOSC_NTHREADS=1 -e NUMBA_NUM_THREADS=1 \
+-e VECLIB_MAXIMUM_THREADS=1 -e OMP_THREAD_LIMIT=1
 ```
 
 Or for the web UI:
@@ -200,6 +210,7 @@ docker run \
   -v $(pwd)/netCDF_files:/mnt/data \
   -e OMP_NUM_THREADS=1 -e MKL_NUM_THREADS=1 -e OPENBLAS_NUM_THREADS=1 \
   -e BLOSC_NTHREADS=1 -e NUMBA_NUM_THREADS=1 \
+  -e VECLIB_MAXIMUM_THREADS=1 -e OMP_THREAD_LIMIT=1 \
   --entrypoint mpirun \
   dc-toolkit \
   -n 1 \
@@ -230,6 +241,7 @@ docker run `
   -e HOME=/tmp `
   -e OMP_NUM_THREADS=1 -e MKL_NUM_THREADS=1 -e OPENBLAS_NUM_THREADS=1 `
   -e BLOSC_NTHREADS=1 -e NUMBA_NUM_THREADS=1 `
+  -e VECLIB_MAXIMUM_THREADS=1 -e OMP_THREAD_LIMIT=1 `
   -w /mnt/data/docker_saved_files `
   -v "${PWD}\netCDF_files:/mnt/data" `
   --entrypoint mpirun `
