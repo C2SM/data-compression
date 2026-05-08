@@ -1624,12 +1624,24 @@ def print_profile_summary():
     if MPI.COMM_WORLD.Get_rank() != 0:
         return
 
-    print("\n=== Timing Summary ===")
+    print("\n=== Timing Summary (rank 0; ranks balanced via deterministic shuffle) ===")
+    print("Sum of Total = thread-seconds inside the eval pipeline (excludes bcast,")
+    print("file I/O, dask graph setup, and result-write overhead).")
+    print()
     label_width = max(len(label) for label in _TIMINGS.keys())
-    header = f"{'Label':<{label_width}} | {'Calls':>5} | {'Avg (s)':>10} | {'Total (s)':>10}"
+    # Per-label totals; grand total is the sum across all labels and is the
+    # denominator for the % column ("how much of the eval pipeline did this
+    # phase consume?").  Edge case: if no time was recorded, show 0% to
+    # avoid a ZeroDivisionError.
+    totals = {label: sum(durations) for label, durations in _TIMINGS.items()}
+    grand_total = sum(totals.values()) or 1.0
+    header = (f"{'Label':<{label_width}} | {'Calls':>5} | {'Avg (s)':>10} | "
+              f"{'Total (s)':>12} | {'% total':>7}")
     print(header)
     print("-" * len(header))
     for label, durations in sorted(_TIMINGS.items()):
-        total = sum(durations); count = len(durations); avg = total / count
-        print(f"{label:<{label_width}} | {count:>5} | {avg:>10.6f} | {total:>10.6f}")
+        total = totals[label]; count = len(durations); avg = total / count
+        pct = 100.0 * total / grand_total
+        print(f"{label:<{label_width}} | {count:>5} | {avg:>10.6f} | "
+              f"{total:>12.6f} | {pct:>6.2f}%")
     print("=" * len(header))
