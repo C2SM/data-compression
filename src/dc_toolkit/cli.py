@@ -183,29 +183,98 @@ def _per_rank_steady_estimate_bytes(
     Steady-state memory footprint of one MPI rank during the codec sweep.
 
     Components, in order of size:
-      sample_bytes           : the broadcast sample buffer, alive for the
-                               entire sweep.
-      sample_bytes (decode)  : evaluate_codec_pipeline keeps one decompressed
-                               copy alive across decode -> metrics, then
-                               drops it via `del decomp_full`.
-      threads * 2 * chunk    : ThreadPoolExecutor working set; each thread
-                               touches at most one inner chunk at a time,
-                               and the float64 promotion in metrics doubles
-                               that chunk briefly.
-      sample_bytes (EBCC)    : optional - EBCC needs a float32 working copy
-                               of the sample when the source dtype isn't
-                               already float32.  Only fired transiently per
-                               EBCC combo; only included here if the caller
-                               knows EBCC is in the search space.
+      sample_bytes                          : the broadcast sample buffer,
+                                              alive for the entire sweep,
+                                              shared across all threads.
+      threads * sample_bytes *              : per-thread working set.
+        PER_THREAD_WORKING_FACTOR             Each ThreadPoolExecutor worker
+                                              runs evaluate_codec_pipeline
+                                              which allocates ITS OWN
+                                              decoded buffer (~1x sample),
+                                              ITS OWN MemoryStore of
+                                              encoded bytes (~0.01-1x
+                                              sample depending on codec
+                                              ratio), and small intermediate
+                                              codec scratch.  Pre-patch
+                                              treated this as 1x total
+                                              instead of threads x ~1.5x;
+                                              that under-count is what
+                                              produced the R02B10 out_15
+                                              OOMs (300 GiB fields at 32
+                                              threads).
+      threads * 2 * chunk_mib               : ThreadPoolExecutor float64
+                                              promotion in the metrics
+                                              loop; per-thread.
+      sample_bytes (EBCC)                   : optional float32 working
+                                              copy of the sample when
+                                              EBCC is in the search space
+                                              and the source dtype isn't
+                                              already float32.
 
-    This is the SAME formula the rank-0 [memory] banner prints; centralised
-    here so the early-abort check and the user-facing banner can never
-    drift apart.
+    This is the SAME formula `_max_sample_bytes_for_threads` inverts;
+    centralised here so the early-abort check, the user-facing banner,
+    and the auto-shrink budget can never drift apart.
     """
-    decode_cache = sample_bytes
-    thread_pool  = max(1, threads_per_rank) * 2 * max(1, inner_chunk_mib) * (2 ** 20)
+    threads = max(1, int(threads_per_rank))
+    decode_cache = int(
+        threads * sample_bytes * PER_THREAD_WORKING_FACTOR
+    )
+    thread_chunk = threads * 2 * max(1, int(inner_chunk_mib)) * (2 ** 20)
     ebcc         = sample_bytes if include_ebcc_overhead else 0
-    return sample_bytes + decode_cache + thread_pool + ebcc
+    return sample_bytes + decode_cache + thread_chunk + ebcc
+
+
+# Per-thread working-memory multiplier (decoded buffer + encoded
+# MemoryStore + codec scratch, in units of sample_bytes).  Empirically
+# 1.5x is a safe upper bound observed across the codec set:
+#   - decoded buffer:                    1.0x sample_bytes
+#   - encoded MemoryStore (worst case
+#     when ratio < 1 with bad codec):    0.0-1.0x sample_bytes (mean ~0.3x)
+#   - codec working/scratch:             0.1-0.3x sample_bytes
+# Raised at module level (not buried in the function) so the auto-shrink
+# inversion uses the SAME multiplier as the steady estimate -- they MUST
+# stay in lockstep.
+PER_THREAD_WORKING_FACTOR = 1.5
+
+
+def _max_sample_bytes_for_threads(
+    budget_bytes: int,
+    threads_per_rank: int,
+    inner_chunk_mib: int,
+    include_ebcc_overhead: bool = False,
+) -> int:
+    """
+    Inverse of `_per_rank_steady_estimate_bytes`: what's the largest
+    sample that fits within `budget_bytes`, given the thread/chunk
+    configuration?
+
+    Solving for sample:
+      sample
+      + threads * PER_THREAD_WORKING_FACTOR * sample
+      + threads * 2 * chunk_mib * MiB
+      + (sample if EBCC else 0)
+      <= budget
+
+    => sample * (1 + threads * factor + (1 if ebcc else 0))
+                + threads * 2 * chunk_mib * MiB
+       <= budget
+
+    => sample <= (budget - thread_chunk_bytes) / coeff
+
+    Returns 0 if no positive sample fits (caller should treat as
+    "cannot start sweep with this thread count").
+    """
+    threads = max(1, int(threads_per_rank))
+    coeff = (
+        1.0
+        + threads * PER_THREAD_WORKING_FACTOR
+        + (1.0 if include_ebcc_overhead else 0.0)
+    )
+    thread_chunk = threads * 2 * max(1, int(inner_chunk_mib)) * (2 ** 20)
+    available_for_sample = budget_bytes - thread_chunk
+    if available_for_sample <= 0:
+        return 0
+    return int(available_for_sample / coeff)
 
 
 def _detect_node_memory_budget() -> tuple[int, str]:
@@ -827,7 +896,65 @@ def evaluate_combos(dataset_file,
             # refinement here (unlike the compress commands): evaluate_combos
             # writes nothing, so there are no shard bytes to re-check against.
             field_bytes = int(da.dtype.itemsize) * int(np.prod(da.shape))
-            actual_sample_bytes = min(field_bytes, int(eval_data_size_limit))
+
+            # -------------------------------------------------------------------------
+            # Auto-shrink the sample budget so the per-rank steady estimate
+            # fits within the detected node memory budget.  This is what
+            # makes the sweep OOM-proof regardless of the user's
+            # --threads-per-rank choice: when threads are high the per-thread
+            # working set dominates, so the safe sample shrinks to keep
+            # (1 + threads * factor) * sample_bytes + chunk_overhead bounded
+            # by the cgroup/host budget.  The CLI flag --eval-data-size-limit
+            # acts as a ceiling, not a target.
+            # -------------------------------------------------------------------------
+            ebcc_in_search = bool(with_ebcc) and da.dtype != np.float32
+            node_budget_bytes, node_budget_source = _detect_node_memory_budget()
+            # Under SLURM cgroup-v2 the budget is per-task; without cgroup
+            # all ranks on the node share it.  Mirror the asymmetry from
+            # _check_node_memory_headroom so the auto-shrink uses the
+            # constraint that will actually bind.
+            is_cgroup_budget = node_budget_source.startswith("cgroup")
+            if is_cgroup_budget:
+                effective_budget = node_budget_bytes
+            else:
+                effective_budget = node_budget_bytes // max(1, ranks_on_node)
+            max_safe_sample = _max_sample_bytes_for_threads(
+                budget_bytes=int(effective_budget * memory_threshold),
+                threads_per_rank=threads_per_rank,
+                inner_chunk_mib=inner_chunk_mib,
+                include_ebcc_overhead=ebcc_in_search,
+            )
+            user_limit = int(eval_data_size_limit)
+            effective_sample_limit = min(user_limit, max_safe_sample)
+
+            if effective_sample_limit <= 0:
+                if rank == 0:
+                    click.echo(
+                        f"[memcheck] FATAL: cannot fit any sample. "
+                        f"threads_per_rank={threads_per_rank}, "
+                        f"inner_chunk_mib={inner_chunk_mib}, "
+                        f"node budget "
+                        f"{humanize.naturalsize(node_budget_bytes, binary=True)} "
+                        f"({node_budget_source}) at threshold "
+                        f"{memory_threshold:.2f}.  Reduce --threads-per-rank "
+                        f"or request more RAM (#SBATCH --mem=0)."
+                    )
+                _abort(1)
+
+            if rank == 0 and effective_sample_limit < user_limit:
+                click.echo(
+                    f"[memcheck] auto-shrunk sample budget from "
+                    f"{humanize.naturalsize(user_limit, binary=True)} "
+                    f"(--eval-data-size-limit) to "
+                    f"{humanize.naturalsize(effective_sample_limit, binary=True)} "
+                    f"to stay under {memory_threshold:.2f} x "
+                    f"{humanize.naturalsize(effective_budget, binary=True)} "
+                    f"({node_budget_source}) at "
+                    f"{threads_per_rank} threads.  To increase the safe "
+                    f"sample, drop --threads-per-rank or request more RAM."
+                )
+
+            actual_sample_bytes = min(field_bytes, effective_sample_limit)
             multiplier = 2 if (rank == 0 and size > 1) else 1
             _check_memory_headroom(
                 multiplier * actual_sample_bytes,
@@ -846,9 +973,7 @@ def evaluate_combos(dataset_file,
                 # EBCC needs a float32 working copy on every rank that runs
                 # an EBCC combo (not just rank 0); upper bound, since we
                 # don't yet know whether EBCC will be selected.
-                include_ebcc_overhead=(
-                    bool(with_ebcc) and da.dtype != np.float32
-                ),
+                include_ebcc_overhead=ebcc_in_search,
             )
             _check_node_memory_headroom(
                 per_rank_steady_bytes=per_rank_steady,
@@ -861,7 +986,7 @@ def evaluate_combos(dataset_file,
 
             if rank == 0:
                 sample_da_local = utils.build_representative_sample(
-                    da, eval_data_size_limit, rank=rank,
+                    da, effective_sample_limit, rank=rank,
                 )
                 # .compute() forces the dask read; we want the buffer, not a lazy handle.
                 sample_da_local = sample_da_local.compute()
@@ -986,10 +1111,18 @@ def evaluate_combos(dataset_file,
                     any(_is_ebcc_serializer(ser) for (_, ser) in serializers)
                     and sample_np.dtype != np.float32
                 ) else 0
-                # Decode caching: evaluate_codec_pipeline keeps one decompressed
-                # copy of the sample alive during the metrics loop.  Released via
-                # `del decomp_full` at end of metrics.
-                decode_cache_mib = steady_mib
+                # Per-thread working set: each ThreadPoolExecutor worker
+                # runs evaluate_codec_pipeline concurrently with its own
+                # decoded buffer (~1x sample), encoded MemoryStore
+                # (~0.0-1x sample) and codec scratch.  Pre-patch the
+                # banner said "1x decompressed cache"; corrected to
+                # threads x PER_THREAD_WORKING_FACTOR.
+                decode_cache_mib = int(
+                    threads_per_rank
+                    * PER_THREAD_WORKING_FACTOR
+                    * sample_np.nbytes
+                    / 2**20
+                )
                 thread_pool_mib = threads_per_rank * max(1, inner_chunk_mib) * 2
                 _per_rank_total_bytes = _per_rank_steady_estimate_bytes(
                     sample_bytes=int(sample_np.nbytes),
@@ -1002,7 +1135,9 @@ def evaluate_combos(dataset_file,
                     f"{int(2 * sample_np.nbytes / 2**20)} MiB (during Bcast); "
                     f"per-rank steady ~= {steady_mib + ebcc_overhead_mib} MiB "
                     f"(sample + EBCC copy) + ~{decode_cache_mib} MiB "
-                    f"(decompressed cache) + ~{thread_pool_mib} MiB "
+                    f"({threads_per_rank} threads x "
+                    f"{PER_THREAD_WORKING_FACTOR:.1f}x decode/encode cache) "
+                    f"+ ~{thread_pool_mib} MiB "
                     f"(threads x 2 x inner_chunk_mib) = "
                     f"{humanize.naturalsize(_per_rank_total_bytes, binary=True)} total."
                 )

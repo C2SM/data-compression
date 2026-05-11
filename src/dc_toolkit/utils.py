@@ -12,7 +12,7 @@ import humanize
 import threading
 import asyncio
 from pathlib import Path
-from typing import Tuple, Optional
+from typing import Tuple, Optional, List
 
 import numpy as np
 import dask
@@ -58,6 +58,31 @@ class CombinationProducedNonFiniteError(Exception):
     reason wouldn't be recorded explicitly.
     """
     pass
+
+
+class SampleTooLargeError(Exception):
+    """
+    Raised by `build_representative_sample` when a field's irreducible
+    spatial footprint exceeds the requested size limit.
+
+    "Irreducible" means: after striding every available time-like and
+    vertical-like dim down to a single index, a single horizontal slab
+    of the field still exceeds the byte limit.  Subsampling horizontal
+    dims is not permitted because it changes the spatial structure
+    codecs exploit during compression scoring.
+
+    Callers should surface this with a clear remedy (raise the limit,
+    drop --threads-per-rank, or move to a larger node).  The exception
+    carries the irreducible byte count and the limit it failed for so
+    the caller can format a precise message.
+    """
+    def __init__(self, message, irreducible_bytes=None, size_limit_bytes=None,
+                 dims=None, spatial_dims=None):
+        super().__init__(message)
+        self.irreducible_bytes = irreducible_bytes
+        self.size_limit_bytes  = size_limit_bytes
+        self.dims              = dims
+        self.spatial_dims      = spatial_dims
 
 
 # =============================================================================
@@ -255,37 +280,116 @@ def _find_time_like_dim(da: xr.DataArray) -> Tuple[Optional[int], Optional[str]]
     return None, None
 
 
+def _is_vertical_like_coord(da: xr.DataArray, dim_name: str) -> bool:
+    """
+    Classify a dim as vertical (level/height/depth-like).
+
+    Order of evidence (most authoritative first), mirroring
+    `_is_time_like_coord`:
+      1. Coord's `axis` attr is 'Z' (CF standard for vertical).
+      2. Coord's `standard_name` matches a vertical-axis CF name
+         (height, altitude, depth, atmosphere_*_coordinate, ...).
+      3. Coord's `positive` attr is set ('up' or 'down') — CF vertical
+         marker that's allowed even without axis=Z.
+      4. Name fallback via `_is_vertical_like_dim` (the existing name
+         heuristic used by `_shrink_order`).
+    """
+    coord = da.coords.get(dim_name)
+    if coord is not None:
+        merged = {**dict(coord.attrs), **dict(coord.encoding)}
+        if merged.get('axis') == 'Z':
+            return True
+        sn = merged.get('standard_name')
+        if isinstance(sn, str) and sn.lower() in {
+            'height', 'altitude', 'depth', 'air_pressure', 'pressure',
+            'model_level_number', 'atmosphere_hybrid_sigma_pressure_coordinate',
+            'atmosphere_hybrid_height_coordinate',
+            'atmosphere_sigma_coordinate',
+            'atmosphere_ln_pressure_coordinate',
+            'atmosphere_sleve_coordinate',
+        }:
+            return True
+        if 'positive' in merged and str(merged['positive']).lower() in ('up', 'down'):
+            return True
+
+    return _is_vertical_like_dim(dim_name)
+
+
+def _classify_sample_dims(
+    da: xr.DataArray,
+) -> Tuple[List[Tuple[int, str]], List[Tuple[int, str]], List[Tuple[int, str]]]:
+    """
+    Classify every dim of `da` into one of:
+      - time-like (CF axis=T or time-units or name regex)
+      - vertical-like (CF axis=Z or vertical CF standard_name or name regex)
+      - spatial (everything else; preserved during sampling)
+
+    Returns (time_dims, vertical_dims, spatial_dims), each as a list of
+    (position-in-da.dims, name).  Time and vertical are STRIDE dims;
+    spatial dims are preserved whole so codec scoring sees the real
+    spatial structure of the field.
+
+    Note: the time check runs first.  If a coord is both T- and Z-like
+    (impossible under CF, but defensive), it's classified as time.
+    """
+    time_dims: List[Tuple[int, str]]     = []
+    vertical_dims: List[Tuple[int, str]] = []
+    spatial_dims: List[Tuple[int, str]]  = []
+    for i, name in enumerate(da.dims):
+        if _is_time_like_coord(da, name):
+            time_dims.append((i, name))
+        elif _is_vertical_like_coord(da, name):
+            vertical_dims.append((i, name))
+        else:
+            spatial_dims.append((i, name))
+    return time_dims, vertical_dims, spatial_dims
+
+
 def build_representative_sample(
     da: xr.DataArray,
     size_limit_bytes: int,
     rank: int = 0,
 ) -> xr.DataArray:
     """
-    Return a subset of `da` that fits within `size_limit_bytes`, built to be
-    representative of the full field.
+    Return a subset of `da` that fits STRICTLY within `size_limit_bytes`,
+    built to be representative of the full field.
 
     Strategy
     --------
     - If the whole field fits under the limit: return it unchanged.
-    - Otherwise: find the first time-like dim of `da` (using CF metadata
-      on the corresponding coord variable when available — `units`,
-      `standard_name`, `axis`, `calendar` — and falling back to a name
-      regex when CF metadata is absent), and stride-sample along it.
-      Non-time dims are kept full so codecs can still exploit spatial
-      smoothness; striding along time samples across the temporal axis
-      instead of taking a corner.  See `_is_time_like_coord` for the
-      detection rules.
-    - If NO time-like dim is present (e.g. CF coordinate-bounds arrays
-      like `clat_bnds`, or SCRIP remapping artifacts like
-      `src_grid_area`), there is no axis the sweep can meaningfully
-      stride over.  We return the whole field with a warning rather
-      than silently striding along the wrong axis (the pre-patch
-      behaviour, which produced a biased sample for these vars).  In
-      practice the variables that hit this branch are small bookkeeping
-      arrays where the size cap was never going to bite; if a large
-      variable lacks a time axis, the warning makes the case visible.
-    - A deterministic `np.linspace`-style stride is used so results are
-      reproducible between `evaluate_combos` and `compress_with_optimal`.
+    - Otherwise: classify dims into time / vertical / spatial.  Spatial
+      dims (horizontal grid: lat, lon, cell, ncells, x, y, ...) are
+      preserved whole so codecs still see the real spatial structure
+      they exploit during scoring.  Time and vertical dims are
+      stride-sampled.
+    - Reduction across multiple stride dims is distributed in log-space
+      so each dim contributes proportional variety.  Small stride dims
+      that don't need full reduction clamp early and free budget for
+      the larger ones.
+    - Within each strided dim, evenly-spaced indices are picked via
+      `np.linspace`, mirroring the single-dim behaviour:
+      deterministic, edge-inclusive, reproducible across
+      `evaluate_combos` and `compress_with_optimal`.
+    - If a field's irreducible spatial footprint (1 element along every
+      stride dim) exceeds the limit, this raises `SampleTooLargeError`
+      rather than silently violating the budget.  Pre-patch the
+      function used `max(1, …)` and accepted the budget violation; that
+      under-budgeted memory model is what caused the production OOMs
+      on R02B10 out_15 (300 GiB fields, single time slice = 37.5 GiB
+      against a 5 GB budget).
+
+    Memory contract
+    ---------------
+    The caller is entitled to assume `sampled.nbytes <= size_limit_bytes`
+    on successful return.  This is the foundation of the per-rank steady
+    estimate in `cli._per_rank_steady_estimate_bytes` and the cgroup
+    headroom check.
+
+    Errors
+    ------
+    SampleTooLargeError: irreducible spatial footprint > size_limit_bytes.
+      Carries `irreducible_bytes`, `size_limit_bytes`, `dims`,
+      `spatial_dims` for caller-side message formatting.
     """
     nbytes = int(da.dtype.itemsize) * int(np.prod(da.shape))
     if nbytes <= size_limit_bytes:
@@ -298,68 +402,106 @@ def build_representative_sample(
             )
         return da
 
-    # Locate the time-like dim using CF metadata (units, standard_name,
-    # axis, calendar) on the coord variable, with a name-regex fallback.
-    # This handles three cases consistently: time at dims[0] (the common
-    # case), time at a non-leading position, and no time axis at all.
-    time_idx, time_dim = _find_time_like_dim(da)
+    time_dims, vertical_dims, spatial_dims = _classify_sample_dims(da)
+    # Stride priority: time first (captures temporal variation, the most
+    # informative axis for codec scoring across forecast steps), then vertical.
+    stride_dims: List[Tuple[int, str]] = list(time_dims) + list(vertical_dims)
 
-    if time_dim is None:
-        # No axis we can stride over.  Return the field whole and warn.
-        # The variables that hit this branch in well-formed climate data
-        # are CF bounds and SCRIP remap arrays - small enough that
-        # returning them whole is safe.  A LARGE variable without a
-        # time axis would deserve human review; the warning surfaces it.
+    if not stride_dims:
+        # Nothing safe to thin — return whole field with a warning.  In
+        # practice the variables that hit this branch are small bookkeeping
+        # arrays (CF coord-bounds, SCRIP remap weights) where being a few
+        # GiB over isn't a problem.  A LARGE variable without any time or
+        # vertical axis would deserve human review; surface that via the
+        # warning so it doesn't pass silently.
         if rank == 0:
             click.echo(
                 f"[sample] WARNING: variable '{da.name}' has dims {da.dims} "
-                f"with no time-like axis; cannot stride-sample.  Returning "
-                f"the full field "
+                f"with no time-like or vertical axis; cannot stride-sample.  "
+                f"Returning the full field "
                 f"({humanize.naturalsize(nbytes, binary=True)}), which "
                 f"exceeds the "
-                f"{humanize.naturalsize(size_limit_bytes, binary=True)} "
-                f"cap.  This is normal for small bookkeeping arrays "
-                f"(coord bounds, remap weights); investigate if the "
+                f"{humanize.naturalsize(size_limit_bytes, binary=True)} cap.  "
+                f"Normal for small bookkeeping arrays; investigate if the "
                 f"variable is large and downstream OOMs."
             )
         return da
 
-    leading_size = da.sizes[time_dim]
+    # Irreducible footprint = bytes at 1 index along every stride dim.
+    spatial_sizes = [da.sizes[d] for _, d in spatial_dims]
+    irreducible_bytes = int(da.dtype.itemsize) * int(
+        np.prod(spatial_sizes) if spatial_sizes else 1
+    )
 
-    # Per-slice byte cost = product of the OTHER dims' sizes * itemsize.
-    # Pre-patch this was hardcoded as `da.shape[1:]`, which assumed
-    # dims[0] was the axis being subset.  Now we exclude whichever
-    # position the time-like axis sits at, so e.g. (height, time, lat,
-    # lon) computes trailing across (height, lat, lon) and strides
-    # along time at position 1.
-    trailing_shape = tuple(s for i, s in enumerate(da.shape) if i != time_idx)
-    trailing_bytes = int(da.dtype.itemsize) * int(np.prod(trailing_shape))
-    if trailing_bytes == 0:
-        return da  # degenerate; nothing to sample
+    if irreducible_bytes > size_limit_bytes:
+        spatial_names = [d for _, d in spatial_dims]
+        msg = (
+            f"variable '{da.name}' has irreducible spatial footprint "
+            f"{humanize.naturalsize(irreducible_bytes, binary=True)} "
+            f"(spatial dims {spatial_names}) which exceeds the "
+            f"{humanize.naturalsize(size_limit_bytes, binary=True)} budget.  "
+            f"Spatial dims must be preserved for codec representativeness.  "
+            f"Remedies (any one):\n"
+            f"  - raise --eval-data-size-limit (memory permitting)\n"
+            f"  - reduce --threads-per-rank to free memory for a larger sample\n"
+            f"  - request more RAM (#SBATCH --mem=0) or a larger node"
+        )
+        if rank == 0:
+            click.echo(f"[sample] FATAL: {msg}")
+        raise SampleTooLargeError(
+            msg,
+            irreducible_bytes=irreducible_bytes,
+            size_limit_bytes=int(size_limit_bytes),
+            dims=tuple(da.dims),
+            spatial_dims=tuple(spatial_names),
+        )
 
-    max_slices = max(1, size_limit_bytes // trailing_bytes)
-    max_slices = int(min(max_slices, leading_size))
+    # Distribute reduction across stride dims via greedy log-space
+    # distribution.  Sort by size ascending so dims that don't need
+    # full reduction clamp early and pass their freed budget upward.
+    max_product = float(size_limit_bytes) / float(irreducible_bytes)
+    stride_info = [(i, name, int(da.sizes[name])) for i, name in stride_dims]
+    by_size_asc = sorted(stride_info, key=lambda t: t[2])
 
-    # Evenly-spaced indices spanning [0, leading_size-1].  Deterministic
-    # so evaluate_combos and compress_with_optimal reproduce the same
-    # sample given the same size_limit_bytes.
-    indices = np.linspace(0, leading_size - 1, num=max_slices, dtype=int)
-    indices = np.unique(indices).tolist()
+    plan: dict = {}  # dim_name -> n_keep
+    remaining_budget = max_product
+    remaining_dims = len(stride_info)
+    for _, name, size in by_size_asc:
+        if remaining_dims > 0:
+            target = remaining_budget ** (1.0 / remaining_dims)
+        else:
+            target = 1.0
+        n_keep = max(1, min(size, int(target)))
+        plan[name] = n_keep
+        remaining_budget = remaining_budget / max(1, n_keep)
+        remaining_dims -= 1
 
-    sampled = da.isel({time_dim: indices})
+    # Build isel dict; only set indices for dims we actually thinned.
+    indices_isel: dict = {}
+    for _, name, size in stride_info:
+        n_keep = plan[name]
+        if n_keep < size:
+            idx = np.linspace(0, size - 1, num=n_keep, dtype=int)
+            indices_isel[name] = np.unique(idx).tolist()
+
+    sampled = da.isel(indices_isel) if indices_isel else da
 
     if rank == 0:
-        position_note = (
-            "" if time_idx == 0
-            else f" (at dim position {time_idx}, not leading)"
+        # Compact plan summary, in original dim order:
+        plan_parts = []
+        for _, name in stride_dims:
+            plan_parts.append(f"{name}={plan[name]}/{da.sizes[name]}")
+        spatial_part = (
+            f" | preserved spatial: {', '.join(d for _, d in spatial_dims)}"
+            if spatial_dims else ""
         )
         click.echo(
             f"[sample] field is "
             f"{humanize.naturalsize(nbytes, binary=True)} > limit "
             f"{humanize.naturalsize(size_limit_bytes, binary=True)}; "
-            f"sampled {len(indices)}/{leading_size} along "
-            f"'{time_dim}'{position_note} "
-            f"-> {humanize.naturalsize(sampled.nbytes, binary=True)}."
+            f"strided {', '.join(plan_parts)}"
+            f"{spatial_part} -> "
+            f"{humanize.naturalsize(int(sampled.nbytes), binary=True)}."
         )
 
     return sampled
