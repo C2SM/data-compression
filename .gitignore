@@ -15,3 +15,6 @@ out-*
 *manifest*.json
 sample*.json
 res_folder_dyamond_*/
+dyamond_inventory_*/
+sweep_batches*/
+VAST_analysis/
