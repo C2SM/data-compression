@@ -789,27 +789,27 @@ def compute_chunks(data, min_height=0, max_height=None, min_width=0, max_width=N
 # =============================================================================
 
 # ---- Compressor parameter grids (bytes -> bytes, data-independent) ----------
-_BLOSC_CNAMES      = ("lz4", "lz4hc", "zstd", "blosclz")
+_BLOSC_CNAMES      = ("lz4", "lz4hc", "zstd")               # dropped blosclz
 _BLOSC_CLEVELS     = (1, 5, 9)
-_BLOSC_SHUFFLES    = (0, 1, 2)             # 0=none, 1=byte, 2=bit; dropped -1=auto
+_BLOSC_SHUFFLES    = (0, 1)                                 # dropped shuffle=2 bit
 _LZ4_ACCELERATIONS = (1, 10, 100)
-_ZSTD_LEVELS       = (1, 6, 12, 22)        # dropped 0 (= library default == 3)
-_ZLIB_LEVELS       = (1, 3, 6, 9)
-_BZ2_LEVELS        = (1, 3, 6, 9)
-_LZMA_PRESETS      = (1, 3, 6, 9)
+_ZSTD_LEVELS       = (6, 12, 22)                            # dropped 1
+_ZLIB_LEVELS       = (3, 6, 9)                              # dropped 1
+_BZ2_LEVELS        = (3, 6, 9)                              # dropped 1
+_LZMA_PRESETS      = (3, 6, 9)                              # dropped 1
 
 # ---- Filter parameter grids (array -> array) --------------------------------
 # The top value in each tuple is effectively lossless
 # and acts as the upper-bound reference point.
-_BITROUND_KEEPBITS_F32 = (3, 5, 7, 9, 11, 13, 15, 17, 23)                  # 23 -> lossless
-_BITROUND_KEEPBITS_F64 = (3, 5, 7, 9, 11, 13, 17, 23, 30, 37, 44, 52)      # 52 -> lossless
-_QUANTIZE_DIGITS_F32   = (1, 2, 3, 4, 5, 6, 7)                             # 7  -> ~lossless
-_QUANTIZE_DIGITS_F64   = (1, 2, 3, 4, 5, 6, 7, 9, 11, 13, 15)              # 15 -> ~lossless
+_BITROUND_KEEPBITS_F32 = (3, 7, 11, 13, 17, 23)             # dropped 5, 9, 15; 23 -> lossless
+_BITROUND_KEEPBITS_F64 = (3, 7, 11, 17, 23, 30, 37, 44, 52) # dropped 5, 9, 13 (mirroring f32 logic); 52 -> lossless
+_QUANTIZE_DIGITS_F32   = (1, 3, 4, 5, 6, 7)                 # dropped 2 (adjacent-redundant); 7 -> ~lossless
+_QUANTIZE_DIGITS_F64   = (1, 3, 4, 5, 6, 7, 9, 11, 13, 15)  # dropped 2 (adjacent-redundant); 15 -> ~lossless
 _ASINH_QUANTILE        = 0.01
 
 # ---- Serializer parameter grids (array -> bytes) ----------------------------
-_PCODEC_LEVELS         = (4, 6, 8, 10, 12)   # dropped 0 ("no compression")
-_PCODEC_DELTA_ORDERS   = (0, 3, 7)
+_PCODEC_LEVELS         = (6, 8, 10, 12)      # dropped 4; dropped 0 ("no compression")
+_PCODEC_DELTA_ORDERS   = (0, 7)              # dropped 3 (middle); endpoints cover delta-mode space
 _ZFPY_K_GRID           = (0, 1, 2, 3)        # k -> compute_fixed_*_param(k);
                                              # fixed-rate / fixed-precision: 8/16/32/64 bits
                                              # fixed-accuracy:               0.5/0.25/0.0625/0.0039
