@@ -74,8 +74,8 @@ def find_file(base_path, file_name):
 
 
 @st.cache_data
-def load_scored_results(file_name: str, params_str: list[str]):
-    return np.load("./out/" + file_name + params_str + "_scored_results_with_names.npy", allow_pickle=True)
+def load_scored_results(file_name: str, params_str: str):
+    return np.load(os.path.join("out", file_name + params_str + "_scored_results_with_names.npy"), allow_pickle=True)
 
 
 @st.cache_resource
