@@ -35,8 +35,8 @@ from plotly.subplots import make_subplots
 from dc_toolkit import utils
 import zipfile
 
-def load_scored_results(file_name: str, params_str: list[str]):
-    return np.load("./out/" + file_name + params_str + "_scored_results_with_names.npy", allow_pickle=True)
+def load_scored_results(file_name: str, params_str: str):
+    return np.load(os.path.join("out", file_name + params_str + "_scored_results_with_names.npy"), allow_pickle=True)
 
 def create_cluster_plots(clean_arr_l1, clean_arr_l2, clean_arr_linf, n_clusters):
     config_idxs = pd.read_csv("config_space.csv")
