@@ -41,10 +41,10 @@ once the above is complete (just for Santis, locally it is not needed):
 ```commandline
 git clone git@github.com:C2SM/data-compression.git dc_toolkit
 cd dc_toolkit
+rm -rf venv
 python -m venv venv
 source venv/bin/activate
 bash install_dc_toolkit.sh
-source venv/bin/activate
 ```
 
 ## Usage
