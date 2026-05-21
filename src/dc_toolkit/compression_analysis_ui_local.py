@@ -555,7 +555,7 @@ class CompressionAnalysisUI(QMainWindow):
                 output_file = os.path.join(temp_dir, generated_files[0])
 
                 split_tmp_name = os.path.basename(output_file).split(".=.", 1)
-                compressed_file_name = f"{self.file_name}.=.{split_tmp_name[1]}"
+                compressed_file_name = f"{self.file_name}.=.{split_tmp_name[0]}"
                 self.log.append(f"Generated file: {compressed_file_name}")
 
                 save_path, _ = QFileDialog.getSaveFileName(
