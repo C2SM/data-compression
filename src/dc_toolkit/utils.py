@@ -1768,7 +1768,7 @@ def get_indexes(arr, indices):
                 fetch_new_idx = [value for key, value in codec_id_dict.items() if "EBCC" in key][0]
                 id_ls.append(fetch_new_idx)
             else:
-                return IndexError(f"{item} not in list {list(codec_id_dict.keys())}")
+                id_ls.append(-1)  # unknown item — append -1 instead of returning an exception object
     return np.asarray(id_ls)
 
 

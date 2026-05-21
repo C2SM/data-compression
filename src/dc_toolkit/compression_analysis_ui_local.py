@@ -441,7 +441,7 @@ class CompressionAnalysisUI(QMainWindow):
             cmd = [
                 "mpirun",
                 "-n",
-                "8",
+                "1",
                 "dc_toolkit",
                 "evaluate_combos",
                 self.modified_file_path,

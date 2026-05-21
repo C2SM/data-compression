@@ -471,9 +471,6 @@ if uploaded_file is not None and uploaded_file.name.endswith(".nc"):
         else:
             temp_dir = os.path.dirname(path_to_modified_file)
             cmd_compress = [
-                "mpirun",
-                "-n",
-                "8",
                 "dc_toolkit",
                 "compress_with_optimal",
                 path_to_modified_file,
