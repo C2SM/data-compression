@@ -14,6 +14,7 @@ subprocess.check_call([
 
 import sys
 import os
+import shutil
 import subprocess
 import tempfile
 
@@ -566,9 +567,19 @@ class CompressionAnalysisUI(QMainWindow):
                 )
 
                 with zipfile.ZipFile(save_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
-                    zipf.write(output_file, arcname=os.path.basename(output_file))
+                    if os.path.isdir(output_file):
+                        for root, _, files in os.walk(output_file):
+                            for file in files:
+                                file_path = os.path.join(root, file)
+                                arcname = os.path.relpath(file_path, temp_dir)
+                                zipf.write(file_path, arcname=arcname)
+                    else:
+                        zipf.write(output_file, arcname=os.path.basename(output_file))
                 self.log.append(f"zip file saved to: {save_path}")
-                os.remove(output_file)
+                if os.path.isdir(output_file):
+                    shutil.rmtree(output_file)
+                else:
+                    os.remove(output_file)
 
             except subprocess.CalledProcessError as e:
                 self.log.append(f"Compression failed:\n{e.stderr}")
