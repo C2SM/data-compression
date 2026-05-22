@@ -487,17 +487,25 @@ if uploaded_file is not None and uploaded_file.name.endswith(".nc"):
             status.empty()
             st.success(f"Compression completed successfully.")
 
-            split_tmp_name = os.path.basename(path_to_modified_file).split(".=.", 1)
-            compressed_file_name = f"{uploaded_file.name}.=.{split_tmp_name[0]}"
-            shutil.copy(path_to_modified_file, os.getcwd())
-            output_file_path = os.path.basename(path_to_modified_file)
-
-            with open(output_file_path, "rb") as data_file:
-                st.download_button(
-                    label="Download compressed file locally",
-                    data=data_file,
-                    file_name=compressed_file_name,
-                )
-            os.remove(output_file_path)
+            after = set(os.listdir(temp_dir))
+            generated_files = list(after - before)
+            if generated_files:
+                output_file_path = os.path.join(temp_dir, generated_files[0])
+                split_tmp_name = os.path.basename(output_file_path).split(".=.", 1)
+                compressed_file_name = f"{uploaded_file.name}.=.{split_tmp_name[0]}.zip"
+                archive_path = shutil.make_archive(output_file_path, "zip", temp_dir, generated_files[0])
+                with open(archive_path, "rb") as data_file:
+                    st.download_button(
+                        label="Download compressed file locally",
+                        data=data_file,
+                        file_name=compressed_file_name,
+                    )
+                os.remove(archive_path)
+                if os.path.isdir(output_file_path):
+                    shutil.rmtree(output_file_path)
+                elif os.path.exists(output_file_path):
+                    os.remove(output_file_path)
+            else:
+                st.error("Compression did not produce a downloadable output.")
             if os.path.exists(path_to_modified_file):
                 os.remove(path_to_modified_file)
