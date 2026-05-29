@@ -681,6 +681,14 @@ def _evaluate_gates(
               help="Max relative L1 error of the finite-difference field "
                    "(spatial axes) when --gradient-gate is on. Absolute "
                    "fraction, NOT a multiple of L1 (derivatives amplify error).")
+@click.option("--gradient-shortcircuit/--no-gradient-shortcircuit", default=True,
+              show_default=True,
+              help="When --gradient-gate is on, only compute the (expensive, "
+                   "re-decoding) gradient metric for combos that already pass "
+                   "the cheap gates (L1/L2/Linf/bias).  Semantically identical "
+                   "kept set; makes the gradient gate nearly free.  Use "
+                   "--no-gradient-shortcircuit to force the gradient on every "
+                   "combo (validation/debug only).")
 @click.option("--compressor-class", default="all",
               help="Compressor class (case-insensitive) or 'none' to skip.")
 @click.option("--filter-class", default="all",
@@ -739,6 +747,7 @@ def evaluate_combos(dataset_file,
                     l2_gate, linf_gate, bias_gate, extremes_sensitive,
                     phys_min, phys_max,
                     gradient_gate, gradient_threshold,
+                    gradient_shortcircuit,
                     compressor_class, filter_class, serializer_class,
                     with_lossy, sampling_policy, vertical_floor,
                     resume, max_evals, allow_multi_rank_per_node,
@@ -868,6 +877,8 @@ def evaluate_combos(dataset_file,
                 f"q99={_fmt(eff_thr['q99'])} | "
                 f"bounds=[{phys_min}, {phys_max}] | "
                 f"gradient={'on@'+format(gradient_threshold,'.3e') if gradient_gate else 'off'}"
+                + (f" (shortcircuit={'on' if gradient_shortcircuit else 'OFF'})"
+                   if gradient_gate else "")
             )
 
         # -------------------------------------------------------------------------
@@ -1249,6 +1260,11 @@ def evaluate_combos(dataset_file,
                 # (axes wouldn't line up).
                 _do_gradient = bool(gradient_gate) and (data_np is sample_np)
                 _grad_axes = grad_axes if _do_gradient else None
+                # Short-circuit: hand the cheap-gate thresholds to the pipeline
+                # so the gradient (a second decode) is computed only for combos
+                # that already pass L1/L2/Linf/bias.  None -> force gradient on
+                # every combo (the --no-gradient-shortcircuit debug path).
+                _precheck = eff_thr if (_do_gradient and gradient_shortcircuit) else None
 
                 ratio, errors, eucd = utils.evaluate_codec_pipeline(
                     data_np, dims,
@@ -1257,6 +1273,7 @@ def evaluate_combos(dataset_file,
                     q99_abs=q99_abs,
                     compute_gradient=_do_gradient,
                     gradient_axes=_grad_axes,
+                    precheck_thresholds=_precheck,
                 )
 
                 return {

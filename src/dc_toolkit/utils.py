@@ -1280,6 +1280,7 @@ def evaluate_codec_pipeline(
     q99_abs: float | None = None,
     compute_gradient: bool = False,
     gradient_axes=None,
+    precheck_thresholds: dict | None = None,
 ):
     """
     Measure (compression_ratio, errors, euclidean_distance) for a codec
@@ -1421,7 +1422,32 @@ def evaluate_codec_pipeline(
     # op; done one axis at a time with intermediates freed between axes to
     # bound the transient.  NaN-masked: only positions finite in both the
     # original and decoded difference fields contribute.
-    if compute_gradient:
+    #
+    # SHORT-CIRCUIT: the gradient re-decodes the sample (a second full
+    # pipeline) and is by far the most expensive part of an evaluation.  A
+    # combo that already fails any cheap gate (L1/L2/Linf/bias) can never be
+    # kept, so its gradient value is irrelevant.  When `precheck_thresholds`
+    # is supplied, skip the gradient for such combos: Grad_Rel stays None
+    # (pass_grad becomes a no-op in _evaluate_gates) and the combo is rejected
+    # by the failing cheap gate anyway.  This is SEMANTICALLY IDENTICAL to
+    # computing the gradient for every combo — the kept set and the winner are
+    # unchanged — but makes --gradient-gate nearly free.  Pass None to force
+    # the gradient on every combo (the validation/debug path).
+    do_grad = compute_gradient
+    if compute_gradient and precheck_thresholds is not None:
+        def _passes(val, lim):
+            # Mirrors _evaluate_gates._le: a None/+inf limit is a no-op pass.
+            if val is None or lim is None or not math.isfinite(lim):
+                return True
+            return float(val) <= float(lim)
+        do_grad = (
+            _passes(errors["Relative_Error_L1"],   precheck_thresholds.get("l1"))
+            and _passes(errors["Relative_Error_L2"],   precheck_thresholds.get("l2"))
+            and _passes(errors["Relative_Error_Linf"], precheck_thresholds.get("linf"))
+            and _passes(errors["Bias_Rel"],            precheck_thresholds.get("bias"))
+        )
+
+    if do_grad:
         if _AsyncBypass.enabled:
             # decomp_full was deleted above to free memory; recompute it.
             loop = _get_thread_event_loop()
