@@ -25,7 +25,6 @@ import numcodecs.zarr3
 import xarray as xr
 from dc_toolkit import utils
 from zarr_any_numcodecs import AnyNumcodecsArrayBytesCodec
-from ebcc.zarr_filter import EBCCZarrFilter
 import pandas as pd
 import numpy as np
 from mpi4py import MPI
@@ -82,13 +81,6 @@ def _size_option_callback(ctx, param, value):
         return utils.parse_size(value)
     except Exception as e:
         raise click.BadParameter(f"Invalid size '{value}': {e}")
-
-
-def _is_ebcc_serializer(serializer) -> bool:
-    return (
-        isinstance(serializer, AnyNumcodecsArrayBytesCodec)
-        and isinstance(serializer.codec, EBCCZarrFilter)
-    )
 
 
 def _is_zfpy_serializer(serializer) -> bool:
@@ -177,7 +169,6 @@ def _per_rank_steady_estimate_bytes(
     sample_bytes: int,
     threads_per_rank: int,
     inner_chunk_mib: int,
-    include_ebcc_overhead: bool = False,
 ) -> int:
     """
     Steady-state memory footprint of one MPI rank during the codec sweep.
@@ -205,11 +196,6 @@ def _per_rank_steady_estimate_bytes(
       threads * 2 * chunk_mib               : ThreadPoolExecutor float64
                                               promotion in the metrics
                                               loop; per-thread.
-      sample_bytes (EBCC)                   : optional float32 working
-                                              copy of the sample when
-                                              EBCC is in the search space
-                                              and the source dtype isn't
-                                              already float32.
 
     This is the SAME formula `_max_sample_bytes_for_threads` inverts;
     centralised here so the early-abort check, the user-facing banner,
@@ -220,8 +206,7 @@ def _per_rank_steady_estimate_bytes(
         threads * sample_bytes * PER_THREAD_WORKING_FACTOR
     )
     thread_chunk = threads * 2 * max(1, int(inner_chunk_mib)) * (2 ** 20)
-    ebcc         = sample_bytes if include_ebcc_overhead else 0
-    return sample_bytes + decode_cache + thread_chunk + ebcc
+    return sample_bytes + decode_cache + thread_chunk
 
 
 # Per-thread working-memory multiplier (decoded buffer + encoded
@@ -241,7 +226,6 @@ def _max_sample_bytes_for_threads(
     budget_bytes: int,
     threads_per_rank: int,
     inner_chunk_mib: int,
-    include_ebcc_overhead: bool = False,
 ) -> int:
     """
     Inverse of `_per_rank_steady_estimate_bytes`: what's the largest
@@ -252,10 +236,9 @@ def _max_sample_bytes_for_threads(
       sample
       + threads * PER_THREAD_WORKING_FACTOR * sample
       + threads * 2 * chunk_mib * MiB
-      + (sample if EBCC else 0)
       <= budget
 
-    => sample * (1 + threads * factor + (1 if ebcc else 0))
+    => sample * (1 + threads * factor)
                 + threads * 2 * chunk_mib * MiB
        <= budget
 
@@ -268,7 +251,6 @@ def _max_sample_bytes_for_threads(
     coeff = (
         1.0
         + threads * PER_THREAD_WORKING_FACTOR
-        + (1.0 if include_ebcc_overhead else 0.0)
     )
     thread_chunk = threads * 2 * max(1, int(inner_chunk_mib)) * (2 ** 20)
     available_for_sample = budget_bytes - thread_chunk
@@ -456,8 +438,8 @@ def _sample_signature(
 
     Purpose: the codec-space indices written by `evaluate_combos` are only
     valid in `compress_with_optimal` when both commands see an *identical*
-    sample - because statistics (Asinh.linear_width, FixedOffsetScale.offset/
-    scale, EBCC chunk geometry) are derived from that sample.  We hash enough
+    sample - because some codec parameters (e.g. dtype-dependent BitRound /
+    Quantize grids) are derived from that sample.  We hash enough
     of the sample's identity to detect a mismatch at the start of
     `compress_with_optimal` and refuse to continue silently.
 
@@ -508,87 +490,100 @@ def _signature_path(where_to_write: str, var: str) -> Path:
 
 
 # =============================================================================
-# L1 error threshold lookup
+# Error threshold policy
 # =============================================================================
-# Source of truth: a Google Sheet ("Short Name", "Unit", "Existing L1 error").
-# Mirrored to a CSV next to this module for offline / CI fallback.
+# The per-variable threshold table (formerly a Google Sheet mirrored to a
+# bundled CSV) has been removed: in practice every production run overrode it,
+# the bundled ECMWF GRIB short-names never matched the ICON variable names, and
+# its "Existing L1 error" column was a GRIB-packing baseline in ABSOLUTE units
+# being compared against a RELATIVE error — a latent unit hazard.
+#
+# Thresholds are now supplied explicitly on the command line as RELATIVE
+# (dimensionless) errors via --l1-threshold (required) and the optional
+# --l2-threshold / --linf-threshold / --bias-threshold / --q99-threshold.
+# Omitted gates auto-derive from L1 (see _derive_thresholds below).
+#
+# Re-entry seam: to reintroduce an authoritative table later, add a loader
+# here that returns a {var: {"l1": ..., "l2": ..., ...}} mapping and consult it
+# before falling back to the CLI values in evaluate_combos.
 
-_L1_THRESHOLDS_SHEET_ID = "1lHcX-HE2WpVCOeKyDvM4iFqjlWvkd14lJlA-CUoCxMM"
-_L1_THRESHOLDS_SHEET_URL = (
-    f"https://docs.google.com/spreadsheets/d/{_L1_THRESHOLDS_SHEET_ID}/export?format=csv"
-)
-_LOCAL_L1_THRESHOLDS_PATH = (
-    Path(__file__).parent / "data" / "l1_error_thresholds.csv"
-)
+# Default multipliers applied to the (relative) L1 threshold when the
+# corresponding gate threshold is not given explicitly.  Documented heuristics,
+# not theorems — see the gate help text and the design discussion.
+_L2_MULT_DEFAULT   = 2.0    # RMS may run ~2x the mean-abs budget (heavy tails)
+_LINF_MULT_DEFAULT = 10.0   # single-cell trip-wire; well-behaved codecs ~2-8x
+_BIAS_MULT_DEFAULT = 0.5    # at most half the budget may be one-directional
+_Q99_MULT_DEFAULT  = 5.0    # extreme-tail error allowance vs the L1 budget
 
 
-def _load_l1_error_thresholds(rank: int) -> "pd.DataFrame | None":
+def _derive_thresholds(
+    l1, l2, linf, bias, q99,
+    l2_gate, linf_gate, bias_gate, extremes_sensitive,
+):
     """
-    Load the L1 error threshold table.
+    Resolve the effective gate thresholds from the L1 anchor.
 
-    Resolution order:
-      1. Remote Google Sheet (authoritative).  On success the result is
-         mirrored to `_LOCAL_L1_THRESHOLDS_PATH` so the next offline run
-         has an up-to-date snapshot.
-      2. Local CSV at `_LOCAL_L1_THRESHOLDS_PATH` (committed to the repo).
-         Used only when the remote fetch raises - typically: no network,
-         the sheet was renamed/permissioned, or the CSV export endpoint
-         is briefly down.
-
-    Returns the DataFrame on success, or `None` if neither source yields
-    one.  The caller is responsible for aborting with a useful message in
-    that case.
-
-    Only the calling rank reads/writes; the resulting DataFrame is
-    broadcast by the caller (we do not enter MPI here so the helper stays
-    usable from non-MPI contexts as well).
-
-    The local cache write is best-effort: if the package directory is
-    read-only (e.g. installed into a system site-packages, sandboxed CI),
-    we log a note and still return the in-memory DataFrame.  The remote
-    payload is the same data, so a failed cache is not a fatal condition.
+    Any explicitly-provided value wins; otherwise the gate auto-derives as a
+    multiple of L1.  Disabled gates resolve to +inf so the comparison is a
+    no-op (and the value still records cleanly in the manifest).  Returns a
+    plain dict of floats, JSON-safe for the manifest.
     """
-    # ---- 1) Try remote --------------------------------------------------
-    try:
-        thresholds = pd.read_csv(_L1_THRESHOLDS_SHEET_URL)
-    except Exception as remote_err:
-        click.echo(
-            f"[Rank {rank}] Remote L1 threshold fetch failed: {remote_err}.  "
-            f"Trying local fallback at {_LOCAL_L1_THRESHOLDS_PATH}."
-        )
-    else:
-        # Refresh the on-disk fallback.  Best-effort - see docstring.
-        try:
-            _LOCAL_L1_THRESHOLDS_PATH.parent.mkdir(parents=True, exist_ok=True)
-            thresholds.to_csv(_LOCAL_L1_THRESHOLDS_PATH, index=False)
-        except Exception as cache_err:
-            click.echo(
-                f"[Rank {rank}] Note: could not refresh local L1 threshold "
-                f"cache at {_LOCAL_L1_THRESHOLDS_PATH} ({cache_err}); "
-                f"continuing with the remote copy."
-            )
-        return thresholds
+    eff = {
+        "l1":   float(l1),
+        "l2":   (float(l2)   if l2   is not None else _L2_MULT_DEFAULT   * l1) if l2_gate   else math.inf,
+        "linf": (float(linf) if linf is not None else _LINF_MULT_DEFAULT * l1) if linf_gate else math.inf,
+        "bias": (float(bias) if bias is not None else _BIAS_MULT_DEFAULT * l1) if bias_gate else math.inf,
+        "q99":  (float(q99)  if q99  is not None else _Q99_MULT_DEFAULT  * l1) if extremes_sensitive else math.inf,
+    }
+    return eff
 
-    # ---- 2) Try local fallback -----------------------------------------
-    if _LOCAL_L1_THRESHOLDS_PATH.is_file():
-        try:
-            thresholds = pd.read_csv(_LOCAL_L1_THRESHOLDS_PATH)
-            click.echo(
-                f"[Rank {rank}] Loaded L1 thresholds from local fallback "
-                f"({_LOCAL_L1_THRESHOLDS_PATH})."
-            )
-            return thresholds
-        except Exception as local_err:
-            click.echo(
-                f"[Rank {rank}] Local L1 threshold fallback at "
-                f"{_LOCAL_L1_THRESHOLDS_PATH} is unreadable: {local_err}."
-            )
+
+def _evaluate_gates(
+    *, l1_rel, l2_rel, linf_rel, bias_rel, q99_rel, grad_rel,
+    decoded_min, decoded_max, n_corrupt,
+    thr, grad_threshold, grad_gate, phys_min, phys_max,
+):
+    """
+    Apply every gate and return (keep, reasons) where `reasons` is a dict of
+    per-gate booleans (True = passed).  A gate whose input is None/inf is
+    treated as not-applicable and passes.  `keep` is the AND of all gates.
+
+    Shared by the sweep (per-combo) and the verify gate (post-production), so
+    the production check uses exactly the same logic as the sweep.
+    """
+    def _le(val, lim):
+        # None input or +inf limit -> gate not applicable -> pass.
+        if val is None or lim is None or not math.isfinite(lim):
+            return True
+        return float(val) <= float(lim)
+
+    reasons = {
+        "pass_l1":   _le(l1_rel,   thr.get("l1")),
+        "pass_l2":   _le(l2_rel,   thr.get("l2")),
+        "pass_linf": _le(linf_rel, thr.get("linf")),
+        "pass_bias": _le(bias_rel, thr.get("bias")),
+        "pass_q99":  _le(q99_rel,  thr.get("q99")),
+        # Layer 6: any valid-input/broken-output cell is a hard reject.
+        "pass_finite": (int(n_corrupt or 0) == 0),
+    }
+
+    # Physical bounds (Layer 6).  Only checked when a bound is supplied and
+    # the decoded range is known/finite.
+    pass_bounds = True
+    if phys_min is not None and decoded_min is not None and math.isfinite(decoded_min):
+        pass_bounds = pass_bounds and (decoded_min >= phys_min)
+    if phys_max is not None and decoded_max is not None and math.isfinite(decoded_max):
+        pass_bounds = pass_bounds and (decoded_max <= phys_max)
+    reasons["pass_bounds"] = bool(pass_bounds)
+
+    # Gradient (spatial-structure), opt-in.
+    if grad_gate:
+        reasons["pass_grad"] = _le(grad_rel, grad_threshold)
     else:
-        click.echo(
-            f"[Rank {rank}] No local L1 threshold fallback found at "
-            f"{_LOCAL_L1_THRESHOLDS_PATH}."
-        )
-    return None
+        reasons["pass_grad"] = True
+
+    keep = all(reasons.values())
+    return keep, reasons
 
 
 @cli.command("evaluate_combos")
@@ -634,9 +629,58 @@ def _load_l1_error_thresholds(rank: int) -> "pd.DataFrame | None":
               help="Fraction of available RAM any single tracked allocation "
                    "may occupy before the run aborts.  Values above 0.80 "
                    "emit a one-time warning.")
-@click.option("--override-existing-l1-error", type=float, default=None,
-              help="L1 error threshold fallback when the variable isn't in "
-                   "the lookup table.  Table values win when present.")
+@click.option("--l1-threshold", type=float, required=True,
+              help="REQUIRED. Relative (dimensionless) L1 error budget, e.g. "
+                   "0.005 = 0.5%. This is the anchor from which the other "
+                   "gate thresholds derive when not given explicitly. A combo "
+                   "is kept only if its relative L1 error <= this value. "
+                   "Applies to every field in a multi-field sweep (relative "
+                   "errors are scale-free).")
+@click.option("--l2-threshold", type=float, default=None,
+              help="Relative L2 (RMS) error budget. Default: 2 x --l1-threshold.")
+@click.option("--linf-threshold", type=float, default=None,
+              help="Relative Linf (worst-cell) error budget. Default: "
+                   "10 x --l1-threshold. The trip-wire that catches codecs "
+                   "which destroy a few cells while keeping a good mean.")
+@click.option("--bias-threshold", type=float, default=None,
+              help="Relative bias budget |mean signed error| / mean|orig|. "
+                   "Default: 0.5 x --l1-threshold. Caps the systematic "
+                   "(one-directional) component of the error; matters for "
+                   "long-integration budgets. Note |bias_rel| <= l1_rel "
+                   "always, so a value >= L1 would be vacuous.")
+@click.option("--q99-threshold", type=float, default=None,
+              help="Relative error budget over the extreme tail (cells with "
+                   "|value| >= the 99th percentile of |field|). Only active "
+                   "with --extremes-sensitive. Default: 5 x --l1-threshold.")
+@click.option("--l2-gate/--no-l2-gate", default=True, show_default=True,
+              help="Enable the L2 gate.")
+@click.option("--linf-gate/--no-linf-gate", default=True, show_default=True,
+              help="Enable the Linf gate.")
+@click.option("--bias-gate/--no-bias-gate", default=True, show_default=True,
+              help="Enable the bias gate.")
+@click.option("--extremes-sensitive/--no-extremes-sensitive", default=False,
+              show_default=True,
+              help="Enable the q99 extreme-tail gate. Turn on for fields where "
+                   "the science is in the extremes (precip, gusts, CAPE, "
+                   "radiation peaks).")
+@click.option("--phys-min", type=float, default=None,
+              help="Physical lower bound. If set, any combo whose decoded "
+                   "sample dips below this is rejected (e.g. 0 for precip / "
+                   "humidity). Layer-6 sanity gate.")
+@click.option("--phys-max", type=float, default=None,
+              help="Physical upper bound. If set, any combo whose decoded "
+                   "sample exceeds this is rejected (e.g. 1 for fractions).")
+@click.option("--gradient-gate/--no-gradient-gate", default=False, show_default=True,
+              help="Enable the spatial-structure (gradient) gate. OFF by "
+                   "default: it is a neighbourhood op computed on the in-memory "
+                   "arrays, so it adds compute and a memory transient. Enable "
+                   "selectively for fields feeding derived dynamical quantities "
+                   "(winds, pressure). On huge fields, lower "
+                   "--eval-data-size-limit when enabling this.")
+@click.option("--gradient-threshold", type=float, default=0.1, show_default=True,
+              help="Max relative L1 error of the finite-difference field "
+                   "(spatial axes) when --gradient-gate is on. Absolute "
+                   "fraction, NOT a multiple of L1 (derivatives amplify error).")
 @click.option("--compressor-class", default="all",
               help="Compressor class (case-insensitive) or 'none' to skip.")
 @click.option("--filter-class", default="all",
@@ -644,8 +688,24 @@ def _load_l1_error_thresholds(rank: int) -> "pd.DataFrame | None":
 @click.option("--serializer-class", default="all",
               help="Serializer class (case-insensitive) or 'none' to skip.")
 @click.option("--with-lossy/--without-lossy", default=True, show_default=True)
-@click.option("--with-numcodecs-wasm/--without-numcodecs-wasm", default=False, show_default=True)
-@click.option("--with-ebcc/--without-ebcc", default=False, show_default=True)
+@click.option("--sampling-policy", type=click.Choice(["cascade", "balanced"]),
+              default="cascade", show_default=True,
+              help="How the representative-sample budget is split across "
+                   "stride axes when a field is over --eval-data-size-limit. "
+                   "'cascade' drains the time axis first (temporal diversity "
+                   "is what codec scoring cares about; adjacent vertical "
+                   "levels are highly correlated), keeping a budget-aware "
+                   "minimum of vertical levels. 'balanced' is the legacy "
+                   "log-space split treating each axis equally. Identical for "
+                   "single-level/single-time fields and for fields that fit "
+                   "whole.")
+@click.option("--vertical-floor", type=int, default=None,
+              help="Minimum vertical levels the cascade policy keeps when the "
+                   "budget allows (capped by sqrt of the slice budget so it "
+                   "can't starve time at tight budgets). Default: "
+                   "max(4, ceil(log2(n_levels))) — 10 levels->4, 60->6, "
+                   "137->8. Raise for moisture/cloud/tracer fields with rich "
+                   "vertical structure. Ignored by --sampling-policy balanced.")
 @click.option("--resume/--no-resume", default=True, show_default=True,
               help="If a `config_space_{var}_rank{rank}.csv` already exists, "
                    "skip combos already present in it (matched by indices).")
@@ -674,9 +734,13 @@ def evaluate_combos(dataset_file,
                     max_inner_chunk_mib, spatial_split,
                     oversubscription_check,
                     memory_threshold,
-                    override_existing_l1_error,
+                    l1_threshold, l2_threshold, linf_threshold,
+                    bias_threshold, q99_threshold,
+                    l2_gate, linf_gate, bias_gate, extremes_sensitive,
+                    phys_min, phys_max,
+                    gradient_gate, gradient_threshold,
                     compressor_class, filter_class, serializer_class,
-                    with_lossy, with_numcodecs_wasm, with_ebcc,
+                    with_lossy, sampling_policy, vertical_floor,
                     resume, max_evals, allow_multi_rank_per_node,
                     bypass_zarr_sync):
     """
@@ -783,43 +847,27 @@ def evaluate_combos(dataset_file,
         if rank == 0:
             click.echo(_version_banner("evaluate_combos"))
 
-        # Fetch threshold table on rank 0, broadcast.  Falls back to a local
-        # CSV if the remote sheet fails; ultimate fallback is the per-call
-        # --override-existing-l1-error value.
-        thresholds = None
+        # Resolve the effective gate thresholds once (relative, dimensionless;
+        # applies to every field in the sweep).  No remote table any more — the
+        # L1 anchor is the required CLI value and the rest derive from it.
+        eff_thr = _derive_thresholds(
+            l1=l1_threshold, l2=l2_threshold, linf=linf_threshold,
+            bias=bias_threshold, q99=q99_threshold,
+            l2_gate=l2_gate, linf_gate=linf_gate, bias_gate=bias_gate,
+            extremes_sensitive=extremes_sensitive,
+        )
         if rank == 0:
-            thresholds = _load_l1_error_thresholds(rank=rank)
-            if thresholds is None and override_existing_l1_error is None:
-                click.echo(
-                    "[Rank 0] ERROR: could not load the L1 error "
-                    "threshold table from either the remote Google "
-                    "Sheet or the local fallback at "
-                    f"{_LOCAL_L1_THRESHOLDS_PATH}, and no "
-                    "--override-existing-l1-error was supplied as a "
-                    "fallback.\n"
-                    "  Re-run with --override-existing-l1-error <value> "
-                    "to specify a fallback threshold explicitly, or fix "
-                    "connectivity / restore the local CSV before "
-                    "retrying."
-                )
-                comm.Abort(1)
-
-            if thresholds is not None:
-                buffer = io.BytesIO()
-                thresholds.to_parquet(buffer, index=False)
-                data_bytes = buffer.getvalue()
-            else:
-                # Table unavailable but a fallback override is set; broadcast
-                # an empty payload so non-root ranks know to skip the lookup.
-                data_bytes = b""
-        else:
-            data_bytes = None
-
-        data_bytes = comm.bcast(data_bytes, root=0)
-        if rank != 0:
-            thresholds = (
-                pd.read_parquet(io.BytesIO(data_bytes))
-                if data_bytes else None
+            def _fmt(x):
+                return "off" if not math.isfinite(x) else f"{x:.3e}"
+            click.echo(
+                "[gates] thresholds (relative): "
+                f"L1={eff_thr['l1']:.3e} "
+                f"L2={_fmt(eff_thr['l2'])} "
+                f"Linf={_fmt(eff_thr['linf'])} "
+                f"bias={_fmt(eff_thr['bias'])} "
+                f"q99={_fmt(eff_thr['q99'])} | "
+                f"bounds=[{phys_min}, {phys_max}] | "
+                f"gradient={'on@'+format(gradient_threshold,'.3e') if gradient_gate else 'off'}"
             )
 
         # -------------------------------------------------------------------------
@@ -835,58 +883,14 @@ def evaluate_combos(dataset_file,
                 continue
             da = ds[var]
 
-            # Try the lookup table first.  Fall back to
-            # --override-existing-l1-error only when the variable is missing
-            # from the table, the units don't match, or the cell is empty / NaN.
-            existing_l1_error = None
-            threshold_source = None
-            if thresholds is not None:
-                threshold_row = thresholds[thresholds["Short Name"] == var]
-                matching_units = (
-                    threshold_row.iloc[0]["Unit"] == da.attrs.get("units", None)
-                    if not threshold_row.empty else None
-                )
-                raw_threshold = (
-                    threshold_row.iloc[0]["Existing L1 error"]
-                    if not threshold_row.empty and matching_units else None
-                )
-                if raw_threshold is not None and not (
-                    isinstance(raw_threshold, float) and math.isnan(raw_threshold)
-                ):
-                    if isinstance(raw_threshold, str):
-                        existing_l1_error = float(raw_threshold.replace(",", "."))
-                    else:
-                        existing_l1_error = float(raw_threshold)
-                    threshold_source = "lookup table"
-
-            if existing_l1_error is None and override_existing_l1_error is not None:
-                existing_l1_error = override_existing_l1_error
-                threshold_source = "--override-existing-l1-error fallback"
-
-            # No threshold resolved (no table row + no override): the keep
-            # filter has no basis, so we'd silently keep every combo.  Abort.
-            if existing_l1_error is None:
-                if rank == 0:
-                    var_units = da.attrs.get("units", "N/A")
-                    click.echo(
-                        f"[var] {var} | ERROR: cannot determine an L1 "
-                        f"error threshold for this variable (no row "
-                        f"matching Short Name='{var}' with Unit="
-                        f"'{var_units}' in the threshold table, or the "
-                        f"row's 'Existing L1 error' cell is empty/NaN).\n"
-                        f"  Re-run with --override-existing-l1-error "
-                        f"<value> to specify a threshold explicitly, or "
-                        f"add an entry for '{var}' to the lookup table "
-                        f"(remote Google Sheet, or the local fallback at "
-                        f"{_LOCAL_L1_THRESHOLDS_PATH})."
-                    )
-                comm.Abort(1)
+            # Thresholds are the same relative values for every field; keep a
+            # per-variable scalar for the legacy manifest field + log line.
+            existing_l1_error = eff_thr["l1"]
 
             if rank == 0:
                 click.echo(
                     f"[var] {var} | units={da.attrs.get('units', 'N/A')} | "
-                    f"Existing L1 error={existing_l1_error} "
-                    f"(source: {threshold_source})"
+                    f"relative L1 threshold={existing_l1_error:.3e}"
                 )
 
             # -------------------------------------------------------------------------
@@ -907,7 +911,6 @@ def evaluate_combos(dataset_file,
             # by the cgroup/host budget.  The CLI flag --eval-data-size-limit
             # acts as a ceiling, not a target.
             # -------------------------------------------------------------------------
-            ebcc_in_search = bool(with_ebcc) and da.dtype != np.float32
             node_budget_bytes, node_budget_source = _detect_node_memory_budget()
             # Under SLURM cgroup-v2 the budget is per-task; without cgroup
             # all ranks on the node share it.  Mirror the asymmetry from
@@ -922,7 +925,6 @@ def evaluate_combos(dataset_file,
                 budget_bytes=int(effective_budget * memory_threshold),
                 threads_per_rank=threads_per_rank,
                 inner_chunk_mib=inner_chunk_mib,
-                include_ebcc_overhead=ebcc_in_search,
             )
             user_limit = int(eval_data_size_limit)
             effective_sample_limit = min(user_limit, max_safe_sample)
@@ -970,10 +972,6 @@ def evaluate_combos(dataset_file,
                 sample_bytes=actual_sample_bytes,
                 threads_per_rank=threads_per_rank,
                 inner_chunk_mib=inner_chunk_mib,
-                # EBCC needs a float32 working copy on every rank that runs
-                # an EBCC combo (not just rank 0); upper bound, since we
-                # don't yet know whether EBCC will be selected.
-                include_ebcc_overhead=ebcc_in_search,
             )
             _check_node_memory_headroom(
                 per_rank_steady_bytes=per_rank_steady,
@@ -987,6 +985,7 @@ def evaluate_combos(dataset_file,
             if rank == 0:
                 sample_da_local = utils.build_representative_sample(
                     da, effective_sample_limit, rank=rank,
+                    policy=sampling_policy, vertical_floor=vertical_floor,
                 )
                 # .compute() forces the dask read; we want the buffer, not a lazy handle.
                 sample_da_local = sample_da_local.compute()
@@ -1054,12 +1053,9 @@ def evaluate_combos(dataset_file,
             # Build codec spaces from the SAMPLE (deterministic; compress_with_optimal
             # must use the same --eval-data-size-limit to reproduce these objects).
             # -------------------------------------------------------------------------
-            compressors = utils.compressor_space(sample_da, with_lossy, with_numcodecs_wasm,
-                                                 with_ebcc, compressor_class)
-            filters     = utils.filter_space(sample_da, with_lossy, with_numcodecs_wasm,
-                                             with_ebcc, filter_class)
-            serializers = utils.serializer_space(sample_da, with_lossy, with_numcodecs_wasm,
-                                                 with_ebcc, serializer_class)
+            compressors = utils.compressor_space(sample_da, with_lossy, compressor_class)
+            filters     = utils.filter_space(sample_da, with_lossy, filter_class)
+            serializers = utils.serializer_space(sample_da, with_lossy, serializer_class)
 
             num_loops = len(compressors) * len(filters) * len(serializers)
             config_space = list(itertools.product(compressors, filters, serializers))
@@ -1077,7 +1073,7 @@ def evaluate_combos(dataset_file,
                 config_space = config_space[:max_evals]
                 num_loops = len(config_space)
             # Deterministic shuffle before stride partition: breaks up runs
-            # of similar-cost combos (e.g. consecutive EBCC entries) so each
+            # of similar-cost combos (e.g. a block of ZFPY entries) so each
             # rank gets a representative mix.  Seed depends only on num_loops
             # so --resume sees the same order across restarts.
             _rng = np.random.default_rng(seed=int(num_loops) & 0xFFFFFFFF)
@@ -1107,10 +1103,6 @@ def evaluate_combos(dataset_file,
                 # _per_rank_steady_estimate_bytes() so the abort check (fired
                 # pre-broadcast) and this user-facing estimate cannot drift.
                 steady_mib = int(sample_np.nbytes / 2**20)
-                ebcc_overhead_mib = int(sample_np.nbytes / 2**20) if (
-                    any(_is_ebcc_serializer(ser) for (_, ser) in serializers)
-                    and sample_np.dtype != np.float32
-                ) else 0
                 # Per-thread working set: each ThreadPoolExecutor worker
                 # runs evaluate_codec_pipeline concurrently with its own
                 # decoded buffer (~1x sample), encoded MemoryStore
@@ -1128,13 +1120,12 @@ def evaluate_combos(dataset_file,
                     sample_bytes=int(sample_np.nbytes),
                     threads_per_rank=threads_per_rank,
                     inner_chunk_mib=inner_chunk_mib,
-                    include_ebcc_overhead=(ebcc_overhead_mib > 0),
                 )
                 click.echo(
                     f"[memory] rank-0 transient peak ~= "
                     f"{int(2 * sample_np.nbytes / 2**20)} MiB (during Bcast); "
-                    f"per-rank steady ~= {steady_mib + ebcc_overhead_mib} MiB "
-                    f"(sample + EBCC copy) + ~{decode_cache_mib} MiB "
+                    f"per-rank steady ~= {steady_mib} MiB "
+                    f"(sample) + ~{decode_cache_mib} MiB "
                     f"({threads_per_rank} threads x "
                     f"{PER_THREAD_WORKING_FACTOR:.1f}x decode/encode cache) "
                     f"+ ~{thread_pool_mib} MiB "
@@ -1167,19 +1158,29 @@ def evaluate_combos(dataset_file,
                 )
 
             # -------------------------------------------------------------------------
-            # Pre-materialise a float32 view of the sample IF any EBCC combo is present
-            # and the dtype isn't already float32 (avoids per-thread float32 allocations).
-            # -------------------------------------------------------------------------
-            sample_np_ebcc = None
-            any_ebcc_local = any(
-                _is_ebcc_serializer(ser) for (_, ser) in serializers
+            # q99 reference value (extreme-tail gate).  The 99th percentile of
+            # |original| over finite cells, computed ONCE per variable on the
+            # in-memory sample (cheap: a single reduction on already-resident
+            # data).  Passed into every per-combo metrics call so the tail
+            # error is accumulated against a fixed cut.  Only computed when the
+            # gate is on.
+            q99_abs = None
+            if extremes_sensitive:
+                finite_vals = sample_np[np.isfinite(sample_np)]
+                if finite_vals.size:
+                    q99_abs = float(np.quantile(np.abs(finite_vals), 0.99))
+                del finite_vals
+                if rank == 0:
+                    click.echo(
+                        f"[gates] {var}: q99(|value|)={q99_abs} "
+                        f"(extreme-tail cut for the q99 gate)"
+                    )
+
+            # Gradient axes: every axis except the leading (time) one, matching
+            # the sample's own dims.  Only used when --gradient-gate is on.
+            grad_axes = (
+                tuple(range(1, sample_np.ndim)) if sample_np.ndim > 1 else (0,)
             )
-            if any_ebcc_local and sample_np.dtype != np.float32:
-                sample_np_ebcc = np.ascontiguousarray(
-                    np.squeeze(sample_np).astype(np.float32, copy=True)
-                )
-            elif any_ebcc_local:
-                sample_np_ebcc = np.ascontiguousarray(np.squeeze(sample_np))
 
             # -------------------------------------------------------------------------
             # Per-combo evaluator (runs inside a thread)
@@ -1191,11 +1192,6 @@ def evaluate_combos(dataset_file,
                 if _is_zfpy_serializer(serializer):
                     data_np = sample_np.reshape(-1)  # flat view; no copy
                     dims = ("flat_dim",)
-                elif _is_ebcc_serializer(serializer):
-                    data_np = sample_np_ebcc        # shared across threads
-                    dims = tuple(d for d, s in zip(sample_da.dims, sample_da.shape) if s > 1)
-                    if not dims:
-                        dims = sample_da.dims
                 else:
                     data_np = sample_np
                     dims = sample_da.dims
@@ -1248,10 +1244,19 @@ def evaluate_combos(dataset_file,
                     )
                     _evaluate_one._warned_oversize = True
 
+                # Gradient is a spatial-neighbourhood op: only meaningful on
+                # the natural-shape array.  Disable it for the zfpy flat view
+                # (axes wouldn't line up).
+                _do_gradient = bool(gradient_gate) and (data_np is sample_np)
+                _grad_axes = grad_axes if _do_gradient else None
+
                 ratio, errors, eucd = utils.evaluate_codec_pipeline(
                     data_np, dims,
                     filters=filters_, compressors=compressors_, serializer=serializer_,
                     chunks=eval_chunks,
+                    q99_abs=q99_abs,
+                    compute_gradient=_do_gradient,
+                    gradient_axes=_grad_axes,
                 )
 
                 return {
@@ -1352,7 +1357,12 @@ def evaluate_combos(dataset_file,
                     partial_csv_writer.writerow([
                         "compressor", "filter", "serializer",
                         "comp_idx", "filt_idx", "ser_idx",
-                        "ratio", "l1_rel", "l2_rel", "linf_rel", "eucd",
+                        "ratio", "l1_rel", "l2_rel", "linf_rel",
+                        "bias_rel", "q99_rel", "grad_rel",
+                        "decoded_min", "decoded_max", "n_corrupt",
+                        "eucd",
+                        "pass_l1", "pass_l2", "pass_linf", "pass_bias",
+                        "pass_q99", "pass_bounds", "pass_grad", "pass_finite",
                         "keep",
                     ])
                 if not failures_exists:
@@ -1393,23 +1403,45 @@ def evaluate_combos(dataset_file,
                                 utils.progress_bar(total_local, print_every=100, key=str(var))
                                 continue
 
-                            l1_rel   = r["errors"]["Relative_Error_L1"]
-                            l2_rel   = r["errors"]["Relative_Error_L2"]
-                            linf_rel = r["errors"]["Relative_Error_Linf"]
+                            err = r["errors"]
+                            l1_rel   = err["Relative_Error_L1"]
+                            l2_rel   = err["Relative_Error_L2"]
+                            linf_rel = err["Relative_Error_Linf"]
+                            bias_rel = err.get("Bias_Rel")
+                            q99_rel  = err.get("Q99_Rel")
+                            grad_rel = err.get("Grad_Rel")
+                            dec_min  = err.get("Decoded_Min")
+                            dec_max  = err.get("Decoded_Max")
+                            n_corrupt = err.get("N_Corrupt", 0)
 
-                            keep = True
-                            if existing_l1_error is not None:
-                                keep = (l1_rel <= existing_l1_error)
+                            # Joint gate: L1 + L2 + Linf + bias (+ q99, bounds,
+                            # gradient, finite).  Shared with the verify gate.
+                            keep, reasons = _evaluate_gates(
+                                l1_rel=l1_rel, l2_rel=l2_rel, linf_rel=linf_rel,
+                                bias_rel=bias_rel, q99_rel=q99_rel, grad_rel=grad_rel,
+                                decoded_min=dec_min, decoded_max=dec_max,
+                                n_corrupt=n_corrupt,
+                                thr=eff_thr,
+                                grad_threshold=gradient_threshold,
+                                grad_gate=gradient_gate,
+                                phys_min=phys_min, phys_max=phys_max,
+                            )
 
                             # Per-rank streaming audit row.  Written for every
-                            # successful evaluation, including filtered-out ones (the
-                            # `keep` column distinguishes).  Batched flushes keep MDS
-                            # pressure down while still surviving a mid-sweep crash
-                            # up to FLUSH_EVERY rows.
+                            # successful evaluation, including filtered-out ones
+                            # (the per-gate booleans show exactly WHY a combo was
+                            # rejected).  Batched flushes keep MDS pressure down.
                             partial_csv_writer.writerow([
                                 r["compressor"], r["filter"], r["serializer"],
                                 r["comp_idx"], r["filt_idx"], r["ser_idx"],
-                                r["ratio"], l1_rel, l2_rel, linf_rel, r["eucd"],
+                                r["ratio"], l1_rel, l2_rel, linf_rel,
+                                bias_rel, q99_rel, grad_rel,
+                                dec_min, dec_max, n_corrupt,
+                                r["eucd"],
+                                reasons["pass_l1"], reasons["pass_l2"],
+                                reasons["pass_linf"], reasons["pass_bias"],
+                                reasons["pass_q99"], reasons["pass_bounds"],
+                                reasons["pass_grad"], reasons["pass_finite"],
                                 keep,
                             ])
                             rows_since_flush += 1
@@ -1436,8 +1468,8 @@ def evaluate_combos(dataset_file,
 
             # ----- Aggregate failure details across ranks (M2) ---------------
             # Gather the first few failures from every rank so the user can see
-            # node-local issues (bad EBCC geometry on one host, codec-library
-            # mismatch on another) even when rank 0 is clean.  Limit to 5 per
+            # node-local issues (e.g. a codec-library mismatch on one host)
+            # even when rank 0 is clean.  Limit to 5 per
             # rank to keep the pickle small.
             sample_failures = failures[:5]
             all_failures = comm.gather(sample_failures, root=0)
@@ -1480,15 +1512,13 @@ def evaluate_combos(dataset_file,
                 raw_gather     = list(itertools.chain.from_iterable(raw_gather))
 
                 lossy_option          = "with-lossy" if with_lossy else "without-lossy"
-                numcodecs_wasm_option = "with-numcodecs-wasm" if with_numcodecs_wasm else "without-numcodecs-wasm"
-                ebcc_option           = "with-ebcc" if with_ebcc else "without-ebcc"
                 # `var` is used unconditionally here (was `field_to_compress or "all"`)
                 # so that when the caller omits --field-to-compress and we iterate
                 # over every data_var, each iteration produces a distinct filename.
                 score_tag = [
                     var,
                     compressor_class, filter_class, serializer_class,
-                    lossy_option, numcodecs_wasm_option, ebcc_option,
+                    lossy_option,
                 ]
                 npy_path = os.path.join(
                     where_to_write,
@@ -1555,15 +1585,40 @@ def evaluate_combos(dataset_file,
                         "filter_class": filter_class,
                         "serializer_class": serializer_class,
                         "with_lossy": bool(with_lossy),
-                        "with_numcodecs_wasm": bool(with_numcodecs_wasm),
-                        "with_ebcc": bool(with_ebcc),
-                        "override_existing_l1_error": override_existing_l1_error,
+                        "sampling_policy": sampling_policy,
+                        "vertical_floor": vertical_floor,
+                        "l1_threshold": float(l1_threshold),
+                        "l2_threshold": l2_threshold,
+                        "linf_threshold": linf_threshold,
+                        "bias_threshold": bias_threshold,
+                        "q99_threshold": q99_threshold,
+                        "l2_gate": bool(l2_gate),
+                        "linf_gate": bool(linf_gate),
+                        "bias_gate": bool(bias_gate),
+                        "extremes_sensitive": bool(extremes_sensitive),
+                        "phys_min": phys_min,
+                        "phys_max": phys_max,
+                        "gradient_gate": bool(gradient_gate),
+                        "gradient_threshold": float(gradient_threshold),
                         "resume": bool(resume),
                     },
                     "topology": {
                         "size": int(size),
                         "cores_avail": int(cores_avail),
                     },
+                    # Effective (resolved) thresholds actually applied.  Read
+                    # by compress_with_optimal's verify gate so production is
+                    # checked against the same numbers the sweep used.  inf ->
+                    # None so the JSON is clean and a missing gate is explicit.
+                    "effective_thresholds": {
+                        k: (None if not math.isfinite(v) else float(v))
+                        for k, v in eff_thr.items()
+                    },
+                    "gradient_threshold": (
+                        float(gradient_threshold) if gradient_gate else None
+                    ),
+                    "phys_min": phys_min,
+                    "phys_max": phys_max,
                     "existing_l1_error": existing_l1_error,
                     "num_combos": int(num_loops),
                     "num_passed": int(len(results_gather)),
@@ -1629,8 +1684,8 @@ def evaluate_combos(dataset_file,
               show_default=True,
               help="Size budget for the sample used to build the codec space "
                    "(i.e. to compute data-derived codec parameters such as "
-                   "Asinh.linear_width, FixedOffsetScale.offset/scale, and EBCC "
-                   "chunk geometry).  The FULL FIELD is always compressed - this "
+                   "the dtype-dependent BitRound/Quantize grids).  The FULL "
+                   "FIELD is always compressed - this "
                    "flag does NOT control what gets written.  "
                    "Must match the value used in evaluate_combos so the codec-space "
                    "indices (comp_idx, filt_idx, ser_idx) resolve to identical codec "
@@ -1691,12 +1746,27 @@ def evaluate_combos(dataset_file,
                    "e.g. re-compressing sibling fields with a combo vetted on a "
                    "prior run - and re-reading the shared Zarr store is the "
                    "bottleneck.")
+@click.option("--verify-gate/--no-verify-gate", default=True, show_default=True,
+              help="When --verify is on, compare the production error norms "
+                   "against the gate thresholds and ABORT the run if any are "
+                   "exceeded (catches sample-vs-production drift). Thresholds "
+                   "are read from manifest_{field}.json (written by "
+                   "evaluate_combos) unless overridden below. Requires "
+                   "--verify; ignored under --no-verify. Pass --no-verify-gate "
+                   "to keep verification advisory (warn but don't fail).")
+@click.option("--l1-threshold", type=float, default=None,
+              help="Override the relative L1 threshold for the verify gate "
+                   "(default: value from manifest_{field}.json).")
+@click.option("--l2-threshold", type=float, default=None,
+              help="Override the relative L2 threshold for the verify gate.")
+@click.option("--linf-threshold", type=float, default=None,
+              help="Override the relative Linf threshold for the verify gate.")
+@click.option("--bias-threshold", type=float, default=None,
+              help="Override the relative bias threshold for the verify gate.")
 @click.option("--compressor-class", default="all")
 @click.option("--filter-class", default="all")
 @click.option("--serializer-class", default="all")
 @click.option("--with-lossy/--without-lossy", default=True, show_default=True)
-@click.option("--with-numcodecs-wasm/--without-numcodecs-wasm", default=False, show_default=True)
-@click.option("--with-ebcc/--without-ebcc", default=False, show_default=True)
 @click.option("--force/--no-force", default=False, show_default=True,
               help="Suppress the warning emitted when the (comp_idx, filt_idx, "
                    "ser_idx) you pass does not match the best combo recorded in "
@@ -1711,9 +1781,10 @@ def compress_with_optimal(dataset_file, where_to_write, field_to_compress,
                           spatial_split, shard_mib,
                           threads, codec_threads,
                           oversubscription_check, memory_threshold,
-                          verify,
+                          verify, verify_gate,
+                          l1_threshold, l2_threshold, linf_threshold, bias_threshold,
                           compressor_class, filter_class, serializer_class,
-                          with_lossy, with_numcodecs_wasm, with_ebcc,
+                          with_lossy,
                           force):
     """
     Compress a single field with the combo chosen by evaluate_combos, streaming
@@ -1731,12 +1802,11 @@ def compress_with_optimal(dataset_file, where_to_write, field_to_compress,
 
     Codec-space reproducibility
     ---------------------------
-    Several codecs have parameters derived from data statistics: Asinh's
-    linear_width comes from a quantile of |da|; FixedOffsetScale's offset and
-    scale come from da.mean/std/min/max; EBCC's chunk geometry comes from the
-    field shape.  These are computed inside compressor_space / filter_space /
-    serializer_space to produce a list of pre-instantiated codec objects, and
-    comp_idx / filt_idx / ser_idx index into those lists.
+    Some codecs have parameters derived from data statistics (e.g. BitRound /
+    Quantize bit/digit grids are dtype-dependent).  These are computed inside
+    compressor_space / filter_space / serializer_space to produce a list of
+    pre-instantiated codec objects, and comp_idx / filt_idx / ser_idx index
+    into those lists.
 
     For an index produced by evaluate_combos to resolve to the SAME codec
     object here, both commands must build the codec space the same way - which
@@ -1983,12 +2053,9 @@ def compress_with_optimal(dataset_file, where_to_write, field_to_compress,
                 f"first with the same --where-to-write.)"
             )
 
-        compressors = utils.compressor_space(sample_for_codec_space, with_lossy,
-                                             with_numcodecs_wasm, with_ebcc, compressor_class)
-        filters     = utils.filter_space(sample_for_codec_space, with_lossy,
-                                         with_numcodecs_wasm, with_ebcc, filter_class)
-        serializers = utils.serializer_space(sample_for_codec_space, with_lossy,
-                                             with_numcodecs_wasm, with_ebcc, serializer_class)
+        compressors = utils.compressor_space(sample_for_codec_space, with_lossy, compressor_class)
+        filters     = utils.filter_space(sample_for_codec_space, with_lossy, filter_class)
+        serializers = utils.serializer_space(sample_for_codec_space, with_lossy, serializer_class)
 
         # Index validation
         for name, idx, arr in [("comp_idx", comp_idx, compressors),
@@ -2003,13 +2070,10 @@ def compress_with_optimal(dataset_file, where_to_write, field_to_compress,
         optimal_serializer = serializers[ser_idx][1]  if ser_idx  != -1 else None
 
         # Per-serializer data shaping (on the FULL field, not the sample).
-        # zfpy and EBCC have incompatible shape expectations; at most one branch
-        # fires (elif documents that intent).
+        # zfpy expects a flat layout.
         data_to_persist = da
         if _is_zfpy_serializer(optimal_serializer):
             data_to_persist = da.stack(flat_dim=da.dims)
-        elif _is_ebcc_serializer(optimal_serializer):
-            data_to_persist = da.squeeze().astype("float32")
 
         # Pipeline assembly rules (same semantics as the original)
         filters_ = [optimal_filter]
@@ -2132,6 +2196,111 @@ def compress_with_optimal(dataset_file, where_to_write, field_to_compress,
         click.echo(summary)
 
         # ------------------------------------------------------------------
+        # Verify gate (Layer: sample-vs-production drift).
+        # When --verify is on, compare the PRODUCTION error norms against the
+        # gate thresholds and abort if any are exceeded.  Thresholds come from
+        # the sweep manifest (manifest_{field}.json) unless overridden on the
+        # CLI.  Runs on rank 0; the decision is broadcast so every rank exits
+        # together.
+        # ------------------------------------------------------------------
+        gate_abort = False
+        if verify and errors is not None:
+            # Resolve thresholds: CLI override > sweep manifest > skip-with-warn.
+            man_thr = {}
+            man_grad = None
+            man_pmin = man_pmax = None
+            sweep_manifest_path = os.path.join(
+                where_to_write, f"manifest_{field_to_compress}.json"
+            )
+            if rank == 0 and Path(sweep_manifest_path).is_file():
+                try:
+                    with open(sweep_manifest_path) as smf:
+                        sm = json.load(smf)
+                    man_thr  = sm.get("effective_thresholds", {}) or {}
+                    man_grad = sm.get("gradient_threshold")
+                    man_pmin = sm.get("phys_min")
+                    man_pmax = sm.get("phys_max")
+                except Exception as sm_err:
+                    click.echo(
+                        f"[verify-gate] WARNING: could not read sweep manifest "
+                        f"{sweep_manifest_path}: {sm_err}"
+                    )
+
+            if rank == 0:
+                def _pick(cli_val, man_key):
+                    if cli_val is not None:
+                        return float(cli_val)
+                    mv = man_thr.get(man_key)
+                    return float(mv) if mv is not None else math.inf
+
+                vg_thr = {
+                    "l1":   _pick(l1_threshold,   "l1"),
+                    "l2":   _pick(l2_threshold,   "l2"),
+                    "linf": _pick(linf_threshold, "linf"),
+                    "bias": _pick(bias_threshold, "bias"),
+                    "q99":  (float(man_thr["q99"])
+                             if man_thr.get("q99") is not None else math.inf),
+                }
+                have_any = any(math.isfinite(v) for v in vg_thr.values())
+
+                if not have_any:
+                    click.echo(
+                        "[verify-gate] WARNING: no thresholds available (no "
+                        f"manifest at {sweep_manifest_path} and no --lX-threshold "
+                        "given); skipping the production gate.  Verification "
+                        "ran but was advisory only."
+                    )
+                else:
+                    keep, reasons = _evaluate_gates(
+                        l1_rel=errors.get("Relative_Error_L1"),
+                        l2_rel=errors.get("Relative_Error_L2"),
+                        linf_rel=errors.get("Relative_Error_Linf"),
+                        bias_rel=errors.get("Bias_Rel"),
+                        q99_rel=None,            # q99 not recomputed on full field
+                        grad_rel=None,           # gradient not recomputed here
+                        decoded_min=None, decoded_max=None,
+                        n_corrupt=errors.get("N_Corrupt", 0),
+                        thr=vg_thr,
+                        grad_threshold=None, grad_gate=False,
+                        phys_min=man_pmin, phys_max=man_pmax,
+                    )
+                    if keep:
+                        click.echo(
+                            "[verify-gate] PASS: production error norms are "
+                            "within the sweep thresholds."
+                        )
+                    else:
+                        failed = [k for k, ok in reasons.items() if not ok]
+                        click.echo(
+                            "[verify-gate] FAIL: production verification "
+                            f"exceeded the thresholds ({', '.join(failed)}).\n"
+                            f"  L1={errors.get('Relative_Error_L1'):.3e} "
+                            f"L2={errors.get('Relative_Error_L2'):.3e} "
+                            f"Linf={errors.get('Relative_Error_Linf'):.3e} "
+                            f"bias={errors.get('Bias_Rel'):.3e} "
+                            f"n_corrupt={errors.get('N_Corrupt', 0)}\n"
+                            f"  thresholds: L1={vg_thr['l1']:.3e} "
+                            f"L2={vg_thr['l2']:.3e} Linf={vg_thr['linf']:.3e} "
+                            f"bias={vg_thr['bias']:.3e}"
+                        )
+                        if verify_gate:
+                            click.echo(
+                                "[verify-gate] aborting (pass --no-verify-gate "
+                                "to downgrade this to a warning)."
+                            )
+                            gate_abort = True
+                        else:
+                            click.echo(
+                                "[verify-gate] --no-verify-gate set: continuing "
+                                "despite the failure (advisory only)."
+                            )
+
+        # Broadcast the abort decision so all ranks stop together.
+        gate_abort = comm.bcast(gate_abort, root=0)
+        if gate_abort:
+            comm.Abort(2)
+
+        # ------------------------------------------------------------------
         # Per-field persist manifest (machine-readable).
         # Mirrors the evaluate_combos manifest so a downstream tool can pick
         # up the exact combo that was written, which shards were produced,
@@ -2240,12 +2409,16 @@ def compress_with_optimal(dataset_file, where_to_write, field_to_compress,
                    "because the documented 1.5-2x rechunk transient can exceed "
                    "the remaining buffer.  Hard upper bound 0.95.")
 @click.option("--verify/--no-verify", default=True, show_default=True)
+@click.option("--verify-gate/--no-verify-gate", default=True, show_default=True,
+              help="When --verify is on, fail a field if its production error "
+                   "norms exceed the gate thresholds recorded in that field's "
+                   "manifest_{var}.json. Honors --continue-on-error (a gate "
+                   "failure is treated like any other per-field error). Pass "
+                   "--no-verify-gate to keep verification advisory.")
 @click.option("--compressor-class", default="all")
 @click.option("--filter-class", default="all")
 @click.option("--serializer-class", default="all")
 @click.option("--with-lossy/--without-lossy", default=True, show_default=True)
-@click.option("--with-numcodecs-wasm/--without-numcodecs-wasm", default=False, show_default=True)
-@click.option("--with-ebcc/--without-ebcc", default=False, show_default=True)
 @click.option("--skip-existing/--no-skip-existing", default=True, show_default=True,
               help="If a field is already present in the merged store, skip it. "
                    "Disable with --no-skip-existing to force re-compression.")
@@ -2257,9 +2430,9 @@ def compress_fields_from_results(dataset_file, where_to_write, vars_filter,
                                   max_inner_chunk_mib, spatial_split, shard_mib,
                                   threads, codec_threads,
                                   oversubscription_check, memory_threshold,
-                                  verify,
+                                  verify, verify_gate,
                                   compressor_class, filter_class, serializer_class,
-                                  with_lossy, with_numcodecs_wasm, with_ebcc,
+                                  with_lossy,
                                   skip_existing, continue_on_error):
     """
     Batch wrapper around compress_with_optimal.
@@ -2536,16 +2709,13 @@ def compress_fields_from_results(dataset_file, where_to_write, vars_filter,
                         )
 
                 compressors = utils.compressor_space(
-                    sample_for_codec_space, with_lossy, with_numcodecs_wasm,
-                    with_ebcc, compressor_class,
+                    sample_for_codec_space, with_lossy, compressor_class,
                 )
                 filters_space = utils.filter_space(
-                    sample_for_codec_space, with_lossy, with_numcodecs_wasm,
-                    with_ebcc, filter_class,
+                    sample_for_codec_space, with_lossy, filter_class,
                 )
                 serializers = utils.serializer_space(
-                    sample_for_codec_space, with_lossy, with_numcodecs_wasm,
-                    with_ebcc, serializer_class,
+                    sample_for_codec_space, with_lossy, serializer_class,
                 )
 
                 comp_idx = c["comp_idx"]; filt_idx = c["filt_idx"]; ser_idx = c["ser_idx"]
@@ -2564,8 +2734,6 @@ def compress_fields_from_results(dataset_file, where_to_write, vars_filter,
                 data_to_persist = da
                 if _is_zfpy_serializer(optimal_serializer):
                     data_to_persist = da.stack(flat_dim=da.dims)
-                elif _is_ebcc_serializer(optimal_serializer):
-                    data_to_persist = da.squeeze().astype("float32")
 
                 filters_ = [optimal_filter]
                 compressors_ = [optimal_compressor]
@@ -2661,6 +2829,67 @@ def compress_fields_from_results(dataset_file, where_to_write, vars_filter,
                     )
                 summary += f"  ({field_seconds:.1f}s)"
                 click.echo(f"[batch] {summary}")
+
+                # Verify gate: compare production norms to this field's sweep
+                # thresholds (manifest_{var}.json).  A failure raises so it is
+                # handled by the existing continue-on-error machinery.
+                if verify and errors is not None:
+                    var_manifest = os.path.join(
+                        where_to_write, f"manifest_{var}.json"
+                    )
+                    vthr = {}
+                    vpmin = vpmax = None
+                    if Path(var_manifest).is_file():
+                        try:
+                            with open(var_manifest) as vmf:
+                                vm = json.load(vmf)
+                            vthr  = vm.get("effective_thresholds", {}) or {}
+                            vpmin = vm.get("phys_min")
+                            vpmax = vm.get("phys_max")
+                        except Exception as vm_err:
+                            click.echo(
+                                f"[verify-gate] {var}: WARNING could not read "
+                                f"{var_manifest}: {vm_err}"
+                            )
+                    thr = {
+                        k: (float(vthr[k]) if vthr.get(k) is not None else math.inf)
+                        for k in ("l1", "l2", "linf", "bias", "q99")
+                    }
+                    if any(math.isfinite(v) for v in thr.values()):
+                        keep, reasons = _evaluate_gates(
+                            l1_rel=errors.get("Relative_Error_L1"),
+                            l2_rel=errors.get("Relative_Error_L2"),
+                            linf_rel=errors.get("Relative_Error_Linf"),
+                            bias_rel=errors.get("Bias_Rel"),
+                            q99_rel=None, grad_rel=None,
+                            decoded_min=None, decoded_max=None,
+                            n_corrupt=errors.get("N_Corrupt", 0),
+                            thr=thr, grad_threshold=None, grad_gate=False,
+                            phys_min=vpmin, phys_max=vpmax,
+                        )
+                        if not keep:
+                            failed = [k for k, ok in reasons.items() if not ok]
+                            msg = (
+                                f"{var}: verify gate FAILED "
+                                f"({', '.join(failed)}) | "
+                                f"L1={errors.get('Relative_Error_L1'):.3e} "
+                                f"L2={errors.get('Relative_Error_L2'):.3e} "
+                                f"Linf={errors.get('Relative_Error_Linf'):.3e}"
+                            )
+                            if verify_gate:
+                                raise RuntimeError(msg)
+                            click.echo(
+                                f"[verify-gate] {msg} (advisory: "
+                                f"--no-verify-gate set)"
+                            )
+                        else:
+                            click.echo(f"[verify-gate] {var}: PASS")
+                    else:
+                        click.echo(
+                            f"[verify-gate] {var}: no thresholds in manifest; "
+                            f"verification advisory only."
+                        )
+
                 results_by_var[var] = {
                     "status": "ok",
                     "ratio": float(ratio),
@@ -3365,12 +3594,10 @@ def analyze_clustering(npy_file: str, where_to_write: str, var: str):
 @click.option("--filter-class", default="all", help="Same as in evaluate_combos.")
 @click.option("--serializer-class", default="all", help="Same as in evaluate_combos.")
 @click.option("--with-lossy/--without-lossy", default=True, show_default=True, help="Same as in evaluate_combos.")
-@click.option("--with-numcodecs-wasm/--without-numcodecs-wasm", default=False, show_default=True, help="Same as in evaluate_combos.")
-@click.option("--with-ebcc/--without-ebcc", default=False, show_default=True, help="Same as in evaluate_combos.")
 def plot_compression_errors(dataset_file: str, where_to_write: str, field_to_compress: str,
                             comp_idx: int, filt_idx: int, ser_idx: int, 
                             compressor_class: str = "all", filter_class: str = "all", serializer_class: str = "all",
-                            with_lossy: bool = True, with_numcodecs_wasm: bool = False, with_ebcc: bool = False):
+                            with_lossy: bool = True):
     """
     Plot the absolute errors arising from compression+decompression of a field
     with the desired combination of compressor, filter, and serializer.
@@ -3383,7 +3610,7 @@ def plot_compression_errors(dataset_file: str, where_to_write: str, field_to_com
     dimensions are not supported or removed if they have a single level.
 
     Make sure to provide the same --[compressor/filter/serializer]-class and the
-    same --with/without-[lossy/numcodecs-wasm/ebcc] flags as in evaluate_combos,
+    same --with/without-lossy flag as in evaluate_combos,
     such that the same lists of instantiated objects are generated.
     
     Note on passing -1 as index:
@@ -3401,8 +3628,6 @@ def plot_compression_errors(dataset_file: str, where_to_write: str, field_to_com
         filter_class: --filter-class
         serializer_class: --serializer-class
         with_lossy: --with-lossy/--without-lossy
-        with_numcodecs_wasm: --with-numcodecs-wasm/--without-numcodecs-wasm
-        with_ebcc: --with-ebcc/--without-ebcc
     """
     # Lazy import: see the comment near the top of this file.
     import matplotlib.pyplot as plt
@@ -3439,9 +3664,9 @@ def plot_compression_errors(dataset_file: str, where_to_write: str, field_to_com
                    f"To avoid high memory usage we only support fields up to {mem_threshold} GiB.")
         comm.Abort(1)
 
-    compressors = utils.compressor_space(da, with_lossy, with_numcodecs_wasm, with_ebcc, compressor_class)
-    filters = utils.filter_space(da, with_lossy, with_numcodecs_wasm, with_ebcc, filter_class)
-    serializers = utils.serializer_space(da, with_lossy, with_numcodecs_wasm, with_ebcc, serializer_class)
+    compressors = utils.compressor_space(da, with_lossy, compressor_class)
+    filters = utils.filter_space(da, with_lossy, filter_class)
+    serializers = utils.serializer_space(da, with_lossy, serializer_class)
 
     if -1 <= comp_idx < len(compressors):
         pass
@@ -3464,12 +3689,6 @@ def plot_compression_errors(dataset_file: str, where_to_write: str, field_to_com
     selected_serializer = serializers[ser_idx][1] if ser_idx != -1 else None
 
     chunks_size = 'auto'
-
-    if isinstance(selected_serializer, AnyNumcodecsArrayBytesCodec) and isinstance(selected_serializer.codec, EBCCZarrFilter):
-        da = da.astype("float32")
-        chunks_height = int(selected_serializer.codec.arglist[0])
-        chunks_width = int(selected_serializer.codec.arglist[1])
-        chunks_size = (chunks_height, chunks_width)
 
     filters_ = [selected_filter,]
     compressors_ = [selected_compressor,]

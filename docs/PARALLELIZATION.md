@@ -26,7 +26,7 @@ A common worry: "Python has a Global Interpreter Lock (the GIL), so threads can'
 
 This is *technically* true but *practically* irrelevant for our workload. The GIL only blocks Python code from running on multiple threads at the same time. It does **not** block code written in C/C++/Rust — and the heavy work in `dc_toolkit` is all in such libraries:
 
-- Compression itself (Blosc, zfp, EBCC, Quantize, BitRound, …) is C/C++ code that releases the GIL while compressing.
+- Compression itself (Blosc, zfp, Quantize, BitRound, …) is C/C++ code that releases the GIL while compressing.
 - numpy reductions used to compute error norms (L1/L2/L∞) are also C code that releases the GIL.
 - HDF5 / NetCDF / zarr file I/O releases the GIL during reads and writes.
 
@@ -86,7 +86,7 @@ So 32 is the right number for this hardware and workload. It's also coincidental
 
 ### Codec-internal threading (`--codec-threads`, default off)
 
-The codec libraries themselves can use multiple threads inside a single encode call (Blosc has built-in support; zfp/EBCC use OpenMP). The `--codec-threads N` flag exposes this. We tested it; it doesn't help on production-size files for the same memory-bandwidth reason. Leave at the default (1) unless you have a specific reason and can A/B-test the change.
+The codec libraries themselves can use multiple threads inside a single encode call (Blosc has built-in support; zfp uses OpenMP). The `--codec-threads N` flag exposes this. We tested it; it doesn't help on production-size files for the same memory-bandwidth reason. Leave at the default (1) unless you have a specific reason and can A/B-test the change.
 
 ### Summary for `evaluate_combos`
 

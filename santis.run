@@ -43,9 +43,9 @@
 #          do NOT enable --codec-threads, do NOT switch topology
 #          without a fresh A/B test against this baseline.
 #
-# Codec space: numcodecs-wasm and EBCC are off by default (~13k combos
-# instead of ~26k); the full lossy family is still covered via
-# numcodecs.zarr3.ZFPY + BitRound + Quantize.
+# Codec space: the lossy family is covered via numcodecs.zarr3.ZFPY +
+# BitRound + Quantize, plus the lossless compressors.  (EBCC and
+# numcodecs-wasm have been removed from the toolkit.)
 #
 # See docs/PARALLELIZATION.md for a thorough walkthrough of the
 # parallelism architecture used by every dc_toolkit command.
@@ -185,7 +185,7 @@ for i in "${!LIST[@]}"; do
          "$INPUT" \
          --where-to-write              "$OUTDIR" \
          --field-to-compress           "$VAR" \
-         --override-existing-l1-error  "$L1_THRESHOLD" \
+         --l1-threshold                "$L1_THRESHOLD" \
          "${EVAL_FLAGS[@]}" \
          2>&1 | stdbuf -oL -eL tee "$LOG"
 

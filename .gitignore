@@ -7,14 +7,9 @@ EBCC/
 venv/
 out-*
 *.csv
-# Exception: the L1 error threshold lookup table is the local fallback
-# used by `evaluate_combos` when the remote Google Sheet is unreachable.
-# It must be tracked despite the blanket *.csv rule above.
-!src/dc_toolkit/data/l1_error_thresholds.csv
 *.parquet
 *manifest*.json
 sample*.json
-res_folder_dyamond_*/
-dyamond_inventory_*/
-sweep_batches*/
-VAST_analysis/
+dyamond_inventory*/
+sweep_analysis*/
+VAST_analysis*/

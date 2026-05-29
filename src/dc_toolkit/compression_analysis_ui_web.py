@@ -248,8 +248,8 @@ if uploaded_file is not None and uploaded_file.name.endswith(".nc"):
 
     with st.expander("Advanced Selection", expanded=st.session_state.expander_state):
         options_compressor = ["all", "Blosc", "LZ4", "Zstd", "Zlib", "GZip", "BZ2", "LZMA", "None"]
-        options_filter = ["all", "Delta", "BitRound", "Quantize", "Asinh", "FixedOffsetScale", "None"]
-        options_serializer = ["all", "PCodec", "ZFPY", "EBCCZarrFilter", "Zfp", "Sperr", "Sz3", "None"]
+        options_filter = ["all", "Delta", "BitRound", "Quantize", "None"]
+        options_serializer = ["all", "PCodec", "ZFPY", "None"]
         options_with = ["with", "without"]
 
         col1, col2, col3 = st.columns(3)
@@ -269,19 +269,11 @@ if uploaded_file is not None and uploaded_file.name.endswith(".nc"):
                 "Choose a filter:",
                 options=options_filter,
             )
-            numcodecs_wasm_class = st.selectbox(
-                "Numcodecs-wasm:",
-                options=options_with,
-            )
 
         with col3:
             serializer_class = st.selectbox(
                 "Choose a serializer:",
                 options=options_serializer,
-            )
-            ebcc_class = st.selectbox(
-                "EBCC:",
-                options=options_with,
             )
 
 
@@ -299,8 +291,6 @@ if uploaded_file is not None and uploaded_file.name.endswith(".nc"):
         st.session_state.temp_plot_file = None
 
     with_lossy_option = "--with-lossy" if lossy_class == "with" else "--without-lossy"
-    with_numcodecs_option = "--with-numcodecs-wasm" if numcodecs_wasm_class == "with" else "--without-numcodecs-wasm"
-    with_ebcc_option = "--with-ebcc" if ebcc_class == "with" else "--without-ebcc"
 
     # create ./out dir if it doesn't exist, to place all generated files there
     if not os.path.exists("out"):
@@ -319,7 +309,7 @@ if uploaded_file is not None and uploaded_file.name.endswith(".nc"):
                 "--compressor-class="+compressor_class,
                 "--filter-class="+filter_class,
                 "--serializer-class="+serializer_class,
-                *[with_lossy_option, with_numcodecs_option, with_ebcc_option]
+                *[with_lossy_option]
             ]
         else:
             cmd_compress = [
@@ -334,8 +324,8 @@ if uploaded_file is not None and uploaded_file.name.endswith(".nc"):
                 "--compressor-class=" + compressor_class,
                 "--filter-class=" + filter_class,
                 "--serializer-class=" + serializer_class,
-                "--override-existing-l1-error=" + str(l1_error_class),
-                *[with_lossy_option, with_numcodecs_option, with_ebcc_option]
+                "--l1-threshold=" + str(l1_error_class),
+                *[with_lossy_option]
             ]
 
         st.info("Analyzing compressors...")
@@ -353,10 +343,8 @@ if uploaded_file is not None and uploaded_file.name.endswith(".nc"):
 
         pattern = r'--.*?-?'
         with_lossy = re.sub(pattern, '', with_lossy_option, count=1)
-        with_numcodesc_wasm = re.sub(pattern, '', with_numcodecs_option, count=1)
-        with_ebcc = re.sub(pattern, '', with_ebcc_option, count=1)
 
-        score_results_file_name = [field_to_compress, compressor_class, filter_class, serializer_class, with_lossy, with_numcodesc_wasm, with_ebcc]
+        score_results_file_name = [field_to_compress, compressor_class, filter_class, serializer_class, with_lossy]
         params_str = '_' + '_'.join(score_results_file_name)
         scored_results = load_scored_results(os.path.basename(tmp.name), params_str)
         scored_results_pd = pd.DataFrame(scored_results)
@@ -394,9 +382,7 @@ if uploaded_file is not None and uploaded_file.name.endswith(".nc"):
     if st.session_state.analysis_performed and st.session_state.temp_plot_file:
         plot_file_path = st.session_state.temp_plot_file
         with_lossy = "with_lossy" if lossy_class == "with" else "without_lossy"
-        with_numcodecs_wasm = "with_numcodecs_wasm" if numcodecs_wasm_class == "with" else "without_numcodecs_wasm"
-        with_ebcc = "with_ebcc" if ebcc_class == "with" else "without_ebcc"
-        cluster_results_file_name = [c for c in (field_to_compress, compressor_class, filter_class, serializer_class, with_lossy, with_numcodecs_wasm, with_ebcc)]
+        cluster_results_file_name = [c for c in (field_to_compress, compressor_class, filter_class, serializer_class, with_lossy)]
         params_str = '_' + '_'.join(cluster_results_file_name)
 
         with open(plot_file_path, "rb") as f:
@@ -414,16 +400,12 @@ if uploaded_file is not None and uploaded_file.name.endswith(".nc"):
     if st.button("Compress file"):
         da = xarray.open_dataset(path_to_modified_file)[field_to_compress]
         with_lossy = True if lossy_class == "with" else False
-        with_numcodecs_wasm = True if numcodecs_wasm_class == "with" else False
-        with_ebcc = True if ebcc_class == "with" else False
 
         compressors_options = utils.compressor_space(da=da, with_lossy=with_lossy,
-                                                     with_numcodecs_wasm=with_numcodecs_wasm, with_ebcc=with_ebcc,
                                                      compressor_class=compressor_class)
-        filters_options = utils.filter_space(da=da, with_lossy=with_lossy, with_numcodecs_wasm=with_numcodecs_wasm,
-                                             with_ebcc=with_ebcc, filter_class=filter_class)
+        filters_options = utils.filter_space(da=da, with_lossy=with_lossy,
+                                             filter_class=filter_class)
         serializers_options = utils.serializer_space(da=da, with_lossy=with_lossy,
-                                                     with_numcodecs_wasm=with_numcodecs_wasm, with_ebcc=with_ebcc,
                                                      serializer_class=serializer_class)
 
         max_compressor_value = len(compressors_options)
@@ -477,7 +459,7 @@ if uploaded_file is not None and uploaded_file.name.endswith(".nc"):
                 temp_dir,
                 field_to_compress,
                 str(comp_idx), str(filt_idx), str(ser_idx),
-                *[with_lossy_option, with_numcodecs_option, with_ebcc_option]
+                *[with_lossy_option]
             ]
 
             before = set(os.listdir(temp_dir))
