@@ -512,7 +512,7 @@ def _signature_path(where_to_write: str, var: str) -> Path:
 _L2_MULT_DEFAULT   = 2.0    # RMS may run ~2x the mean-abs budget (heavy tails)
 _LINF_MULT_DEFAULT = 10.0   # single-cell trip-wire; well-behaved codecs ~2-8x
 _BIAS_MULT_DEFAULT = 0.5    # at most half the budget may be one-directional
-_Q99_MULT_DEFAULT  = 5.0    # extreme-tail error allowance vs the L1 budget
+_Q99_MULT_DEFAULT  = 2.0    # extreme-tail error allowance vs the L1 budget
 
 
 def _derive_thresholds(
@@ -650,7 +650,7 @@ def _evaluate_gates(
 @click.option("--q99-threshold", type=float, default=None,
               help="Relative error budget over the extreme tail (cells with "
                    "|value| >= the 99th percentile of |field|). Only active "
-                   "with --extremes-sensitive. Default: 5 x --l1-threshold.")
+                   "with --extremes-sensitive. Default: 2 x --l1-threshold.")
 @click.option("--l2-gate/--no-l2-gate", default=True, show_default=True,
               help="Enable the L2 gate.")
 @click.option("--linf-gate/--no-linf-gate", default=True, show_default=True,

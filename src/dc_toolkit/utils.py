@@ -7,6 +7,7 @@
 # SPDX-License-Identifier: BSD-3-Clause
 import os
 import math
+import warnings
 import click
 import humanize
 import threading
@@ -1379,7 +1380,14 @@ async def _zarr_pipeline_async(sample_np, dims, codec_kwargs, chunks):
         )
 
     with Timer("eval.encode"):
-        await z.setitem(Ellipsis, sample_np)
+        # See _zarr_pipeline_sync: suppress only the benign NaN-fill cast warning.
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message="invalid value encountered in cast",
+                category=RuntimeWarning,
+            )
+            await z.setitem(Ellipsis, sample_np)
 
     with Timer("eval.info_complete"):
         info = await z.info_complete()
@@ -1409,7 +1417,19 @@ def _zarr_pipeline_sync(sample_np, dims, codec_kwargs, chunks):
         )
 
     with Timer("eval.encode"):
-        z[...] = sample_np
+        # FixedScaleOffset casts NaN-fill cells to int, which numpy flags as
+        # "invalid value encountered in cast".  This is benign: fill cells are
+        # masked out of every error norm downstream, so the garbage ints never
+        # affect scoring.  Suppress ONLY this specific message -- a genuine FSO
+        # overflow does NOT warn (numpy wraps silently; that path is guarded by
+        # full_field_data_range + the verify gate), so nothing real is hidden.
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message="invalid value encountered in cast",
+                category=RuntimeWarning,
+            )
+            z[...] = sample_np
 
     with Timer("eval.info_complete"):
         info = z.info_complete()
@@ -1722,14 +1742,23 @@ def persist_with_codec_pipeline(
         zarr_kwargs["shards"] = shards
 
     with Timer("dask.array.to_zarr"):
-        dask.array.to_zarr(
-            dask_arr,
-            store,
-            component=component,
-            overwrite=True,     # dask-level kwarg; NOT forwarded to zarr.create_array
-            compute=True,
-            **zarr_kwargs,
-        )
+        # See _zarr_pipeline_sync: FixedScaleOffset casts NaN-fill to int and
+        # numpy warns benignly; fill is masked out of the verify norms. Suppress
+        # only that specific message (overflow is silent + guarded elsewhere).
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message="invalid value encountered in cast",
+                category=RuntimeWarning,
+            )
+            dask.array.to_zarr(
+                dask_arr,
+                store,
+                component=component,
+                overwrite=True,     # dask-level kwarg; NOT forwarded to zarr.create_array
+                compute=True,
+                **zarr_kwargs,
+            )
 
     # Reopen the written array and compute stats.  Read-only by design:
     # only info_complete() and the verification read follow, neither writes.
