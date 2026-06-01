@@ -844,8 +844,16 @@ _QUANTIZE_DIGITS_F64   = (1, 3, 4, 5, 6, 7, 9, 11, 13, 15)  # dropped 2 (adjacen
 # ---- FixedScaleOffset target integer widths (array -> array, data-dependent) -
 # The field's [min, max] is mapped onto the full range of each integer width.
 # More bits -> finer absolute precision (less lossy) but larger encoded ints.
-# u8 is very lossy (256 levels), u32 is effectively lossless for f32 inputs.
-_FSO_TARGET_UINTS      = ("uint8", "uint16", "uint32")
+# uint32 is effectively lossless for f32 inputs.
+#
+# uint8 is intentionally EXCLUDED: it has no viable serializer in this toolkit.
+# ZFPY is rejected for all FSO by combo_is_valid (integer-mode crash), and
+# PCodec refuses 8-bit input outright ("compressing 8-bit types with Pco is
+# often a mistake").  An empirical trial on pres_msl confirmed every
+# uint8-FSO->PCodec combo crashed (264 guaranteed failures/field) with zero
+# usable output, while 256 levels is too coarse to pass a sub-1% gate anyway.
+# Dropping it removes the failures at no loss of any viable combo.
+_FSO_TARGET_UINTS      = ("uint16", "uint32")
 
 # ---- Serializer parameter grids (array -> bytes) ----------------------------
 _PCODEC_LEVELS         = (6, 8, 10, 12)      # dropped 4; dropped 0 ("no compression")
@@ -1166,21 +1174,33 @@ def combo_is_valid(filt, serializer):
     meaningless, so the product builder can skip them instead of paying for a
     guaranteed per-combo failure.
 
-    Currently: a FixedScaleOffset filter emits an UNSIGNED-INTEGER array, and
-    feeding that to a ZFPY serializer in anything other than fixed-rate mode
-    crashes inside numcodecs' zfpy backend (it lacks the integer-mode encode
-    path and raises AttributeError: 'ZFPY' object has no attribute
-    'compression_kwargs').  ZFPY's own integer support is fixed-rate only.
-    Since serializer_space derives its ZFPY mode from the ORIGINAL float dtype
-    (so all three modes are present), we must reject FSO->ZFPY combos here at
-    the pairing level.  PCodec handles the integer output natively, so
-    FixedScaleOffset->PCodec is allowed and is the intended integer pairing.
+    1. FixedScaleOffset emits an UNSIGNED-INTEGER array.  Feeding that to a
+       ZFPY serializer in anything other than fixed-rate mode crashes inside
+       numcodecs' zfpy backend (AttributeError: 'ZFPY' object has no attribute
+       'compression_kwargs'); ZFPY's integer support is fixed-rate only, but
+       serializer_space derives its ZFPY mode from the ORIGINAL float dtype
+       (all three modes present), so FSO->ZFPY must be rejected here.  PCodec
+       handles integer output natively, so FSO->PCodec is the intended pairing.
+
+    2. An 8-bit (uint8) FixedScaleOffset output -> PCodec also crashes: PCodec
+       refuses 8-bit input ("compressing 8-bit types with Pco is often a
+       mistake").  uint8 is excluded from _FSO_TARGET_UINTS for this reason, so
+       this branch is belt-and-suspenders should the grid ever be widened.
 
     AsType(encode='float32') keeps the data floating, so it is unaffected.
     """
-    if isinstance(filt, zarrcodecs_nc.FixedScaleOffset) and \
-       isinstance(serializer, zarrcodecs_nc.ZFPY):
-        return False
+    if isinstance(filt, zarrcodecs_nc.FixedScaleOffset):
+        # FSO -> ZFPY: integer-mode crash.
+        if isinstance(serializer, zarrcodecs_nc.ZFPY):
+            return False
+        # 8-bit FSO -> PCodec: PCodec rejects 8-bit input.
+        if isinstance(serializer, zarrcodecs_nc.PCodec):
+            astype = None
+            cfg = getattr(filt, "codec_config", None)
+            if isinstance(cfg, dict):
+                astype = cfg.get("astype")
+            if astype is not None and np.dtype(astype).itemsize == 1:
+                return False
     return True
 
 
