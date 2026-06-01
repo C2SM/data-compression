@@ -20,9 +20,8 @@ import dask.array
 import pandas as pd
 import xarray as xr
 import zarr
-from zarr_any_numcodecs import AnyNumcodecsArrayArrayCodec, AnyNumcodecsArrayBytesCodec
 import numcodecs
-import numcodecs.zarr3
+from zarr.codecs import numcodecs as zarrcodecs_nc  # zarr-native codecs (replaces deprecated numcodecs.zarr3)
 import zfpy
 from mpi4py import MPI
 import time
@@ -841,6 +840,12 @@ _BITROUND_KEEPBITS_F64 = (3, 7, 11, 17, 23, 30, 37, 44, 52) # dropped 5, 9, 13 (
 _QUANTIZE_DIGITS_F32   = (1, 3, 4, 5, 6, 7)                 # dropped 2 (adjacent-redundant); 7 -> ~lossless
 _QUANTIZE_DIGITS_F64   = (1, 3, 4, 5, 6, 7, 9, 11, 13, 15)  # dropped 2 (adjacent-redundant); 15 -> ~lossless
 
+# ---- FixedScaleOffset target integer widths (array -> array, data-dependent) -
+# The field's [min, max] is mapped onto the full range of each integer width.
+# More bits -> finer absolute precision (less lossy) but larger encoded ints.
+# u8 is very lossy (256 levels), u32 is effectively lossless for f32 inputs.
+_FSO_TARGET_UINTS      = ("uint8", "uint16", "uint32")
+
 # ---- Serializer parameter grids (array -> bytes) ----------------------------
 _PCODEC_LEVELS         = (6, 8, 10, 12)      # dropped 4; dropped 0 ("no compression")
 _PCODEC_DELTA_ORDERS   = (0, 7)              # dropped 3 (middle); endpoints cover delta-mode space
@@ -853,16 +858,26 @@ def compressor_space(da, with_lossy=True, compressor_class="all"):
     """
     Bytes->bytes compressor space.  Data-independent: the `da` argument is
     accepted only for signature symmetry with filter_space / serializer_space,
-    and the lossy flag is also ignored here (every codec in
-    this space is lossless).  Returns [(index, codec), ...].
+    and the lossy flag is ignored (every codec here is lossless).
+    Returns [(index, codec), ...].
+
+    Byte-shuffle note: a STANDALONE numcodecs Shuffle codec cannot be used in
+    this pipeline.  Shuffle is a bytes->bytes codec that requires its input
+    length to be an exact multiple of `elementsize`; in Zarr v3 the bytes->bytes
+    stage runs AFTER the array->bytes serializer, so with a compressing
+    serializer (ZFPY / PCodec) Shuffle receives an already-compressed,
+    variable-length blob and raises "buffer is not an integer multiple of
+    elementsize".  The byte-shuffle transform is instead obtained via Blosc's
+    own `shuffle` parameter (swept in _BLOSC_SHUFFLES), which is the supported
+    way to byte-shuffle in Zarr v3.
 
     Note: standalone GZip has been removed from the space.  GZip and Zlib
     both run DEFLATE with different wrapping headers, so they produce
     identical CR for identical input; keeping both was strict redundancy.
     """
     _COMPRESSORS = [
-        numcodecs.zarr3.Blosc, numcodecs.zarr3.LZ4, numcodecs.zarr3.Zstd,
-        numcodecs.zarr3.Zlib, numcodecs.zarr3.BZ2, numcodecs.zarr3.LZMA,
+        zarrcodecs_nc.Blosc, zarrcodecs_nc.LZ4, zarrcodecs_nc.Zstd,
+        zarrcodecs_nc.Zlib, zarrcodecs_nc.BZ2, zarrcodecs_nc.LZMA,
     ]
     _COMPRESSOR_MAP = {cls.__name__.lower(): cls for cls in _COMPRESSORS}
 
@@ -876,43 +891,56 @@ def compressor_space(da, with_lossy=True, compressor_class="all"):
         space.append(None)
 
     for compressor in _COMPRESSORS:
-        if compressor is numcodecs.zarr3.Blosc:
+        if compressor is zarrcodecs_nc.Blosc:
             for cname in _BLOSC_CNAMES:
                 for clevel in _BLOSC_CLEVELS:
                     for shuffle in _BLOSC_SHUFFLES:
                         space.append(compressor(cname=cname, clevel=clevel, shuffle=shuffle))
-        elif compressor is numcodecs.zarr3.LZ4:
+        elif compressor is zarrcodecs_nc.LZ4:
             for acceleration in _LZ4_ACCELERATIONS:
                 space.append(compressor(acceleration=acceleration))
-        elif compressor is numcodecs.zarr3.Zstd:
+        elif compressor is zarrcodecs_nc.Zstd:
             for level in _ZSTD_LEVELS:
                 space.append(compressor(level=level))
-        elif compressor is numcodecs.zarr3.Zlib:
+        elif compressor is zarrcodecs_nc.Zlib:
             for level in _ZLIB_LEVELS:
                 space.append(compressor(level=level))
-        elif compressor is numcodecs.zarr3.BZ2:
+        elif compressor is zarrcodecs_nc.BZ2:
             for level in _BZ2_LEVELS:
                 space.append(compressor(level=level))
-        elif compressor is numcodecs.zarr3.LZMA:
+        elif compressor is zarrcodecs_nc.LZMA:
             for preset in _LZMA_PRESETS:
                 space.append(compressor(preset=preset))
 
     return list(enumerate(space))
 
 
-def filter_space(da, with_lossy=True, filter_class="all"):
+def filter_space(da, with_lossy=True, filter_class="all", data_range=None):
     """
     Array->array filter space.  For integer dtypes only Delta is meaningful
     (BitRound/Quantize are float-only).  If the user asks for a filter class
     that is incompatible with the dtype, we warn explicitly rather than
     silently honouring the dtype override.
 
+    `data_range`: optional (global_min, global_max) of the FULL field, used to
+    build FixedScaleOffset's affine integer packing.  Pass the true full-field
+    extremes here whenever `da` is only a strided evaluation sample, so the
+    uint packing cannot overflow on production values outside the sample range.
+    If None, FixedScaleOffset falls back to the min/max of `da` (safe only when
+    `da` is the whole field).
+
     Returns [(index, codec), ...].
     """
     is_int = (da.dtype.kind == "i")
-    _FILTERS = [numcodecs.zarr3.Delta]
+    _FILTERS = [zarrcodecs_nc.Delta]
     if with_lossy:
-        _FILTERS += [numcodecs.zarr3.BitRound, numcodecs.zarr3.Quantize]
+        _FILTERS += [zarrcodecs_nc.BitRound, zarrcodecs_nc.Quantize,
+                     zarrcodecs_nc.FixedScaleOffset]
+        # AsType down-cast is only meaningful when the field is WIDER than
+        # 32-bit float (e.g. f64 -> f32).  For already-32-bit fields there is
+        # nothing to narrow, so it is not added.
+        if np.issubdtype(da.dtype, np.floating) and da.dtype.itemsize > 4:
+            _FILTERS.append(zarrcodecs_nc.AsType)
     if is_int:
         # Integer fields: only Delta is algorithmically meaningful.  Surface
         # the override to the user instead of silently dropping their
@@ -923,7 +951,7 @@ def filter_space(da, with_lossy=True, filter_class="all"):
                 f"available; ignoring --filter-class={filter_class}.",
                 err=True,
             )
-        _FILTERS = [numcodecs.zarr3.Delta]
+        _FILTERS = [zarrcodecs_nc.Delta]
 
     _FILTER_MAP = {cls.__name__.lower(): cls for cls in _FILTERS}
 
@@ -937,15 +965,22 @@ def filter_space(da, with_lossy=True, filter_class="all"):
         space.append(None)
 
     for filt in _FILTERS:
-        if filt is numcodecs.zarr3.Delta:
+        if filt is zarrcodecs_nc.Delta:
             if np.issubdtype(da.dtype, np.number):
                 space.append(filt(dtype=str(da.dtype)))
-        elif filt is numcodecs.zarr3.BitRound:
+        elif filt is zarrcodecs_nc.BitRound:
             for keepbits in valid_keepbits_for_bitround(da):
                 space.append(filt(keepbits=keepbits))
-        elif filt is numcodecs.zarr3.Quantize:
+        elif filt is zarrcodecs_nc.Quantize:
             for digits in valid_digits_for_quantize(da):
                 space.append(filt(digits=digits, dtype=str(da.dtype)))
+        elif filt is zarrcodecs_nc.FixedScaleOffset:
+            for cfg in fixed_scale_offset_configs(da, data_range=data_range):
+                space.append(filt(**cfg))
+        elif filt is zarrcodecs_nc.AsType:
+            # Down-cast wider floats to float32 as a cheap ~2x lossy pre-step.
+            # encode_dtype is the narrowed type; decode_dtype is the original.
+            space.append(filt(encode_dtype="float32", decode_dtype=str(da.dtype)))
 
     return list(enumerate(space))
 
@@ -961,9 +996,9 @@ def serializer_space(da, with_lossy=True, serializer_class="all"):
     Returns [(index, codec), ...].
     """
     is_int = (da.dtype.kind == "i")
-    _SERIALIZERS = [numcodecs.zarr3.PCodec]
+    _SERIALIZERS = [zarrcodecs_nc.PCodec]
     if with_lossy:
-        _SERIALIZERS.append(numcodecs.zarr3.ZFPY)
+        _SERIALIZERS.append(zarrcodecs_nc.ZFPY)
 
     _SERIALIZER_MAP = {cls.__name__.lower(): cls for cls in _SERIALIZERS}
 
@@ -977,14 +1012,14 @@ def serializer_space(da, with_lossy=True, serializer_class="all"):
         space.append(None)
 
     for serializer in _SERIALIZERS:
-        if serializer is numcodecs.zarr3.PCodec:
+        if serializer is zarrcodecs_nc.PCodec:
             for level in _PCODEC_LEVELS:
                 for delta_encoding_order in _PCODEC_DELTA_ORDERS:
                     space.append(serializer(
                         level=level, mode_spec="auto",
                         delta_spec="auto", delta_encoding_order=delta_encoding_order,
                     ))
-        elif serializer is numcodecs.zarr3.ZFPY:
+        elif serializer is zarrcodecs_nc.ZFPY:
             _ZFP_MODES = [
                 ("fixed-accuracy",  zfpy.mode_fixed_accuracy,  "tolerance", compute_fixed_accuracy_param),
                 ("fixed-precision", zfpy.mode_fixed_precision, "precision", compute_fixed_precision_param),
@@ -1024,6 +1059,128 @@ def valid_digits_for_quantize(xr_dataarray):
         raise TypeError(
             f"Unsupported dtype '{dtype}'. Quantize only supports float32 and float64."
         )
+
+
+def full_field_data_range(da):
+    """
+    Compute the finite (global_min, global_max) over the ENTIRE field, for use
+    as FixedScaleOffset's affine anchor.  This is a single streaming reduction
+    (no compression), far cheaper than the codec sweep, and parallelises over
+    dask chunks.  Returns None if the field has no finite values or is
+    constant (in which case FixedScaleOffset is not applicable anyway).
+
+    Computed once (e.g. on rank 0) and broadcast to all ranks so the codec
+    space is identical everywhere and reproducible in compress_with_optimal.
+    """
+    import dask.array as _dask_array
+    data = da.data if hasattr(da, "data") else np.asarray(da)
+    try:
+        if isinstance(data, _dask_array.Array):
+            finite = _dask_array.isfinite(data)
+            # masked reductions; nan-aware min/max over finite entries only
+            mn = _dask_array.where(finite, data, np.inf).min()
+            mx = _dask_array.where(finite, data, -np.inf).max()
+            dmin = float(mn.compute())
+            dmax = float(mx.compute())
+        else:
+            arr = np.asarray(data)
+            fin = arr[np.isfinite(arr)]
+            if fin.size == 0:
+                return None
+            dmin = float(fin.min())
+            dmax = float(fin.max())
+    except Exception:
+        return None
+    if not (np.isfinite(dmin) and np.isfinite(dmax)) or dmax <= dmin:
+        return None
+    return (dmin, dmax)
+
+
+def fixed_scale_offset_configs(xr_dataarray, data_range=None):
+    """
+    Build FixedScaleOffset (offset, scale, astype) tuples that map the field's
+    [min, max] onto the full range of each target unsigned-integer width.
+
+    Encode is round((x - offset) * scale); to fill [0, 2**bits - 1] we use
+    offset = data_min and scale = (2**bits - 1) / (data_max - data_min).
+
+    CRITICAL - range source.  FixedScaleOffset packs floats into unsigned
+    integers anchored to [data_min, data_max].  numcodecs does NO overflow
+    clipping (see its docstring warning), so a production value OUTSIDE the
+    range used to build the codec encodes to a negative or too-large integer
+    and silently CORRUPTS on the unsigned cast.  The range therefore MUST cover
+    the WHOLE field, not just the strided evaluation sample (which may miss the
+    global extremes on un-sampled timesteps/levels).
+
+      - `data_range=(global_min, global_max)`: use these true full-field
+        extremes (the correct production path; caller computes them once over
+        the full dask array and threads them through filter_space).
+      - `data_range=None`: fall back to the min/max of `xr_dataarray` itself.
+        Only safe when that array IS the full field (e.g. small fields that
+        fit under the eval-data-size-limit, or unit tests).  A WARNING-worthy
+        path for strided samples; callers that have the full field should
+        always pass `data_range`.
+
+    Returns [] for constant / non-finite fields (no usable range) and skips
+    integer widths that cannot improve on the source itemsize.  dtype is the
+    decoded (original) dtype.
+    """
+    dtype = xr_dataarray.dtype
+    if not np.issubdtype(dtype, np.floating):
+        return []
+
+    if data_range is not None:
+        dmin, dmax = float(data_range[0]), float(data_range[1])
+    else:
+        # Fallback: derive from the given array (valid only if it is the full
+        # field).  Finite values only.
+        arr = np.asarray(xr_dataarray.values)
+        finite = arr[np.isfinite(arr)]
+        if finite.size == 0:
+            return []
+        dmin = float(finite.min())
+        dmax = float(finite.max())
+
+    span = dmax - dmin
+    if not (np.isfinite(dmin) and np.isfinite(dmax)) or span <= 0.0:
+        # constant / non-finite field: nothing for an affine packer to do
+        return []
+
+    src_itemsize = dtype.itemsize
+    configs = []
+    for uw in _FSO_TARGET_UINTS:
+        bits = np.dtype(uw).itemsize * 8
+        # Only worth it if the packed integer is smaller than the source value.
+        if np.dtype(uw).itemsize >= src_itemsize:
+            continue
+        scale = (float(2 ** bits) - 1.0) / span
+        configs.append(dict(offset=dmin, scale=scale,
+                            dtype=str(dtype), astype=uw))
+    return configs
+
+
+def combo_is_valid(filt, serializer):
+    """
+    Reject (filter, serializer) pairings that are known to be broken or
+    meaningless, so the product builder can skip them instead of paying for a
+    guaranteed per-combo failure.
+
+    Currently: a FixedScaleOffset filter emits an UNSIGNED-INTEGER array, and
+    feeding that to a ZFPY serializer in anything other than fixed-rate mode
+    crashes inside numcodecs' zfpy backend (it lacks the integer-mode encode
+    path and raises AttributeError: 'ZFPY' object has no attribute
+    'compression_kwargs').  ZFPY's own integer support is fixed-rate only.
+    Since serializer_space derives its ZFPY mode from the ORIGINAL float dtype
+    (so all three modes are present), we must reject FSO->ZFPY combos here at
+    the pairing level.  PCodec handles the integer output natively, so
+    FixedScaleOffset->PCodec is allowed and is the intended integer pairing.
+
+    AsType(encode='float32') keeps the data floating, so it is unaffected.
+    """
+    if isinstance(filt, zarrcodecs_nc.FixedScaleOffset) and \
+       isinstance(serializer, zarrcodecs_nc.ZFPY):
+        return False
+    return True
 
 
 def compute_fixed_precision_param(param: int) -> int:  return 1 << (param + 3)

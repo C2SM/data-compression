@@ -11,5 +11,5 @@ out-*
 *manifest*.json
 sample*.json
 dyamond_inventory*/
-sweep_analysis*/
+sweep*/
 VAST_analysis*/

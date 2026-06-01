@@ -21,10 +21,9 @@ import csv
 import click
 import zarr
 import numcodecs
-import numcodecs.zarr3
+from zarr.codecs import numcodecs as zarrcodecs_nc  # zarr-native codecs (replaces deprecated numcodecs.zarr3)
 import xarray as xr
 from dc_toolkit import utils
-from zarr_any_numcodecs import AnyNumcodecsArrayBytesCodec
 import pandas as pd
 import numpy as np
 from mpi4py import MPI
@@ -84,7 +83,7 @@ def _size_option_callback(ctx, param, value):
 
 
 def _is_zfpy_serializer(serializer) -> bool:
-    return isinstance(serializer, numcodecs.zarr3.ZFPY)
+    return isinstance(serializer, zarrcodecs_nc.ZFPY)
 
 
 def _merged_store_path(where_to_write: str, dataset_file: str) -> str:
@@ -1006,14 +1005,22 @@ def evaluate_combos(dataset_file,
                     "attrs": dict(sample_da_local.attrs),
                     "name":  sample_da_local.name,
                 }
+                # Global (full-field) finite min/max for FixedScaleOffset's
+                # affine packing.  MUST come from the whole field, not the
+                # strided sample, or the uint packing can overflow on
+                # production values outside the sampled range.  Cheap reduction
+                # (no compression); computed once here and broadcast below.
+                fso_data_range = utils.full_field_data_range(da)
             else:
                 sample_np_local = None
                 sample_meta = None
+                fso_data_range = None
 
             # Bcast the numpy buffer via MPI's buffer protocol.  bcast() the small
             # metadata dict via pickle (dims + attrs are tiny).
             sample_np  = utils.broadcast_numpy(sample_np_local, comm=comm, root=0)
             sample_meta = comm.bcast(sample_meta, root=0)
+            fso_data_range = comm.bcast(fso_data_range, root=0)
 
             # Free the rank-0 duplicate ASAP so we fall from 2x transient to 1x
             # steady state.  The broadcast has already committed the bytes to
@@ -1065,11 +1072,27 @@ def evaluate_combos(dataset_file,
             # must use the same --eval-data-size-limit to reproduce these objects).
             # -------------------------------------------------------------------------
             compressors = utils.compressor_space(sample_da, with_lossy, compressor_class)
-            filters     = utils.filter_space(sample_da, with_lossy, filter_class)
+            filters     = utils.filter_space(sample_da, with_lossy, filter_class,
+                                             data_range=fso_data_range)
             serializers = utils.serializer_space(sample_da, with_lossy, serializer_class)
 
             num_loops = len(compressors) * len(filters) * len(serializers)
-            config_space = list(itertools.product(compressors, filters, serializers))
+            # Skip pairings known to be broken (e.g. FixedScaleOffset->ZFPY:
+            # FSO emits uint, ZFPY's non-fixed-rate modes crash on integers).
+            # combo_is_valid keeps the (compressor, filter, serializer) tuple
+            # iff the filter/serializer pairing is supported.
+            config_space = [
+                (c, f, s)
+                for (c, f, s) in itertools.product(compressors, filters, serializers)
+                if utils.combo_is_valid(f[1], s[1])
+            ]
+            _skipped = num_loops - len(config_space)
+            if _skipped and rank == 0:
+                click.echo(
+                    f"[combo-filter] skipped {_skipped} unsupported "
+                    f"filter/serializer pairing(s) (e.g. FixedScaleOffset->ZFPY)."
+                )
+            num_loops = len(config_space)
             # --max-evals: optional global cap for quick test runs.  Applied
             # BEFORE the rank partition so all ranks see the same truncated
             # space and the partition (configs[rank::size]) divides it evenly.
@@ -1215,7 +1238,11 @@ def evaluate_combos(dataset_file,
                 local_comp_idx = comp_idx
                 local_ser_idx = ser_idx
 
-                if isinstance(serializer_, AnyNumcodecsArrayBytesCodec) or filt is None:
+                # filters=[None] is malformed; collapse an absent filter to None.
+                # (The legacy AnyNumcodecsArrayBytesCodec serializer guard was
+                # removed: this toolkit uses only native zarr.codecs.numcodecs
+                # serializers, which accept a separate filter stage.)
+                if filt is None:
                     filters_ = None
                     filt = None
                     local_filt_idx = -1
@@ -2070,8 +2097,15 @@ def compress_with_optimal(dataset_file, where_to_write, field_to_compress,
                 f"first with the same --where-to-write.)"
             )
 
+        # Full-field range for FixedScaleOffset, computed once on rank 0 and
+        # broadcast so it is IDENTICAL to the value evaluate_combos used (the
+        # FSO winner's offset/scale must reproduce exactly, or the persisted
+        # output is encoded with a different mapping than was measured).
+        fso_data_range = utils.full_field_data_range(da) if rank == 0 else None
+        fso_data_range = comm.bcast(fso_data_range, root=0)
         compressors = utils.compressor_space(sample_for_codec_space, with_lossy, compressor_class)
-        filters     = utils.filter_space(sample_for_codec_space, with_lossy, filter_class)
+        filters     = utils.filter_space(sample_for_codec_space, with_lossy, filter_class,
+                                         data_range=fso_data_range)
         serializers = utils.serializer_space(sample_for_codec_space, with_lossy, serializer_class)
 
         # Index validation
@@ -2096,7 +2130,7 @@ def compress_with_optimal(dataset_file, where_to_write, field_to_compress,
         filters_ = [optimal_filter]
         compressors_ = [optimal_compressor]
         serializer_ = optimal_serializer
-        if isinstance(serializer_, AnyNumcodecsArrayBytesCodec) or optimal_filter is None:
+        if optimal_filter is None:   # filters=[None] is malformed; native serializers take a filter stage
             filters_ = None
         if optimal_compressor is None:
             compressors_ = None
@@ -2725,11 +2759,16 @@ def compress_fields_from_results(dataset_file, where_to_write, vars_filter,
                             f"[sample-hash] WARNING {var}: {sig_err}; proceeding."
                         )
 
+                # Full-field range for FixedScaleOffset (must match the value
+                # used during evaluate_combos so the FSO winner reproduces
+                # identically).  Single-process here -> compute directly.
+                fso_data_range = utils.full_field_data_range(da)
                 compressors = utils.compressor_space(
                     sample_for_codec_space, with_lossy, compressor_class,
                 )
                 filters_space = utils.filter_space(
                     sample_for_codec_space, with_lossy, filter_class,
+                    data_range=fso_data_range,
                 )
                 serializers = utils.serializer_space(
                     sample_for_codec_space, with_lossy, serializer_class,
@@ -2755,7 +2794,7 @@ def compress_fields_from_results(dataset_file, where_to_write, vars_filter,
                 filters_ = [optimal_filter]
                 compressors_ = [optimal_compressor]
                 serializer_ = optimal_serializer
-                if isinstance(serializer_, AnyNumcodecsArrayBytesCodec) or optimal_filter is None:
+                if optimal_filter is None:   # filters=[None] is malformed; native serializers take a filter stage
                     filters_ = None
                 if optimal_compressor is None:
                     compressors_ = None
@@ -3682,7 +3721,10 @@ def plot_compression_errors(dataset_file: str, where_to_write: str, field_to_com
         comm.Abort(1)
 
     compressors = utils.compressor_space(da, with_lossy, compressor_class)
-    filters = utils.filter_space(da, with_lossy, filter_class)
+    # `da` here IS the full field (<=2.5 GiB, no sampling), so its own min/max
+    # is the true global range; pass it explicitly for clarity/consistency.
+    filters = utils.filter_space(da, with_lossy, filter_class,
+                                 data_range=utils.full_field_data_range(da))
     serializers = utils.serializer_space(da, with_lossy, serializer_class)
 
     if -1 <= comp_idx < len(compressors):
@@ -3711,7 +3753,7 @@ def plot_compression_errors(dataset_file: str, where_to_write: str, field_to_com
     compressors_ = [selected_compressor,]
     serializer_ = selected_serializer
 
-    if isinstance(serializer_, AnyNumcodecsArrayBytesCodec) or selected_filter is None:
+    if selected_filter is None:   # filters=[None] is malformed; native serializers take a filter stage
         filters_ = None
     if selected_compressor is None:
         compressors_ = None
@@ -3733,7 +3775,7 @@ def plot_compression_errors(dataset_file: str, where_to_write: str, field_to_com
     shifted_da_backshifted = shifted_da.roll({lon_dim: half_idx}, roll_coords=False)
 
     # Flatten data for ZFPY serializer
-    if isinstance(selected_serializer, numcodecs.zarr3.ZFPY):
+    if isinstance(selected_serializer, zarrcodecs_nc.ZFPY):
         # Save the original dims BEFORE mutating `da`.  Using `da.dims` on the
         # second stack call after the first one runs would read the stacked
         # shape (`("flat_dim",)`), so xarray would try to stack `shifted_da`
@@ -3781,7 +3823,7 @@ def plot_compression_errors(dataset_file: str, where_to_write: str, field_to_com
     shifted_da_decompressed = xr.DataArray(shifted_da_compressed[:], dims=da.dims, coords=da.coords)
 
     # Reshape the data to its original dimensions for ZFPY serializer
-    if isinstance(selected_serializer, numcodecs.zarr3.ZFPY):
+    if isinstance(selected_serializer, zarrcodecs_nc.ZFPY):
         da = da.unstack("flat_dim")
         shifted_da = shifted_da.unstack("flat_dim")
         da_decompressed = da_decompressed.unstack("flat_dim")
