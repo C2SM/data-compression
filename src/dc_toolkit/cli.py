@@ -585,6 +585,36 @@ def _evaluate_gates(
     return keep, reasons
 
 
+def _evaluate_cr_drift(production_ratio, predicted_ratio, tol):
+    """Compare achieved vs predicted compression ratio.
+
+    The verify gate (``_evaluate_gates``) bounds the production *error*
+    against the manifest thresholds.  It says nothing about whether the
+    achieved compression *ratio* matches what the sweep predicted.  A
+    regime-shifted file (e.g. a storm-day humidity field the mid-run sample
+    didn't represent) can pass every error gate yet compress far worse than
+    predicted, silently wasting storage.  This is the ratio counterpart.
+
+    Returns (ok, drift, direction):
+      - drift     = signed relative change, (production - predicted)/predicted.
+                    Negative => compressed WORSE than predicted (storage risk).
+      - direction = "ok" | "under" (shortfall) | "over" (beat prediction) |
+                    "skip" (no/invalid prediction).
+      - ok        = abs(drift) <= tol, or True when not applicable.
+
+    The sign is returned so the caller can fail only on shortfalls and treat
+    pleasant surprises as informational.
+    """
+    if (predicted_ratio is None or production_ratio is None
+            or not math.isfinite(predicted_ratio) or predicted_ratio <= 0
+            or not math.isfinite(production_ratio)):
+        return True, None, "skip"
+    drift = (production_ratio - predicted_ratio) / predicted_ratio
+    if abs(drift) <= tol:
+        return True, drift, "ok"
+    return False, drift, ("under" if drift < 0 else "over")
+
+
 @cli.command("evaluate_combos")
 @click.argument("dataset_file", type=click.Path(exists=True, dir_okay=True, file_okay=True))
 @click.option("--where-to-write", "where_to_write", required=True,
@@ -2466,6 +2496,20 @@ def compress_with_optimal(dataset_file, where_to_write, field_to_compress,
                    "manifest_{var}.json. Honors --continue-on-error (a gate "
                    "failure is treated like any other per-field error). Pass "
                    "--no-verify-gate to keep verification advisory.")
+@click.option("--cr-drift-tol", type=click.FloatRange(0.0, 10.0), default=0.25,
+              show_default=True,
+              help="Allowed fractional drift between the achieved compression "
+                   "ratio and the manifest's predicted ratio before the "
+                   "CR-drift check flags a field (0.25 = 25%). Only meaningful "
+                   "when --verify is on.")
+@click.option("--cr-drift-gate/--no-cr-drift-gate", default=False,
+              show_default=True,
+              help="When set, a compression-ratio SHORTFALL beyond "
+                   "--cr-drift-tol raises (hard reject, honors "
+                   "--continue-on-error). Default is advisory: log a warning "
+                   "but keep the output. Only shortfalls (compressed WORSE "
+                   "than predicted) can fail; beating the prediction only logs. "
+                   "The verify gate bounds ERROR; this bounds wasted STORAGE.")
 @click.option("--compressor-class", default="all")
 @click.option("--filter-class", default="all")
 @click.option("--serializer-class", default="all")
@@ -2482,6 +2526,7 @@ def compress_fields_from_results(dataset_file, where_to_write, vars_filter,
                                   threads, codec_threads,
                                   oversubscription_check, memory_threshold,
                                   verify, verify_gate,
+                                  cr_drift_tol, cr_drift_gate,
                                   compressor_class, filter_class, serializer_class,
                                   with_lossy,
                                   skip_existing, continue_on_error):
@@ -2946,9 +2991,63 @@ def compress_fields_from_results(dataset_file, where_to_write, vars_filter,
                             f"verification advisory only."
                         )
 
+                # CR-drift check: the verify gate above bounds ERROR; this
+                # bounds wasted STORAGE by comparing the achieved ratio to the
+                # manifest's predicted ratio.  Opt-in failure on shortfalls.
+                cr_drift_value = None
+                predicted_ratio = None
+                if verify:
+                    var_manifest = os.path.join(
+                        where_to_write, f"manifest_{var}.json"
+                    )
+                    if Path(var_manifest).is_file():
+                        try:
+                            with open(var_manifest) as vmf:
+                                predicted_ratio = (
+                                    json.load(vmf).get("best") or {}
+                                ).get("ratio")
+                        except Exception:
+                            predicted_ratio = None
+                    ok_cr, drift, direction = _evaluate_cr_drift(
+                        production_ratio=float(ratio),
+                        predicted_ratio=predicted_ratio,
+                        tol=cr_drift_tol,
+                    )
+                    cr_drift_value = drift
+                    if direction == "skip":
+                        click.echo(
+                            f"[cr-drift] {var}: no predicted ratio in "
+                            f"manifest; skipped."
+                        )
+                    elif ok_cr:
+                        click.echo(
+                            f"[cr-drift] {var}: PASS (achieved {ratio:.2f}x "
+                            f"vs predicted {predicted_ratio:.2f}x, "
+                            f"drift {drift:+.1%})"
+                        )
+                    else:
+                        msg = (
+                            f"{var}: CR drift {drift:+.1%} exceeds "
+                            f"+/-{cr_drift_tol:.0%} (achieved {ratio:.2f}x vs "
+                            f"predicted {predicted_ratio:.2f}x)"
+                        )
+                        # Only a shortfall is a storage problem worth failing
+                        # on; beating the prediction just logs.
+                        if direction == "under" and cr_drift_gate:
+                            raise RuntimeError(f"cr-drift gate FAILED: {msg}")
+                        click.echo(
+                            f"[cr-drift] WARNING {msg}"
+                            + ("" if direction == "under"
+                               else "  (better than predicted; informational)")
+                        )
+
                 results_by_var[var] = {
                     "status": "ok",
                     "ratio": float(ratio),
+                    "predicted_ratio": (float(predicted_ratio)
+                                        if predicted_ratio is not None else None),
+                    "cr_drift": (float(cr_drift_value)
+                                 if cr_drift_value is not None else None),
                     "errors": {k: float(v) for k, v in (errors or {}).items()},
                     "eucd": (float(eucd) if eucd is not None else None),
                     "seconds": float(field_seconds),
