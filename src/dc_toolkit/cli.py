@@ -1605,6 +1605,7 @@ def evaluate_combos(dataset_file,
                 partial_paths = sorted(
                     Path(where_to_write).glob(f"config_space_{var}_rank*.csv")
                 )
+                consolidated = None
                 if partial_paths:
                     consolidated = pd.concat(
                         [pd.read_csv(p) for p in partial_paths],
@@ -1620,8 +1621,45 @@ def evaluate_combos(dataset_file,
                         f"({len(consolidated)} row(s))."
                     )
 
-                if results_gather:
+                # -------------------------------------------------------------
+                # Winner selection from the COMPLETE on-disk record.
+                #
+                # The manifest MUST be a pure function of what is stored on disk
+                # (the consolidated parquet / per-rank CSVs), never of this
+                # process's in-memory `results`.  On --resume, a field whose
+                # combos were all scored in a PRIOR run has an empty in-memory
+                # `results` here (configs_pending was empty), while the CSVs
+                # still hold every scored combo.  Selecting from `results_gather`
+                # would then write best=null for an already-complete field -- a
+                # bug that strikes whenever a later pass (resume / re-split)
+                # re-touches a finished field.  Source the winner from the
+                # parquet so the manifest always reflects the real, recoverable
+                # record; fall back to in-memory results only if no CSV exists.
+                # -------------------------------------------------------------
+                best = None
+                n_passed = 0
+                if consolidated is not None and len(consolidated):
+                    keep_mask = (
+                        consolidated["keep"].astype(str).str.strip().str.lower()
+                        .isin(("true", "1"))
+                    )
+                    kept = consolidated[keep_mask]
+                    n_passed = int(len(kept))
+                    if n_passed:
+                        top = kept.loc[kept["ratio"].astype(float).idxmax()]
+                        best = (
+                            (top["compressor"], top["filter"], top["serializer"],
+                             int(top["comp_idx"]), int(top["filt_idx"]),
+                             int(top["ser_idx"])),
+                            float(top["ratio"]), float(top["l1_rel"]),
+                            float(top["eucd"]),
+                        )
+                elif results_gather:
+                    # No per-rank CSV on disk (unexpected): preserve old behaviour.
+                    n_passed = len(results_gather)
                     best = max(results_gather, key=lambda x: x[1])
+
+                if best is not None:
                     click.echo(
                         "optimal combo:\n"
                         f"compressor : {best[0][0]}\n"
@@ -1695,10 +1733,10 @@ def evaluate_combos(dataset_file,
                     "phys_max": phys_max,
                     "existing_l1_error": existing_l1_error,
                     "num_combos": int(num_loops),
-                    "num_passed": int(len(results_gather)),
+                    "num_passed": int(n_passed),
                     "num_failed_total": int(total_failures or 0),
                     "num_filtered": int(
-                        num_loops - len(results_gather) - (total_failures or 0)
+                        num_loops - n_passed - (total_failures or 0)
                     ),
                     "var_sweep_seconds": float(var_sweep_seconds),
                     "env": {
@@ -1720,7 +1758,7 @@ def evaluate_combos(dataset_file,
                     },
                     "best": None,
                 }
-                if results_gather:
+                if best is not None:
                     manifest["best"] = {
                         "compressor": best[0][0],
                         "filter":     best[0][1],
