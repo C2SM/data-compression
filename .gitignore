@@ -10,6 +10,5 @@ out-*
 *.parquet
 *manifest*.json
 sample*.json
-dyamond_inventory*/
-sweep*/
-VAST_analysis*/
+SWEEP*/
+VAST*/
