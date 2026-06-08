@@ -69,8 +69,8 @@ def find_file(base_path, file_name):
     return None
 
 @st.cache_data
-def load_scored_results(file_name: str, params_str: list[str]):
-    return np.load(file_name + params_str + "_scored_results_with_names.npy", allow_pickle=True)
+def load_scored_results(file_name: str, params_str: str):
+    return np.load(os.path.join("out", file_name + params_str + "_scored_results_with_names.npy"), allow_pickle=True)
 
 
 @st.cache_resource
@@ -248,8 +248,8 @@ if uploaded_file is not None and uploaded_file.name.endswith(".nc"):
 
     with st.expander("Advanced Selection", expanded=st.session_state.expander_state):
         options_compressor = ["all", "Blosc", "LZ4", "Zstd", "Zlib", "GZip", "BZ2", "LZMA", "None"]
-        options_filter = ["all", "Delta", "BitRound", "Quantize", "Asinh", "FixedOffsetScale", "None"]
-        options_serializer = ["all", "PCodec", "ZFPY", "EBCCZarrFilter", "Zfp", "Sperr", "Sz3", "None"]
+        options_filter = ["all", "Delta", "BitRound", "Quantize", "None"]
+        options_serializer = ["all", "PCodec", "ZFPY", "None"]
         options_with = ["with", "without"]
 
         col1, col2, col3 = st.columns(3)
@@ -269,19 +269,11 @@ if uploaded_file is not None and uploaded_file.name.endswith(".nc"):
                 "Choose a filter:",
                 options=options_filter,
             )
-            numcodecs_wasm_class = st.selectbox(
-                "Numcodecs-wasm:",
-                options=options_with,
-            )
 
         with col3:
             serializer_class = st.selectbox(
                 "Choose a serializer:",
                 options=options_serializer,
-            )
-            ebcc_class = st.selectbox(
-                "EBCC:",
-                options=options_with,
             )
 
 
@@ -299,39 +291,41 @@ if uploaded_file is not None and uploaded_file.name.endswith(".nc"):
         st.session_state.temp_plot_file = None
 
     with_lossy_option = "--with-lossy" if lossy_class == "with" else "--without-lossy"
-    with_numcodecs_option = "--with-numcodecs-wasm" if numcodecs_wasm_class == "with" else "--without-numcodecs-wasm"
-    with_ebcc_option = "--with-ebcc" if ebcc_class == "with" else "--without-ebcc"
+
+    # create ./out dir if it doesn't exist, to place all generated files there
+    if not os.path.exists("out"):
+        os.makedirs("out")
     if st.button("Analyze compressors"):
         if predefined_l1:
             cmd_compress = [
                 "mpirun",
                 "-n",
-                "8",
+                "1",
                 "dc_toolkit",
                 "evaluate_combos",
                 tmp.name,
-                os.getcwd(),
+                "--where-to-write=out",
                 "--field-to-compress="+field_to_compress,
                 "--compressor-class="+compressor_class,
                 "--filter-class="+filter_class,
                 "--serializer-class="+serializer_class,
-                *[with_lossy_option, with_numcodecs_option, with_ebcc_option]
+                *[with_lossy_option]
             ]
         else:
             cmd_compress = [
                 "mpirun",
                 "-n",
-                "8",
+                "1",
                 "dc_toolkit",
                 "evaluate_combos",
                 tmp.name,
-                os.getcwd(),
+                "--where-to-write=out",
                 "--field-to-compress=" + field_to_compress,
                 "--compressor-class=" + compressor_class,
                 "--filter-class=" + filter_class,
                 "--serializer-class=" + serializer_class,
-                "--override-existing-l1-error=" + str(l1_error_class),
-                *[with_lossy_option, with_numcodecs_option, with_ebcc_option]
+                "--l1-threshold=" + str(l1_error_class),
+                *[with_lossy_option]
             ]
 
         st.info("Analyzing compressors...")
@@ -349,10 +343,8 @@ if uploaded_file is not None and uploaded_file.name.endswith(".nc"):
 
         pattern = r'--.*?-?'
         with_lossy = re.sub(pattern, '', with_lossy_option, count=1)
-        with_numcodesc_wasm = re.sub(pattern, '', with_numcodecs_option, count=1)
-        with_ebcc = re.sub(pattern, '', with_ebcc_option, count=1)
 
-        score_results_file_name = [field_to_compress, compressor_class, filter_class, serializer_class, with_lossy, with_numcodesc_wasm, with_ebcc]
+        score_results_file_name = [field_to_compress, compressor_class, filter_class, serializer_class, with_lossy]
         params_str = '_' + '_'.join(score_results_file_name)
         scored_results = load_scored_results(os.path.basename(tmp.name), params_str)
         scored_results_pd = pd.DataFrame(scored_results)
@@ -390,9 +382,7 @@ if uploaded_file is not None and uploaded_file.name.endswith(".nc"):
     if st.session_state.analysis_performed and st.session_state.temp_plot_file:
         plot_file_path = st.session_state.temp_plot_file
         with_lossy = "with_lossy" if lossy_class == "with" else "without_lossy"
-        with_numcodecs_wasm = "with_numcodecs_wasm" if numcodecs_wasm_class == "with" else "without_numcodecs_wasm"
-        with_ebcc = "with_ebcc" if ebcc_class == "with" else "without_ebcc"
-        cluster_results_file_name = [c for c in (field_to_compress, compressor_class, filter_class, serializer_class, with_lossy, with_numcodecs_wasm, with_ebcc)]
+        cluster_results_file_name = [c for c in (field_to_compress, compressor_class, filter_class, serializer_class, with_lossy)]
         params_str = '_' + '_'.join(cluster_results_file_name)
 
         with open(plot_file_path, "rb") as f:
@@ -410,16 +400,12 @@ if uploaded_file is not None and uploaded_file.name.endswith(".nc"):
     if st.button("Compress file"):
         da = xarray.open_dataset(path_to_modified_file)[field_to_compress]
         with_lossy = True if lossy_class == "with" else False
-        with_numcodecs_wasm = True if numcodecs_wasm_class == "with" else False
-        with_ebcc = True if ebcc_class == "with" else False
 
         compressors_options = utils.compressor_space(da=da, with_lossy=with_lossy,
-                                                     with_numcodecs_wasm=with_numcodecs_wasm, with_ebcc=with_ebcc,
                                                      compressor_class=compressor_class)
-        filters_options = utils.filter_space(da=da, with_lossy=with_lossy, with_numcodecs_wasm=with_numcodecs_wasm,
-                                             with_ebcc=with_ebcc, filter_class=filter_class)
+        filters_options = utils.filter_space(da=da, with_lossy=with_lossy,
+                                             filter_class=filter_class)
         serializers_options = utils.serializer_space(da=da, with_lossy=with_lossy,
-                                                     with_numcodecs_wasm=with_numcodecs_wasm, with_ebcc=with_ebcc,
                                                      serializer_class=serializer_class)
 
         max_compressor_value = len(compressors_options)
@@ -467,16 +453,13 @@ if uploaded_file is not None and uploaded_file.name.endswith(".nc"):
         else:
             temp_dir = os.path.dirname(path_to_modified_file)
             cmd_compress = [
-                "mpirun",
-                "-n",
-                "8",
                 "dc_toolkit",
                 "compress_with_optimal",
                 path_to_modified_file,
                 temp_dir,
                 field_to_compress,
                 str(comp_idx), str(filt_idx), str(ser_idx),
-                *[with_lossy_option, with_numcodecs_option, with_ebcc_option]
+                *[with_lossy_option]
             ]
 
             before = set(os.listdir(temp_dir))
@@ -486,17 +469,25 @@ if uploaded_file is not None and uploaded_file.name.endswith(".nc"):
             status.empty()
             st.success(f"Compression completed successfully.")
 
-            split_tmp_name = os.path.basename(path_to_modified_file).split(".=.", 1)
-            compressed_file_name = f"{uploaded_file.name}.=.{split_tmp_name[0]}"
-            shutil.copy(path_to_modified_file, os.getcwd())
-            output_file_path = os.path.basename(path_to_modified_file)
-
-            with open(output_file_path, "rb") as data_file:
-                st.download_button(
-                    label="Download compressed file locally",
-                    data=data_file,
-                    file_name=compressed_file_name,
-                )
-            os.remove(output_file_path)
+            after = set(os.listdir(temp_dir))
+            generated_files = list(after - before)
+            if generated_files:
+                output_file_path = os.path.join(temp_dir, generated_files[0])
+                split_tmp_name = os.path.basename(output_file_path).split(".=.", 1)
+                compressed_file_name = f"{uploaded_file.name}.=.{split_tmp_name[0]}.zip"
+                archive_path = shutil.make_archive(output_file_path, "zip", temp_dir, generated_files[0])
+                with open(archive_path, "rb") as data_file:
+                    st.download_button(
+                        label="Download compressed file locally",
+                        data=data_file,
+                        file_name=compressed_file_name,
+                    )
+                os.remove(archive_path)
+                if os.path.isdir(output_file_path):
+                    shutil.rmtree(output_file_path)
+                elif os.path.exists(output_file_path):
+                    os.remove(output_file_path)
+            else:
+                st.error("Compression did not produce a downloadable output.")
             if os.path.exists(path_to_modified_file):
                 os.remove(path_to_modified_file)

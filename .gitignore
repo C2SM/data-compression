@@ -7,3 +7,8 @@ EBCC/
 venv/
 out-*
 *.csv
+*.parquet
+*manifest*.json
+sample*.json
+SWEEP*/
+VAST*/

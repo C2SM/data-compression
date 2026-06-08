@@ -1,39 +1,226 @@
 #!/bin/bash
+#
+# Production codec sweep on Santis (Grace nodes, 288 cores/node).
+#
+# Topology: 1 MPI rank/node x 32 threads/rank, --bypass-zarr-sync.
+#
+# This setup was selected after extensive testing on Santis.  Three
+# alternatives were considered and rejected:
+#
+#   Alt A: codec-internal threading (--codec-threads > 1, larger chunks).
+#     Tested at --codec-threads=9 with --inner-chunk-mib=64 on a real
+#     production-size sweep (qv at R02B08, 4.6 GiB, 1000 combos).
+#     LOST by 14% vs baseline.  Cause: cache pressure and memory-
+#     bandwidth saturation; the codec-internal helper threads compete
+#     for the same memory channels as the outer parallelism.  A small
+#     in-cache file (120 MiB tot_prec) had shown a 17% gain at this
+#     setting, but the gain did not carry to production-size files.
+#     Lesson: codec-internal threading is not productive at production
+#     scales on this hardware.
+#
+#   Alt B: pure-MPI 1 rank x 1 thread, no bypass.
+#     Tested on the same qv file at 1000 combos.  Bypass 1x32 finished
+#     in 32 min; pure-MPI 1x1 was projected to 4+ hours (7.6x slower)
+#     and was canceled mid-run.  Cause: encode and decode DO parallelise
+#     in pure-MPI 1x1 — zarr's internal worker pool (32 threads) keeps
+#     32 chunk encodes in flight regardless of user-thread count, so
+#     those phases are fine.  But the metrics phase (numpy elementwise
+#     ops + L1/L2/Linf reductions) runs as plain numpy on the user
+#     thread itself, not under zarr.  With 1 user thread, only 1 core
+#     does all metrics work; with 32 user threads, 32 metrics
+#     computations run in parallel (one per user thread).  Metrics is
+#     ~39% of per-combo wall time, so this phase alone takes ~32x
+#     longer in 1x1, dominating the total slowdown.
+#
+#   Alt C: multi-rank-per-node (32 ranks x 1 thread).
+#     Faster per combo, but each rank duplicates the sample buffer in
+#     memory.  At 5 GB samples that is 32 x 5 GB = 160 GB per node,
+#     which OOMs on R02B08 and R02B10.  Bypass 1x32 keeps memory at
+#     1 sample per node and tolerates the modest throughput loss vs
+#     pure MPI in exchange for not OOMing.
+#
+# Verdict:  current setup is correct.  Do NOT bump --cpus-per-task,
+#          do NOT enable --codec-threads, do NOT switch topology
+#          without a fresh A/B test against this baseline.
+#
+# Codec space: the lossy family is covered via numcodecs.zarr3.ZFPY +
+# BitRound + Quantize, plus the lossless compressors.  (EBCC and
+# numcodecs-wasm have been removed from the toolkit.)
+#
+# See docs/PARALLELIZATION.md for a thorough walkthrough of the
+# parallelism architecture used by every dc_toolkit command.
 
-#SBATCH --account=...
-#SBATCH --uenv=prgenv-gnu/24.11:v2
+#SBATCH --account=YOUR_ACCOUNT_HERE
+#SBATCH --uenv=prgenv-gnu/26.3:v1
 #SBATCH --view=default
-#SBATCH --partition=debug
-#SBATCH --ntasks-per-node=32
-#SBATCH --nodes=1
-#SBATCH --time=00:30:00
+#SBATCH --partition=normal
+#SBATCH --nodes=8
+#SBATCH --ntasks-per-node=1
+#SBATCH --cpus-per-task=32
+#SBATCH --time=12:00:00
 #SBATCH --output=out-%j.out
 #SBATCH --error=out-%j.out
+
+set -uo pipefail   # NOT -e: continue past per-file failures
 
 export PYTHONUNBUFFERED=1
 source venv/bin/activate
 
-srun dc_toolkit \
-     evaluate_combos \
-     /capstor/store/cscs/userlab/cwp03/ppothapa/Data_Dyamond_PostProcessed/DYAMOND_R02B10L120_main/out_15/temp_20200410T000000Z.nc \
-     ./res_folder \
-     --field-to-compress temp \
-     --field-percentage-to-compress 10 \
-     --override-existing-l1-error 0.002 \
-     --compressor-class Zlib \
-     --serializer-class PCodec \
-     --without-lossy \
-     --without-numcodecs-wasm \
-     --without-ebcc
+# Codec-internal threadpools pinned to 1.  The bypass machinery already
+# parallelises codec dispatch across the 32 user threads; OpenMP/blosc
+# adding their own would oversubscribe.
+export OMP_NUM_THREADS=1 \
+       MKL_NUM_THREADS=1 \
+       OPENBLAS_NUM_THREADS=1 \
+       BLOSC_NTHREADS=1 \
+       NUMBA_NUM_THREADS=1 \
+       VECLIB_MAXIMUM_THREADS=1 \
+       OMP_THREAD_LIMIT=1
 
-# srun -n 1 dc_toolkit \
-#      compress_with_optimal \
-#      /capstor/store/cscs/userlab/cwp03/ppothapa/Data_Dyamond_PostProcessed/DYAMOND_R02B10L120_main/out_15/temp_20200410T000000Z.nc \
-#      ./res_folder \
-#      temp \
-#      2 0 9 \
-#      --compressor-class Zlib \
-#      --serializer-class PCodec \
-#      --without-lossy \
-#      --without-numcodecs-wasm \
-#      --without-ebcc
+# ---------------------------------------------------------------------------
+# Tunables
+# ---------------------------------------------------------------------------
+ROOT_R02B10=/capstor/store1/cscs/userlab/cwp03/zemanc/Data_Dyamond_PostProcessed
+ROOT_R02B08=/capstor/store1/cscs/userlab/cwp03/zemanc/Data_Dyamond_PostProcessed_R02B08
+ROOT_R02B06=/capstor/store1/cscs/userlab/cwp03/zemanc/Data_Dyamond_PostProcessed_R02B06
+
+RESULTS_BASE="${RESULTS_BASE:-./res_folder_dyamond_${SLURM_JOB_ID:-$$}}"
+mkdir -p "$RESULTS_BASE"
+
+echo "[santis.run] topology: 1 rank/node x 32 threads/rank x ${SLURM_JOB_NUM_NODES:-?} nodes"
+
+EVAL_FLAGS=(
+    --eval-data-size-limit         5GB
+    --threads-per-rank             32
+)
+
+# Quick-test escape hatch: cap evals (e.g. MAX_EVALS=50 sbatch santis.run)
+MAX_EVALS="${MAX_EVALS:-}"
+if [[ -n "$MAX_EVALS" && "$MAX_EVALS" != "0" ]]; then
+    EVAL_FLAGS+=(--max-evals "$MAX_EVALS")
+    echo "[santis.run] --max-evals=$MAX_EVALS active (test mode)"
+fi
+
+# ---------------------------------------------------------------------------
+# File list
+# ---------------------------------------------------------------------------
+# Format:  <resolution>|<stream>|<filename>|<variable>|<l1_threshold>
+# L1 thresholds are in the variable's native units; rule of thumb ~0.5%
+# of typical std(field), aligned with Klöwer et al. (2021).
+LIST=(
+    # R02B06 backbone
+    "R02B06|out_1_1|remap_qv_20230121T000000Z.nc|qv|5e-6"          # 3D water vapor (remap)
+    "R02B06|out_1_2|remap_qi_20230121T000000Z.nc|qi|1e-8"          # 3D cloud ice
+    "R02B06|out_1_3|remap_temp_20230121T000000Z.nc|temp|0.05"      # 3D temperature
+    "R02B06|out_1_4|remap_w_20230121T000000Z.nc|w|5e-3"            # 3D vertical wind (remap)
+    "R02B06|out_2|tot_prec_20230121T000000Z.nc|tot_prec|1e-2"      # 2D 15-min precip
+    "R02B06|out_3|t_2m_20230121T000000Z.nc|t_2m|0.05"              # 2D 2-m temperature
+    "R02B06|out_4|w_20230121T000000Z.nc|w|5e-3"                    # 3D vertical wind (native)
+    "R02B06|out_6|sob_s_20230121T000000Z.nc|sob_s|1.0"             # 2D net SW at surface
+    "R02B06|out_8|remap_cape_20230121T000000Z.nc|cape|1.0"         # 2D CAPE
+    "R02B06|out_9|remap_t_so_20230121T000000Z.nc|t_so|0.05"        # Soil temperature
+    "R02B06|out_11|geopot_20230121T000000Z.nc|geopot|1.0"          # 3D geopot
+
+    # Cross-resolution spot-checks
+    "R02B08|out_1_1|remap_qv_20230121T000000Z.nc|qv|5e-6"
+    "R02B10|out_1_1|remap_qv_20230121T000000Z.nc|qv|5e-6"
+    "R02B10|out_2|tot_prec_20230121T000000Z.nc|tot_prec|1e-2"
+)
+
+resolve_root () {
+    case "$1" in
+        R02B06) echo "$ROOT_R02B06" ;;
+        R02B08) echo "$ROOT_R02B08" ;;
+        R02B10) echo "$ROOT_R02B10" ;;
+        *)      echo ""; return 1 ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
+# Driver loop
+# ---------------------------------------------------------------------------
+n_total=${#LIST[@]}
+n_ok=0; n_fail=0; n_skip=0
+declare -a FAILED_ENTRIES=()
+
+echo "======================================================================="
+echo "dc_toolkit evaluate_combos sweep over ${n_total} files"
+echo "Results base: $RESULTS_BASE"
+echo "Started at:   $(date -Is)"
+echo "======================================================================="
+
+for i in "${!LIST[@]}"; do
+    entry="${LIST[$i]}"
+    IFS='|' read -r RES_TAG STREAM FNAME VAR L1_THRESHOLD <<<"$entry"
+
+    ROOT=$(resolve_root "$RES_TAG") || {
+        echo "[$((i+1))/$n_total] SKIP unknown resolution tag '$RES_TAG'"
+        n_skip=$((n_skip+1))
+        continue
+    }
+    INPUT="$ROOT/$STREAM/$FNAME"
+    SUBDIR="${RES_TAG}_${STREAM}_${VAR}"
+    OUTDIR="$RESULTS_BASE/$SUBDIR"
+    LOG="$OUTDIR/run.log"
+
+    echo
+    echo "-----------------------------------------------------------------------"
+    echo "[$((i+1))/$n_total] $SUBDIR"
+    echo "  input    : $INPUT"
+    echo "  field    : $VAR"
+    echo "  l1 thresh: $L1_THRESHOLD"
+    echo "  outdir   : $OUTDIR"
+
+    if [[ ! -e "$INPUT" ]]; then
+        echo "  STATUS: SKIP - input file not found"
+        n_skip=$((n_skip+1))
+        FAILED_ENTRIES+=("SKIP  $SUBDIR  (missing input)")
+        continue
+    fi
+
+    mkdir -p "$OUTDIR"
+
+    srun --unbuffered dc_toolkit \
+         evaluate_combos \
+         "$INPUT" \
+         --where-to-write              "$OUTDIR" \
+         --field-to-compress           "$VAR" \
+         --l1-threshold                "$L1_THRESHOLD" \
+         "${EVAL_FLAGS[@]}" \
+         2>&1 | stdbuf -oL -eL tee "$LOG"
+
+    rc=${PIPESTATUS[0]}
+    if [[ $rc -eq 0 ]]; then
+        echo "  STATUS: OK"
+        n_ok=$((n_ok+1))
+    else
+        echo "  STATUS: FAILED (exit $rc)"
+        n_fail=$((n_fail+1))
+        FAILED_ENTRIES+=("FAIL  $SUBDIR  (exit $rc)")
+    fi
+done
+
+# ---------------------------------------------------------------------------
+# Summary
+# ---------------------------------------------------------------------------
+echo
+echo "======================================================================="
+echo "Summary"
+echo "  total      : $n_total"
+echo "  ok         : $n_ok"
+echo "  failed     : $n_fail"
+echo "  skipped    : $n_skip"
+echo "  results    : $RESULTS_BASE"
+echo "  finished at: $(date -Is)"
+if (( n_fail + n_skip > 0 )); then
+    echo "  problems:"
+    for f in "${FAILED_ENTRIES[@]}"; do
+        echo "    $f"
+    done
+fi
+echo "======================================================================="
+
+if (( n_ok == 0 )); then
+    exit 1
+fi
+exit 0

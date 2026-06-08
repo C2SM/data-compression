@@ -14,6 +14,7 @@ subprocess.check_call([
 
 import sys
 import os
+import shutil
 import subprocess
 import tempfile
 
@@ -35,8 +36,8 @@ from plotly.subplots import make_subplots
 from dc_toolkit import utils
 import zipfile
 
-def load_scored_results(file_name: str, params_str: list[str]):
-    return np.load(file_name + params_str + "_scored_results_with_names.npy", allow_pickle=True)
+def load_scored_results(file_name: str, params_str: str):
+    return np.load(os.path.join("out", file_name + params_str + "_scored_results_with_names.npy"), allow_pickle=True)
 
 def create_cluster_plots(clean_arr_l1, clean_arr_l2, clean_arr_linf, n_clusters):
     config_idxs = pd.read_csv("config_space.csv")
@@ -182,7 +183,7 @@ class CompressorThread(QThread):
     log = pyqtSignal(str)
     finished = pyqtSignal()
 
-    def __init__(self, cmd, field_to_compress, compressor_class, filter_class, serializer_class, with_lossy, with_numcodesc_wasm, with_ebcc):
+    def __init__(self, cmd, field_to_compress, compressor_class, filter_class, serializer_class, with_lossy):
         super().__init__()
         self.cmd = cmd
         self.field_to_compress = field_to_compress
@@ -191,8 +192,6 @@ class CompressorThread(QThread):
         self.serializer_class = serializer_class
         pattern = r'--.*?-?'
         self.with_lossy = re.sub(pattern, '', with_lossy, count=1)
-        self.with_numcodesc_wasm = re.sub(pattern, '', with_numcodesc_wasm, count=1)
-        self.with_ebcc = re.sub(pattern, '', with_ebcc, count=1)
 
     def run(self):
         with subprocess.Popen(
@@ -208,7 +207,7 @@ class CompressorThread(QThread):
 
         where_am_i = subprocess.run(["uname", "-a"], capture_output=True, text=True)
         file_name = self.cmd[3] if "santis" in where_am_i.stdout.strip() else self.cmd[5]
-        score_results_file_name = [self.field_to_compress, self.compressor_class, self.filter_class, self.serializer_class, self.with_lossy, self.with_numcodesc_wasm, self.with_ebcc]
+        score_results_file_name = [self.field_to_compress, self.compressor_class, self.filter_class, self.serializer_class, self.with_lossy]
         params_str = '_' + '_'.join(score_results_file_name)
         scored_results = load_scored_results(os.path.basename(file_name), params_str)
         scored_results_pd = pd.DataFrame(scored_results)
@@ -287,12 +286,12 @@ class CompressionAnalysisUI(QMainWindow):
 
         self.grid_layout.addWidget(QLabel("Choose a filter:"), 0, 1)
         self.options_filter = QComboBox()
-        self.options_filter.addItems(["all", "Delta", "BitRound", "Quantize", "Asinh", "FixedOffsetScale", "None"])
+        self.options_filter.addItems(["all", "Delta", "BitRound", "Quantize", "None"])
         self.grid_layout.addWidget(self.options_filter, 1, 1)
 
         self.grid_layout.addWidget(QLabel("Choose a serializer:"), 0, 2)
         self.options_serializer = QComboBox()
-        self.options_serializer.addItems(["all", "PCodec", "ZFPY", "EBCCZarrFilter", "Zfp", "Sperr", "Sz3", "None"])
+        self.options_serializer.addItems(["all", "PCodec", "ZFPY", "None"])
         self.grid_layout.addWidget(self.options_serializer, 1, 2)
 
         self.grid_layout.addWidget(QLabel("Lossy:"), 2, 0)
@@ -300,15 +299,6 @@ class CompressionAnalysisUI(QMainWindow):
         self.options_lossy.addItems(["with", "without"])
         self.grid_layout.addWidget(self.options_lossy, 3, 0)
 
-        self.grid_layout.addWidget(QLabel("Numcodecs-wasm:"), 2, 1)
-        self.options_numcodecs_wasm = QComboBox()
-        self.options_numcodecs_wasm.addItems(["with", "without"])
-        self.grid_layout.addWidget(self.options_numcodecs_wasm, 3, 1)
-
-        self.grid_layout.addWidget(QLabel("EBCC:"), 2, 2)
-        self.options_ebcc = QComboBox()
-        self.options_ebcc.addItems(["with", "without"])
-        self.grid_layout.addWidget(self.options_ebcc, 3, 2)
 
         self.panel_layout.addLayout(self.grid_layout)
 
@@ -416,18 +406,19 @@ class CompressionAnalysisUI(QMainWindow):
         serializer_class = self.options_serializer.currentText()
         with_options_ls = []
         with_options_ls.append("--with-lossy") if self.options_lossy.currentText() == "with" else with_options_ls.append("--without-lossy")
-        with_options_ls.append("--with-numcodecs-wasm") if self.options_numcodecs_wasm.currentText() == "with" else with_options_ls.append("--without-numcodecs-wasm")
-        with_options_ls.append("--with-ebcc") if self.options_ebcc.currentText() == "with" else with_options_ls.append("--without-ebcc")
 
+        # create ./out dir if it doesn't exist, to place all generated files there
+        if not os.path.exists("out"):
+            os.makedirs("out")
         if self.predefined_l1.isChecked():
             cmd = [
                 "mpirun",
                 "-n",
-                "8",
+                "1",
                 "dc_toolkit",
                 "evaluate_combos",
                 self.modified_file_path,
-                os.getcwd(),
+                "--where-to-write=out",
                 "--field-to-compress=" + selected_var,
                 "--compressor-class=" + compressor_class,
                 "--filter-class=" + filter_class,
@@ -438,13 +429,13 @@ class CompressionAnalysisUI(QMainWindow):
             cmd = [
                 "mpirun",
                 "-n",
-                "8",
+                "1",
                 "dc_toolkit",
                 "evaluate_combos",
                 self.modified_file_path,
                 os.getcwd(),
                 "--field-to-compress=" + selected_var,
-                "--override-existing-l1-error=" + str(self.options_l1_error.value()),
+                "--l1-threshold=" + str(self.options_l1_error.value()),
                 "--compressor-class=" + compressor_class,
                 "--filter-class=" + filter_class,
                 "--serializer-class=" + serializer_class,
@@ -456,7 +447,7 @@ class CompressionAnalysisUI(QMainWindow):
                                        compressor_class=compressor_class,
                                        filter_class=filter_class,
                                        serializer_class=serializer_class,
-                                       with_lossy=with_options_ls[0], with_numcodesc_wasm=with_options_ls[1], with_ebcc=with_options_ls[2]
+                                       with_lossy=with_options_ls[0]
                                        )
         self.thread.progress.connect(self.update_progress)
         self.thread.log.connect(self.log.append)
@@ -496,16 +487,12 @@ class CompressionAnalysisUI(QMainWindow):
         da = xr.open_dataset(self.modified_file_path)[selected_field]
 
         with_lossy = True if self.options_lossy.currentText() == "with" else False
-        with_numcodecs_wasm = True if self.options_numcodecs_wasm.currentText() == "with" else False
-        with_ebcc = True if self.options_ebcc.currentText() == "with" else False
 
         compressors_options = len(utils.compressor_space(da=da, with_lossy=with_lossy,
-                                                     with_numcodecs_wasm=with_numcodecs_wasm, with_ebcc=with_ebcc,
                                                      compressor_class=self.options_compressor.currentText()))
-        filters_options = len(utils.filter_space(da=da, with_lossy=with_lossy, with_numcodecs_wasm=with_numcodecs_wasm,
-                                             with_ebcc=with_ebcc, filter_class=self.options_filter.currentText()))
+        filters_options = len(utils.filter_space(da=da, with_lossy=with_lossy,
+                                             filter_class=self.options_filter.currentText()))
         serializers_options = len(utils.serializer_space(da=da, with_lossy=with_lossy,
-                                                     with_numcodecs_wasm=with_numcodecs_wasm, with_ebcc=with_ebcc,
                                                      serializer_class=self.options_serializer.currentText()))
 
         if self.comp_idx_spin.value() > compressors_options:
@@ -525,8 +512,6 @@ class CompressionAnalysisUI(QMainWindow):
             temp_dir = os.path.dirname(self.modified_file_path)
             with_options_ls = []
             with_options_ls.append("--with-lossy") if with_lossy else with_options_ls.append("--without-lossy")
-            with_options_ls.append("--with-numcodecs-wasm") if with_numcodecs_wasm else with_options_ls.append("--without-numcodecs-wasm")
-            with_options_ls.append("--with-ebcc") if with_ebcc else with_options_ls.append("--without-ebcc")
 
             cmd = [
                 "dc_toolkit",
@@ -552,7 +537,7 @@ class CompressionAnalysisUI(QMainWindow):
                 output_file = os.path.join(temp_dir, generated_files[0])
 
                 split_tmp_name = os.path.basename(output_file).split(".=.", 1)
-                compressed_file_name = f"{self.file_name}.=.{split_tmp_name[1]}"
+                compressed_file_name = f"{self.file_name}.=.{split_tmp_name[0]}"
                 self.log.append(f"Generated file: {compressed_file_name}")
 
                 save_path, _ = QFileDialog.getSaveFileName(
@@ -563,9 +548,19 @@ class CompressionAnalysisUI(QMainWindow):
                 )
 
                 with zipfile.ZipFile(save_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
-                    zipf.write(output_file, arcname=os.path.basename(output_file))
+                    if os.path.isdir(output_file):
+                        for root, _, files in os.walk(output_file):
+                            for file in files:
+                                file_path = os.path.join(root, file)
+                                arcname = os.path.relpath(file_path, temp_dir)
+                                zipf.write(file_path, arcname=arcname)
+                    else:
+                        zipf.write(output_file, arcname=os.path.basename(output_file))
                 self.log.append(f"zip file saved to: {save_path}")
-                os.remove(output_file)
+                if os.path.isdir(output_file):
+                    shutil.rmtree(output_file)
+                else:
+                    os.remove(output_file)
 
             except subprocess.CalledProcessError as e:
                 self.log.append(f"Compression failed:\n{e.stderr}")
