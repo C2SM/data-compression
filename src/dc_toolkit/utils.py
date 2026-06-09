@@ -408,12 +408,10 @@ def build_representative_sample(
     stride_dims: List[Tuple[int, str]] = list(time_dims) + list(vertical_dims)
 
     if not stride_dims:
-        # Nothing safe to thin — return whole field with a warning.  In
-        # practice the variables that hit this branch are small bookkeeping
-        # arrays (CF coord-bounds, SCRIP remap weights) where being a few
-        # GiB over isn't a problem.  A LARGE variable without any time or
-        # vertical axis would deserve human review; surface that via the
-        # warning so it doesn't pass silently.
+        # Nothing safe to thin — return the whole field with a warning.  These
+        # are usually small bookkeeping arrays (CF coord-bounds, SCRIP weights)
+        # where a few GiB over is fine; a LARGE axis-less variable would deserve
+        # review, so surface it via the warning rather than passing silently.
         if rank == 0:
             click.echo(
                 f"[sample] WARNING: variable '{da.name}' has dims {da.dims} "
@@ -842,17 +840,12 @@ _QUANTIZE_DIGITS_F32   = (1, 3, 4, 5, 6, 7)                 # dropped 2 (adjacen
 _QUANTIZE_DIGITS_F64   = (1, 3, 4, 5, 6, 7, 9, 11, 13, 15)  # dropped 2 (adjacent-redundant); 15 -> ~lossless
 
 # ---- FixedScaleOffset target integer widths (array -> array, data-dependent) -
-# The field's [min, max] is mapped onto the full range of each integer width.
-# More bits -> finer absolute precision (less lossy) but larger encoded ints.
-# uint32 is effectively lossless for f32 inputs.
-#
-# uint8 is intentionally EXCLUDED: it has no viable serializer in this toolkit.
-# ZFPY is rejected for all FSO by combo_is_valid (integer-mode crash), and
-# PCodec refuses 8-bit input outright ("compressing 8-bit types with Pco is
-# often a mistake").  An empirical trial on pres_msl confirmed every
-# uint8-FSO->PCodec combo crashed (264 guaranteed failures/field) with zero
-# usable output, while 256 levels is too coarse to pass a sub-1% gate anyway.
-# Dropping it removes the failures at no loss of any viable combo.
+# The field's [min, max] maps onto the full range of each integer width: more
+# bits -> finer precision but larger ints (uint32 is ~lossless for f32).
+# uint8 is EXCLUDED: it has no viable serializer here — ZFPY rejects all FSO
+# (combo_is_valid), and PCodec refuses 8-bit input.  An empirical pres_msl trial
+# had every uint8-FSO->PCodec combo crash (264 failures/field), and 256 levels
+# is too coarse for a sub-1% gate anyway.
 _FSO_TARGET_UINTS      = ("uint16", "uint32")
 
 # ---- Serializer parameter grids (array -> bytes) ----------------------------
@@ -994,6 +987,28 @@ def filter_space(da, with_lossy=True, filter_class="all", data_range=None):
     return list(enumerate(space))
 
 
+class ZFPYFlat(zarrcodecs_nc.ZFPY, codec_name="zfpy"):
+    """ZFPY serializer that flattens each chunk to 1-D before zfp.
+
+    zfp stores the array shape in its stream header with a per-axis budget that
+    shrinks with rank (2**48 in 1-D, 2**24 in 2-D, 2**16 in 3-D, 2**12 in 4-D);
+    the DYAMOND cell dimension (327680+) overflows it at >=3-D, so natural-shape
+    chunks fail with "Failed to write header to stream".  Flattening each chunk
+    to 1-D keeps every shape under the 2**48 ceiling.  The store still holds the
+    array's natural shape + dim names (only the per-chunk stream is 1-D; the
+    inherited decode reshapes back), and the codec name stays "zfpy", so a stock
+    zarr+numcodecs reader needs no custom code.  (zfp thus can't use multi-D
+    decorrelation, but the unstructured cell axis can't be a zfp dimension
+    anyway.)
+    """
+    async def _encode_single(self, chunk_data, chunk_spec):
+        # Flatten to a C-contiguous 1-D view; the inherited decode reshapes back
+        # to chunk_spec.shape, so the C-order round-trip is an identity.
+        arr = np.ascontiguousarray(chunk_data.as_ndarray_like()).reshape(-1)
+        out = await asyncio.to_thread(self._codec.encode, arr)
+        return chunk_spec.prototype.buffer.from_bytes(out)
+
+
 def serializer_space(da, with_lossy=True, serializer_class="all"):
     """
     Array->bytes serializer space.  PCodec is always present.  ZFPY is added
@@ -1039,7 +1054,10 @@ def serializer_space(da, with_lossy=True, serializer_class="all"):
             for mode_str, zfpy_mode, param_name, param_fn in _ZFP_MODES:
                 for k in _ZFPY_K_GRID:
                     val = param_fn(k)
-                    space.append(serializer(mode=zfpy_mode, **{param_name: val}))
+                    # ZFPYFlat (flattening ZFPY subclass) so oversized dims
+                    # work; still a zarrcodecs_nc.ZFPY, so isinstance checks, the
+                    # "zfpy" selector, and the stored codec name are unchanged.
+                    space.append(ZFPYFlat(mode=zfpy_mode, **{param_name: val}))
 
     return list(enumerate(space))
 
@@ -1292,18 +1310,14 @@ def _iter_chunk_slices(shape, chunk_shape):
 # =============================================================================
 # ZARR SYNC-API BYPASS  (opt-in via cli --bypass-zarr-sync)
 # =============================================================================
-# zarr 3's sync wrapper (zarr.core.sync.sync) runs every coroutine on a
-# process-global event loop, serialising codec calls from concurrent worker
-# threads down to ~1 effective core (measured 5x slowdown at 1x32 vs 32x1).
-# We bypass it by calling zarr.api.asynchronous.create_array directly, with
-# a persistent event loop per worker thread.
-#
-# A single shared bounded ThreadPoolExecutor is wired as the default
-# executor on every per-thread loop.  Without that, asyncio.to_thread()
-# inside zarr's native codecs lazily creates a 32-worker default executor
-# per loop -> 32 user threads x 32 workers = ~1024 OS threads (validation
-# job 844391: 30 GB RAM, AveCPU/wall = 2.1).  The shared executor caps
-# total OS threads at user_threads + shared_workers.
+# zarr 3's sync wrapper runs every coroutine on a process-global event loop,
+# serialising codec calls from concurrent worker threads down to ~1 core (5x
+# slowdown at 1x32 vs 32x1).  We bypass it by calling
+# zarr.api.asynchronous.create_array directly on a persistent per-thread loop.
+# A single shared bounded ThreadPoolExecutor is wired as each loop's default
+# executor; without it, asyncio.to_thread() inside zarr's codecs spawns a
+# 32-worker default executor per loop -> 32 x 32 = ~1024 OS threads.  The shared
+# executor caps total OS threads at user_threads + shared_workers.
 
 try:
     from zarr.api.asynchronous import create_array as _zarr_async_create_array
@@ -1437,11 +1451,10 @@ def _zarr_pipeline_sync(sample_np, dims, codec_kwargs, chunks):
         )
 
     with Timer("eval.encode"):
-        # FixedScaleOffset casts NaN-fill cells to int, which numpy flags as
-        # "invalid value encountered in cast".  This is benign: fill cells are
-        # masked out of every error norm downstream, so the garbage ints never
-        # affect scoring.  Suppress ONLY this specific message -- a genuine FSO
-        # overflow does NOT warn (numpy wraps silently; that path is guarded by
+        # FixedScaleOffset casts NaN-fill cells to int ("invalid value in cast").
+        # Benign: fill cells are masked out of every error norm, so the garbage
+        # ints never affect scoring.  Suppress ONLY this message — a genuine FSO
+        # overflow does NOT warn (numpy wraps silently; guarded by
         # full_field_data_range + the verify gate), so nothing real is hidden.
         with warnings.catch_warnings():
             warnings.filterwarnings(
@@ -1506,26 +1519,16 @@ def evaluate_codec_pipeline(
             sample_np, dims, codec_kwargs, chunks
         )
 
-    # Chunk-wise error accumulation: bounds the float64 promotion peak at
-    # one chunk's worth.
-    #
-    # Non-finite handling (see PR introducing the production-grade gates):
-    #   - Cells that are non-finite in the ORIGINAL are legitimate fill
-    #     (ocean points in a land field, below-surface levels, masked
-    #     regions).  They are EXCLUDED from every norm so fill never
-    #     poisons the statistics.
-    #   - Cells that are finite in the original but non-finite in the
-    #     DECODED output are genuine corruption.  They are excluded from
-    #     the norms (so the norms stay meaningful) but COUNTED in
-    #     `n_corrupt`; the caller treats n_corrupt > 0 as a hard reject
-    #     (pass_finite = False).  This replaces the old behaviour of
-    #     raising CombinationProducedNonFiniteError for any non-finite.
-    #
-    # Alongside the L-norms we also accumulate, in the same single pass:
-    #   - signed error sum  -> relative bias (mean signed error / ||o||_1)
-    #   - decoded min/max over valid cells -> physical-bounds gate
-    #   - (optional) error restricted to the extreme tail |o| >= q99_abs
-    #     -> q99 relative error gate for extremes-sensitive fields.
+    # Chunk-wise error accumulation: bounds the float64 promotion peak at one
+    # chunk's worth.  Non-finite handling:
+    #   - non-finite in the ORIGINAL = legitimate fill (ocean/land, below-surface,
+    #     masks) -> EXCLUDED from every norm so fill never poisons the stats.
+    #   - finite original but non-finite DECODED = corruption -> excluded from the
+    #     norms but COUNTED in `n_corrupt`; the caller treats n_corrupt > 0 as a
+    #     hard reject (replaces the old raise-on-any-non-finite).
+    # Same pass also accumulates: signed error sum -> relative bias; decoded
+    # min/max over valid cells -> physical-bounds gate; and (optional) error over
+    # the extreme tail |o| >= q99_abs -> q99 gate.
     with Timer("eval.metrics"):
         l1_err = 0.0; l2_err_sq = 0.0; linf_err = 0.0
         l1_ori = 0.0; l2_ori_sq = 0.0; linf_ori = 0.0
@@ -1613,23 +1616,18 @@ def evaluate_codec_pipeline(
     }
 
     # ---- optional gradient (spatial-structure) metric ------------------
-    # Relative L1 error of the per-axis finite-difference field, combined
-    # across the requested axes.  Computed on the in-memory arrays (not the
-    # streaming accumulator) because finite differencing is a neighbourhood
-    # op; done one axis at a time with intermediates freed between axes to
-    # bound the transient.  NaN-masked: only positions finite in both the
-    # original and decoded difference fields contribute.
+    # Relative L1 error of the per-axis finite-difference field, combined across
+    # the requested axes.  Computed on the in-memory arrays (finite differencing
+    # is a neighbourhood op), one axis at a time with intermediates freed to
+    # bound the transient; NaN-masked to positions finite in both fields.
     #
-    # SHORT-CIRCUIT: the gradient re-decodes the sample (a second full
-    # pipeline) and is by far the most expensive part of an evaluation.  A
-    # combo that already fails any cheap gate (L1/L2/Linf/bias) can never be
-    # kept, so its gradient value is irrelevant.  When `precheck_thresholds`
-    # is supplied, skip the gradient for such combos: Grad_Rel stays None
-    # (pass_grad becomes a no-op in _evaluate_gates) and the combo is rejected
-    # by the failing cheap gate anyway.  This is SEMANTICALLY IDENTICAL to
-    # computing the gradient for every combo — the kept set and the winner are
-    # unchanged — but makes --gradient-gate nearly free.  Pass None to force
-    # the gradient on every combo (the validation/debug path).
+    # SHORT-CIRCUIT: the gradient re-decodes the sample (a second full pipeline)
+    # and is the most expensive part of an evaluation.  A combo that already
+    # fails a cheap gate (L1/L2/Linf/bias) can't be kept, so when
+    # `precheck_thresholds` is given we skip it: Grad_Rel stays None (a no-op in
+    # _evaluate_gates) and the cheap gate rejects the combo anyway.  Identical
+    # kept set and winner, but --gradient-gate becomes nearly free.  None forces
+    # the gradient on every combo (validation/debug path).
     do_grad = compute_gradient
     if compute_gradient and precheck_thresholds is not None:
         def _passes(val, lim):
@@ -1713,6 +1711,7 @@ def persist_with_codec_pipeline(
     verify: bool = True,
     verbose: bool = True,
     rank: int = 0,
+    q99_abs=None,
 ):
     """
     Write `da` into `store` at `component` using the codec pipeline.
@@ -1799,7 +1798,7 @@ def persist_with_codec_pipeline(
             # efficient reads.
             z_dask = dask.array.from_zarr(z, chunks=write_unit)
             _pprint, errors, euclidean_distance, _nrm = \
-                compute_errors_distances(z_dask, da.data)
+                compute_errors_distances(z_dask, da.data, q99_abs=q99_abs)
         if verbose and rank == 0:
             click.echo("-" * 80)
             click.echo(_pprint)
@@ -1814,12 +1813,11 @@ def persist_with_codec_pipeline(
 # ERROR METRICS  (used by the persist path; dask-lazy)
 # =============================================================================
 
-def compute_errors_distances(da_compressed, da):
+def compute_errors_distances(da_compressed, da, q99_abs=None):
     # Mask non-finite cells in the ORIGINAL (legitimate fill); score only
-    # finite-in-original positions, mirroring evaluate_codec_pipeline.  A
-    # cell finite in the original but non-finite in the decoded output is
-    # corruption: excluded from the norms, counted in n_corrupt, surfaced
-    # so the verify gate can reject it.
+    # finite-in-original positions, mirroring evaluate_codec_pipeline.  A cell
+    # finite in the original but non-finite in the decoded output is corruption:
+    # excluded from the norms, counted in n_corrupt, surfaced for the gate.
     finite_orig = np.isfinite(da)
     finite_dec  = np.isfinite(da_compressed)
     valid       = finite_orig & finite_dec
@@ -1842,13 +1840,27 @@ def compute_errors_distances(da_compressed, da):
     norm_L2_original   = np.sqrt((o ** 2).sum())
     norm_Linf_original = np.abs(o).max()
 
-    computed = dask.compute(
+    # Optional extreme-tail (q99) reduction.  `q99_abs` is the sweep's |value|
+    # cut (its sample's 99th pct of |value|); cells with |original| >= q99_abs
+    # are the tail.  Accumulate the masked error/original L1 sums over the tail
+    # and fuse them into the SAME dask.compute as the global norms (one read),
+    # mirroring evaluate_codec_pipeline so production Q99_Rel matches the sweep's.
+    want_q99 = q99_abs is not None
+    reductions = [
         norm_L1_error, norm_L1_original,
         norm_L2_error, norm_L2_original,
         norm_Linf_error, norm_Linf_original,
         signed_error_sum, n_corrupt,
-    )
-    (l1e, l1o, l2e, l2o, linfe, linfo, signed, ncorrupt) = computed
+    ]
+    if want_q99:
+        _o_abs = np.abs(o)
+        _e_abs = np.abs(da_error)
+        _ext = _o_abs >= float(q99_abs)
+        reductions.append(dask.array.where(_ext, _e_abs, 0.0).sum())
+        reductions.append(dask.array.where(_ext, _o_abs, 0.0).sum())
+
+    computed = dask.compute(*reductions)
+    (l1e, l1o, l2e, l2o, linfe, linfo, signed, ncorrupt) = computed[:8]
 
     def _safe_rel(err, ori):
         """Relative error with sane behavior for zero-norm originals.
@@ -1863,6 +1875,11 @@ def compute_errors_distances(da_compressed, da):
     relative_error_Linf = _safe_rel(linfe,  linfo)
     bias_rel            = _safe_rel(abs(float(signed)), l1o)
 
+    q99_rel = None
+    if want_q99:
+        q99e, q99o = computed[8], computed[9]
+        q99_rel = _safe_rel(q99e, q99o)
+
     euclidean_distance = l2e
     normalized_euclidean_distance = relative_error_L2
 
@@ -1872,6 +1889,8 @@ def compute_errors_distances(da_compressed, da):
         "Relative_Error_Linf": relative_error_Linf,
         "Bias_Rel":            bias_rel,
         "N_Corrupt":           int(ncorrupt),
+        # Extreme-tail relative L1 error; None when no q99_abs cut was given.
+        "Q99_Rel":             q99_rel,
     }
     errors_ = {k: (f"{v:.3e}" if isinstance(v, float) else str(v))
                for k, v in errors.items()}
@@ -2045,11 +2064,10 @@ def check_thread_oversubscription(abort_if_unsafe: bool = True, rank: int = 0, c
             comm.Abort(1)
 
     # Pin zarr v3's internal thread pool only when oversubscription is a real
-    # risk: multi-rank-per-node (each rank's process otherwise spawns its own
-    # default executor of ~32 workers, giving N_ranks * 32 threads on a
-    # N-core node).  With 1 rank-per-node, no pin is needed: a single rank
-    # uses one ~32-worker pool, which matches the 32 cores it's been given.
-    # The bypass case has its own bounded shared executor — also no pin.
+    # risk — multi-rank-per-node, where each rank otherwise spawns its own
+    # ~32-worker executor (N_ranks * 32 threads on an N-core node).  With 1
+    # rank-per-node the single ~32-worker pool matches the cores, and the bypass
+    # case has its own bounded executor, so neither needs a pin.
     if not _AsyncBypass.enabled:
         try:
             _, ranks_on_node, _ = detect_node_topology(MPI.COMM_WORLD)
@@ -2064,19 +2082,46 @@ def check_thread_oversubscription(abort_if_unsafe: bool = True, rank: int = 0, c
 # =============================================================================
 
 def get_indexes(arr, indices):
-    codec_to_id = []
+    """
+    Reverse-map codec repr strings (`arr`) back to their integer indices using
+    the `config_space_{var}.csv` column (`indices`), whose cells are the
+    stringified `(index, codec_repr)` tuples written by evaluate_combos.
+
+    Returns an int array (one entry per item in `arr`):
+      - the codec's integer index when its repr is found,
+      - -1 for the explicit "None" stage (no compressor / filter / serializer).
+
+    The npy and the config CSV are co-produced by the same evaluate_combos run,
+    so every repr in `arr` is expected to appear in `indices`.  A repr that is
+    NOT found is therefore an anomaly (e.g. a config CSV paired with a npy from
+    a different run, or a numcodecs __repr__ change across environments); we map
+    it to -1 but warn so the mismatch is visible rather than silently labelled
+    as "None".  Used only for plot hover labels — not on any compression path.
+    """
+    codec_id_dict = {}
     for ind in indices:
-        codec_to_id.append(ind[1:-1].split(", ", 1))
+        # "(3, Blosc(...))" -> ["3", "Blosc(...)"]
+        idx_str, codec_repr = str(ind)[1:-1].split(", ", 1)
+        codec_id_dict[codec_repr] = int(idx_str)
     id_ls = []
-    codec_id_dict = {key: val for val, key in codec_to_id}
+    _unknown = 0
     for item in arr:
         if item == "None":
             id_ls.append(-1)
-        elif item in list(codec_id_dict.keys()):
+        elif item in codec_id_dict:
             id_ls.append(codec_id_dict[item])
         else:
-            id_ls.append(-1)  # unknown item — append -1 instead of returning an exception object
-    return np.asarray(id_ls)
+            id_ls.append(-1)  # anomaly (see docstring); surfaced via warning below
+            _unknown += 1
+    if _unknown:
+        click.echo(
+            f"[get_indexes] WARNING: {_unknown} codec repr(s) in the results "
+            f"were not found in the config-space CSV and were labelled -1.  "
+            f"Are the .npy and config_space CSV from the SAME evaluate_combos "
+            f"run (and the same numcodecs version)?",
+            err=True,
+        )
+    return np.asarray(id_ls, dtype=int)
 
 
 def slice_array(arr: pd.array, indices_ls: list) -> np.ndarray:
