@@ -33,11 +33,8 @@ import humanize
 import psutil
 
 # Heavyweight optional imports (matplotlib / sklearn / plotly / tqdm) are
-# deferred: they are only used by the clustering and plotting commands below
-# and are imported lazily inside each of those commands.  Keeping them out of
-# the module-level import list means `dc_toolkit evaluate_combos` and
-# `compress_with_optimal` don't pay the import cost, and environments without
-# (e.g.) a matplotlib install can still run the main sweep.
+# imported lazily inside the clustering/plotting commands, so the sweep and
+# compress commands don't pay the cost and can run without them installed.
 
 import warnings
 warnings.filterwarnings(
@@ -49,13 +46,10 @@ warnings.filterwarnings(
     "ignore", message="Engine 'cfgrib' loading failed", category=RuntimeWarning,
 )
 warnings.filterwarnings("ignore", message="overflow encountered in square")
-# Cosmetic: at MPI step teardown, each rank's multiprocessing.resource_tracker
-# logs a "leaked semaphore" UserWarning because the parent dies before the
-# tracker has reaped its /dev/shm semaphores.  The semaphores are reclaimed
-# by the kernel at SLURM step end regardless, so the message is purely
-# noise; on a 256-rank job it produces several hundred lines that drown out
-# real warnings.  Suppress only this one specific message - leave the rest
-# of the UserWarning class active in case a real one appears elsewhere.
+# Cosmetic: at MPI teardown each rank's multiprocessing.resource_tracker logs a
+# "leaked semaphore" warning (the parent dies before it reaps /dev/shm; the
+# kernel reclaims them at step end anyway).  On a 256-rank job that's hundreds
+# of noise lines, so suppress this one message while leaving UserWarning active.
 warnings.filterwarnings(
     "ignore",
     message=r".*leaked semaphore objects.*",
@@ -82,8 +76,23 @@ def _size_option_callback(ctx, param, value):
         raise click.BadParameter(f"Invalid size '{value}': {e}")
 
 
-def _is_zfpy_serializer(serializer) -> bool:
-    return isinstance(serializer, zarrcodecs_nc.ZFPY)
+def _validate_resolved_combo(optimal_filter, optimal_serializer, *, context=""):
+    """Guard a resolved (filter, serializer) before persisting / plotting.
+
+    Sweep winners are already valid via ``utils.combo_is_valid``;
+    ``compress_with_optimal`` and ``plot_compression_errors`` also accept a
+    MANUAL ``(comp, filt, ser)`` triple that bypasses it, so re-check here for a
+    clear error rather than a cryptic codec crash.
+    """
+    where = f" for {context}" if context else ""
+    if not utils.combo_is_valid(optimal_filter, optimal_serializer):
+        raise click.ClickException(
+            f"Invalid (filter, serializer) pairing{where}: "
+            f"filter={optimal_filter}  serializer={optimal_serializer}.  "
+            f"This pairing is rejected by combo_is_valid (e.g. "
+            f"FixedScaleOffset->ZFPY, or 8-bit FixedScaleOffset->PCodec) and "
+            f"would crash inside the codec.  Choose a different combination."
+        )
 
 
 def _merged_store_path(where_to_write: str, dataset_file: str) -> str:
@@ -208,16 +217,10 @@ def _per_rank_steady_estimate_bytes(
     return sample_bytes + decode_cache + thread_chunk
 
 
-# Per-thread working-memory multiplier (decoded buffer + encoded
-# MemoryStore + codec scratch, in units of sample_bytes).  Empirically
-# 1.5x is a safe upper bound observed across the codec set:
-#   - decoded buffer:                    1.0x sample_bytes
-#   - encoded MemoryStore (worst case
-#     when ratio < 1 with bad codec):    0.0-1.0x sample_bytes (mean ~0.3x)
-#   - codec working/scratch:             0.1-0.3x sample_bytes
-# Raised at module level (not buried in the function) so the auto-shrink
-# inversion uses the SAME multiplier as the steady estimate -- they MUST
-# stay in lockstep.
+# Per-thread working memory in units of sample_bytes: decoded buffer (1.0x) +
+# encoded MemoryStore (~0.3x mean, up to 1.0x) + codec scratch (~0.3x); 1.5x is
+# a safe empirical upper bound.  Module-level so the auto-shrink inversion and
+# the steady estimate use the SAME multiplier.
 PER_THREAD_WORKING_FACTOR = 1.5
 
 
@@ -491,20 +494,13 @@ def _signature_path(where_to_write: str, var: str) -> Path:
 # =============================================================================
 # Error threshold policy
 # =============================================================================
-# The per-variable threshold table (formerly a Google Sheet mirrored to a
-# bundled CSV) has been removed: in practice every production run overrode it,
-# the bundled ECMWF GRIB short-names never matched the ICON variable names, and
-# its "Existing L1 error" column was a GRIB-packing baseline in ABSOLUTE units
-# being compared against a RELATIVE error — a latent unit hazard.
-#
-# Thresholds are now supplied explicitly on the command line as RELATIVE
-# (dimensionless) errors via --l1-threshold (required) and the optional
-# --l2-threshold / --linf-threshold / --bias-threshold / --q99-threshold.
-# Omitted gates auto-derive from L1 (see _derive_thresholds below).
-#
-# Re-entry seam: to reintroduce an authoritative table later, add a loader
-# here that returns a {var: {"l1": ..., "l2": ..., ...}} mapping and consult it
-# before falling back to the CLI values in evaluate_combos.
+# The old per-variable threshold table (a bundled GRIB-derived CSV) was removed:
+# it was always overridden, its short-names never matched ICON, and its baseline
+# mixed ABSOLUTE with RELATIVE error.  Thresholds are now given on the CLI as
+# RELATIVE errors: --l1-threshold (required) plus optional --l2/--linf/--bias/
+# --q99; omitted gates auto-derive from L1 (see _derive_thresholds).  To restore
+# a table, add a loader returning {var: {"l1": ...}} and consult it before the
+# CLI values in evaluate_combos.
 
 # Default multipliers applied to the (relative) L1 threshold when the
 # corresponding gate threshold is not given explicitly.  Documented heuristics,
@@ -813,12 +809,10 @@ def evaluate_combos(dataset_file,
     node_comm, ranks_on_node, _local_rank = utils.detect_node_topology(comm)
 
     # ---- 1 MPI rank per node: opt-in bypass -----------------------------
-    # The original design intends shared-memory threading within each node
-    # (1 Python process / 1 GIL).  In practice the GIL + codec config registry
-    # + glibc malloc arenas serialize so heavily on aarch64 (Grace) that
-    # multiple Python processes per node beat threads despite paying for
-    # sample duplication.  --allow-multi-rank-per-node is the explicit knob
-    # for that case.
+    # The design intends shared-memory threading per node (1 process / 1 GIL),
+    # but on aarch64 (Grace) the GIL + codec registry + malloc arenas serialize
+    # so heavily that multiple processes per node beat threads despite sample
+    # duplication.  --allow-multi-rank-per-node is the explicit knob for that.
     if ranks_on_node > 1 and not allow_multi_rank_per_node:
         if rank == 0:
             click.echo(
@@ -871,10 +865,9 @@ def evaluate_combos(dataset_file,
         os.makedirs(where_to_write, exist_ok=True)
     comm.Barrier()
 
-    # `array.chunk-size` must be set before any open() that uses chunks="auto".
-    # This outer block governs only the dataset open and the rank-0 sample
-    # .compute(); the inner sweep below opens its own
-    # `with dask.config.set(scheduler="synchronous")` so per-combo threads
+    # `array.chunk-size` must be set before any open() using chunks="auto".
+    # This block governs only the dataset open and rank-0 sample .compute(); the
+    # inner sweep opens its own synchronous-scheduler block so per-combo threads
     # don't nest dask thread pools.
     with dask.config.set({
         "array.chunk-size": "512MiB",
@@ -933,24 +926,17 @@ def evaluate_combos(dataset_file,
                     f"relative L1 threshold={existing_l1_error:.3e}"
                 )
 
-            # -------------------------------------------------------------------------
-            # Build representative sample ONCE on rank 0, broadcast to others.
-            # -------------------------------------------------------------------------
-            # Memory guardrail before the sample broadcast.  No post-open
-            # refinement here (unlike the compress commands): evaluate_combos
-            # writes nothing, so there are no shard bytes to re-check against.
+            # Build the representative sample ONCE on rank 0, broadcast to others.
+            # Memory guardrail before the broadcast; no post-open refinement
+            # (evaluate_combos writes nothing, so there are no shard bytes).
             field_bytes = int(da.dtype.itemsize) * int(np.prod(da.shape))
 
-            # -------------------------------------------------------------------------
-            # Auto-shrink the sample budget so the per-rank steady estimate
-            # fits within the detected node memory budget.  This is what
-            # makes the sweep OOM-proof regardless of the user's
-            # --threads-per-rank choice: when threads are high the per-thread
-            # working set dominates, so the safe sample shrinks to keep
-            # (1 + threads * factor) * sample_bytes + chunk_overhead bounded
-            # by the cgroup/host budget.  The CLI flag --eval-data-size-limit
-            # acts as a ceiling, not a target.
-            # -------------------------------------------------------------------------
+            # Auto-shrink the sample budget so the per-rank steady estimate fits
+            # the detected node memory budget — this keeps the sweep OOM-proof at
+            # any --threads-per-rank: high threads -> the per-thread working set
+            # dominates, so the sample shrinks to keep
+            # (1 + threads * factor) * sample_bytes + overhead under the budget.
+            # --eval-data-size-limit is a ceiling, not a target.
             node_budget_bytes, node_budget_source = _detect_node_memory_budget()
             # Under SLURM cgroup-v2 the budget is per-task; without cgroup
             # all ranks on the node share it.  Mirror the asymmetry from
@@ -1036,10 +1022,9 @@ def evaluate_combos(dataset_file,
                     "name":  sample_da_local.name,
                 }
                 # Global (full-field) finite min/max for FixedScaleOffset's
-                # affine packing.  MUST come from the whole field, not the
-                # strided sample, or the uint packing can overflow on
-                # production values outside the sampled range.  Cheap reduction
-                # (no compression); computed once here and broadcast below.
+                # affine packing.  MUST be the whole field, not the strided
+                # sample, or uint packing can overflow on production values
+                # outside the sampled range.  Cheap; broadcast below.
                 fso_data_range = utils.full_field_data_range(da)
             else:
                 sample_np_local = None
@@ -1068,6 +1053,20 @@ def evaluate_combos(dataset_file,
                         var=str(var),
                         eval_data_size_limit=int(eval_data_size_limit),
                         sample_np=sample_np,
+                    )
+                    # Record the sample-DETERMINING parameters so the compress
+                    # commands rebuild the IDENTICAL sample instead of
+                    # re-deriving from --eval-data-size-limit.  The memory
+                    # auto-shrink can drop the budget below the CLI ceiling on a
+                    # tight sweep node; compress runs single-process and never
+                    # shrinks, so without these keys it would build a different
+                    # sample and the hash check would false-positive.  Stored as
+                    # EXTRA keys, NOT part of the field-comparison set
+                    # (shape/nbytes/sha256 stay authoritative).
+                    sig["effective_sample_limit"] = int(effective_sample_limit)
+                    sig["sampling_policy"] = str(sampling_policy)
+                    sig["vertical_floor"] = (
+                        int(vertical_floor) if vertical_floor is not None else None
                     )
                     _signature_path(where_to_write, str(var)).write_text(
                         json.dumps(sig, indent=2)
@@ -1123,11 +1122,10 @@ def evaluate_combos(dataset_file,
                     f"filter/serializer pairing(s) (e.g. FixedScaleOffset->ZFPY)."
                 )
             num_loops = len(config_space)
-            # --max-evals: optional global cap for quick test runs.  Applied
-            # BEFORE the rank partition so all ranks see the same truncated
-            # space and the partition (configs[rank::size]) divides it evenly.
-            # The full config_space CSV written below is also truncated to
-            # match - that file is the audit trail of what was actually run.
+            # --max-evals: optional cap for quick test runs.  Applied BEFORE the
+            # rank partition so all ranks see the same truncated space and
+            # configs[rank::size] divides evenly.  The config_space CSV below is
+            # truncated to match (the audit trail of what actually ran).
             if max_evals is not None and max_evals < num_loops:
                 if rank == 0:
                     click.echo(
@@ -1167,12 +1165,10 @@ def evaluate_combos(dataset_file,
                 # _per_rank_steady_estimate_bytes() so the abort check (fired
                 # pre-broadcast) and this user-facing estimate cannot drift.
                 steady_mib = int(sample_np.nbytes / 2**20)
-                # Per-thread working set: each ThreadPoolExecutor worker
-                # runs evaluate_codec_pipeline concurrently with its own
-                # decoded buffer (~1x sample), encoded MemoryStore
-                # (~0.0-1x sample) and codec scratch.  Pre-patch the
-                # banner said "1x decompressed cache"; corrected to
-                # threads x PER_THREAD_WORKING_FACTOR.
+                # Per-thread working set: each ThreadPoolExecutor worker runs
+                # evaluate_codec_pipeline with its own decoded buffer (~1x
+                # sample), encoded MemoryStore (~0-1x sample) and codec scratch
+                # -> threads x PER_THREAD_WORKING_FACTOR.
                 decode_cache_mib = int(
                     threads_per_rank
                     * PER_THREAD_WORKING_FACTOR
@@ -1223,11 +1219,9 @@ def evaluate_combos(dataset_file,
 
             # -------------------------------------------------------------------------
             # q99 reference value (extreme-tail gate).  The 99th percentile of
-            # |original| over finite cells, computed ONCE per variable on the
-            # in-memory sample (cheap: a single reduction on already-resident
-            # data).  Passed into every per-combo metrics call so the tail
-            # error is accumulated against a fixed cut.  Only computed when the
-            # gate is on.
+            # |original| q99 over finite cells, computed ONCE per variable on the
+            # in-memory sample (one cheap reduction) and passed to every per-combo
+            # metrics call so the tail error uses a fixed cut.  Only when gated.
             q99_abs = None
             if extremes_sensitive:
                 finite_vals = sample_np[np.isfinite(sample_np)]
@@ -1252,13 +1246,13 @@ def evaluate_combos(dataset_file,
             def _evaluate_one(cfg):
                 (comp_idx, compressor), (filt_idx, filt), (ser_idx, serializer) = cfg
 
-                # Prep data + dims for this serializer's expectations
-                if _is_zfpy_serializer(serializer):
-                    data_np = sample_np.reshape(-1)  # flat view; no copy
-                    dims = ("flat_dim",)
-                else:
-                    data_np = sample_np
-                    dims = sample_da.dims
+                # The sample is passed at its natural shape; ZFPY combos use
+                # utils.ZFPYFlat, which flattens each chunk to 1-D internally
+                # (zfp's per-axis header limit cannot hold the cell dimension at
+                # >=3-D) and reshapes back on decode, so the store keeps natural
+                # dims while zfp only ever sees 1-D.
+                data_np = sample_np
+                dims = sample_da.dims
 
                 # Pipeline assembly rules (match original semantics)
                 filters_ = [filt]
@@ -1283,12 +1277,11 @@ def evaluate_combos(dataset_file,
                     serializer_ = "auto"
                     local_ser_idx = -1
 
-                # Chunks for the eval memory store.  Same algorithm as the
-                # persist path (compute_chunk_and_shard_shape) so the measured
-                # compression ratio reflects production conditions.  When
-                # --no-spatial-split is set, chunks may exceed --inner-chunk-mib
-                # (one timestep, full spatial); a warning is emitted once if
-                # they also exceed --max-inner-chunk-mib.
+                # Chunks for the eval store: same algorithm as the persist path
+                # (compute_chunk_and_shard_shape) so the measured ratio reflects
+                # production.  With --no-spatial-split, chunks may exceed
+                # --inner-chunk-mib (one timestep, full spatial); a warning fires
+                # once if they also exceed --max-inner-chunk-mib.
                 eval_chunks = utils.compute_chunk_shape_for_eval(
                     data_np.shape, data_np.dtype,
                     target_mib=inner_chunk_mib,
@@ -1312,15 +1305,15 @@ def evaluate_combos(dataset_file,
                     )
                     _evaluate_one._warned_oversize = True
 
-                # Gradient is a spatial-neighbourhood op: only meaningful on
-                # the natural-shape array.  Disable it for the zfpy flat view
-                # (axes wouldn't line up).
-                _do_gradient = bool(gradient_gate) and (data_np is sample_np)
+                # Gradient is a spatial-neighbourhood metric on the decoded
+                # natural-shape array, so it applies uniformly to all combos
+                # (ZFPY included; ZFPYFlat's per-chunk flatten is codec-internal).
+                _do_gradient = bool(gradient_gate)
                 _grad_axes = grad_axes if _do_gradient else None
-                # Short-circuit: hand the cheap-gate thresholds to the pipeline
-                # so the gradient (a second decode) is computed only for combos
-                # that already pass L1/L2/Linf/bias.  None -> force gradient on
-                # every combo (the --no-gradient-shortcircuit debug path).
+                # Short-circuit: pass the cheap-gate thresholds so the gradient
+                # (a second decode) runs only for combos that already pass
+                # L1/L2/Linf/bias.  None -> force gradient on every combo
+                # (the --no-gradient-shortcircuit debug path).
                 _precheck = eff_thr if (_do_gradient and gradient_shortcircuit) else None
 
                 ratio, errors, eucd = utils.evaluate_codec_pipeline(
@@ -1443,13 +1436,11 @@ def evaluate_combos(dataset_file,
                     failures_csv_writer.writerow([
                         "compressor", "filter", "serializer", "error",
                     ])
-                # From here on, per-combo threads provide parallelism.  Dask runs
-                # serially inside each thread to avoid nested thread pools.  The
-                # synchronous-scheduler setting is scoped with `with dask.config.set`
-                # so it reverts automatically when we leave the sweep block - it
-                # wouldn't leak in the CLI flow (one process per command), but this
-                # keeps evaluate_combos safe to import into notebooks or compose in
-                # longer-lived processes.
+                # From here on, per-combo threads provide parallelism; dask runs
+                # serially in each thread to avoid nested pools.  The
+                # synchronous-scheduler setting is scoped with `with
+                # dask.config.set` so it reverts on exit - harmless in the CLI
+                # flow, but keeps evaluate_combos safe to import elsewhere.
                 with dask.config.set(scheduler="synchronous"):
                     with ThreadPoolExecutor(max_workers=threads_per_rank) as pool:
                         future_to_cfg = {
@@ -1621,21 +1612,14 @@ def evaluate_combos(dataset_file,
                         f"({len(consolidated)} row(s))."
                     )
 
-                # -------------------------------------------------------------
-                # Winner selection from the COMPLETE on-disk record.
-                #
-                # The manifest MUST be a pure function of what is stored on disk
-                # (the consolidated parquet / per-rank CSVs), never of this
-                # process's in-memory `results`.  On --resume, a field whose
-                # combos were all scored in a PRIOR run has an empty in-memory
-                # `results` here (configs_pending was empty), while the CSVs
-                # still hold every scored combo.  Selecting from `results_gather`
-                # would then write best=null for an already-complete field -- a
-                # bug that strikes whenever a later pass (resume / re-split)
-                # re-touches a finished field.  Source the winner from the
-                # parquet so the manifest always reflects the real, recoverable
-                # record; fall back to in-memory results only if no CSV exists.
-                # -------------------------------------------------------------
+                # Winner selection from the COMPLETE on-disk record.  The manifest
+                # must be a pure function of what's stored (consolidated parquet /
+                # per-rank CSVs), never this process's in-memory `results`: on
+                # --resume a field scored in a PRIOR run has empty in-memory
+                # `results` while the CSVs still hold every combo, so selecting
+                # from `results_gather` would write best=null for a finished field.
+                # Source the winner from parquet; fall back to in-memory only if
+                # no CSV exists.
                 best = None
                 n_passed = 0
                 if consolidated is not None and len(consolidated):
@@ -1988,12 +1972,10 @@ def compress_with_optimal(dataset_file, where_to_write, field_to_compress,
                         "the sweep's best combo."
                     )
             # ---- library-version check ----
-            # Minor version differences (e.g. dask 2026.3.0 -> 2026.3.1) are
-            # usually harmless but decode paths in xarray / netCDF4 can shift
-            # bytes across version upgrades, which would trip the sample-
-            # signature hash check below.  We report differences here so the
-            # user can connect a hash mismatch to a library upgrade rather
-            # than hunting for a flag they didn't change.
+            # Minor version drift (e.g. dask 2026.3.0 -> .1) is usually harmless,
+            # but decode paths in xarray/netCDF4 can shift bytes across upgrades
+            # and trip the sample-signature hash below.  Report diffs so the user
+            # connects a hash mismatch to an upgrade rather than a missing flag.
             sweep_env = manifest.get("env", {}) or {}
             current_env = {
                 "zarr":  getattr(zarr, "__version__", None),
@@ -2046,17 +2028,14 @@ def compress_with_optimal(dataset_file, where_to_write, field_to_compress,
             abort_if_unsafe=oversubscription_check, rank=rank,
         )
 
-    # Both memory guardrails (write peak + codec-space sample) are deferred
-    # until after the dataset is opened, so we can check against the ACTUAL
-    # data size rather than a configuration upper bound.  Checking the
-    # raw `threads * shard_mib` here would spuriously abort tiny fields
-    # whose total bytes are smaller than a single shard.
+    # Both memory guardrails (write peak + codec sample) are deferred until the
+    # dataset is open, so we check the ACTUAL data size, not a config upper
+    # bound: a raw threads * shard_mib check here would spuriously abort tiny
+    # fields smaller than one shard.
 
-    # Scope the scheduler + worker-count settings to this function so they
-    # don't leak if compress_with_optimal is imported and called from a
-    # notebook or longer-lived process.  No-op difference for the single-
-    # command CLI flow (process exits immediately after), but matches the
-    # pattern used in evaluate_combos.
+    # Scope the scheduler + worker-count to this function so they don't leak if
+    # compress_with_optimal is imported into a notebook or long-lived process.
+    # No-op for the single-command CLI flow, but matches evaluate_combos.
     with dask.config.set(scheduler="threads", num_workers=int(threads)):
         click.echo(
             f"[topology] {cores_avail} core(s) visible; "
@@ -2073,11 +2052,9 @@ def compress_with_optimal(dataset_file, where_to_write, field_to_compress,
         field_bytes = int(da.dtype.itemsize) * int(np.prod(da.shape))
 
         # Memory guardrail for the write: documented peak is threads * shard_mib,
-        # but capped by field_bytes - you cannot have more transient working
-        # memory than there is data to process.  For a field smaller than one
-        # shard, the real peak is ~field_bytes; for a multi-GB field, it
-        # saturates at threads * shard_mib.  Rechunk transients can push
-        # 1.5-2x above that; we check against the documented peak as a floor.
+        # capped by field_bytes (can't use more transient memory than there is
+        # data).  Small field -> ~field_bytes; multi-GB -> threads * shard_mib.
+        # Rechunk transients can hit 1.5-2x; we check the documented peak as a floor.
         write_peak_bytes = min(int(threads) * int(shard_mib) * 2**20, field_bytes)
         _check_memory_headroom(
             write_peak_bytes,
@@ -2097,22 +2074,45 @@ def compress_with_optimal(dataset_file, where_to_write, field_to_compress,
             threshold=memory_threshold,
         )
 
-        # Sample for codec-space construction.  Same --eval-data-size-limit
-        # as the sweep -> identical pre-instantiated codec objects, so
-        # comp_idx/filt_idx/ser_idx resolve consistently.  This sample is
-        # NOT what gets compressed (we compress `da` below).
+        # Sample for codec-space construction only (we compress `da` below); it
+        # parameterises the codec space so comp_idx/filt_idx/ser_idx resolve to
+        # the same objects the sweep measured.  Reproduce the EXACT sweep sample:
+        # the sweep may have auto-shrunk its budget (and used a non-default
+        # policy/floor), all recorded in the signature, so read those and feed the
+        # builder.  Without a signature, fall back to the raw CLI limit/defaults.
+        sig_path = _signature_path(where_to_write, str(field_to_compress))
+        _expected_sig = None
+        if sig_path.is_file():
+            try:
+                _expected_sig = json.loads(sig_path.read_text())
+            except Exception as _sig_read_err:
+                click.echo(
+                    f"[sample-hash] WARNING: could not read {sig_path.name}: "
+                    f"{_sig_read_err}.  Falling back to --eval-data-size-limit."
+                )
+                _expected_sig = None
+
+        _build_limit = int(eval_data_size_limit)
+        _build_policy = "cascade"
+        _build_vfloor = None
+        if _expected_sig is not None:
+            _build_limit = int(
+                _expected_sig.get("effective_sample_limit", eval_data_size_limit)
+            )
+            _build_policy = _expected_sig.get("sampling_policy", "cascade") or "cascade"
+            _build_vfloor = _expected_sig.get("vertical_floor", None)
+
         sample_for_codec_space = utils.build_representative_sample(
-            da, eval_data_size_limit,
+            da, _build_limit, policy=_build_policy, vertical_floor=_build_vfloor,
         ).compute()
 
         # Sample reproducibility hash: if evaluate_combos wrote a signature,
         # recompute and compare.  Mismatch means codec-space indices resolve
         # to different objects than the sweep measured — refuse to continue.
         # Absent signature: warn once and proceed (older sweep, manual indices).
-        sig_path = _signature_path(where_to_write, str(field_to_compress))
-        if sig_path.is_file():
+        if _expected_sig is not None:
             try:
-                expected = json.loads(sig_path.read_text())
+                expected = _expected_sig
                 sample_np_view = np.ascontiguousarray(
                     sample_for_codec_space.values
                 )
@@ -2122,10 +2122,18 @@ def compress_with_optimal(dataset_file, where_to_write, field_to_compress,
                     eval_data_size_limit=int(eval_data_size_limit),
                     sample_np=sample_np_view,
                 )
-                fields_to_check = (
-                    "dataset_stem", "var", "eval_data_size_limit",
+                fields_to_check = [
+                    "dataset_stem", "var",
                     "shape", "dtype", "nbytes", "sha256",
-                )
+                ]
+                # Only compare the CLI eval_data_size_limit when it actually
+                # determined the sample.  New-style signatures carry
+                # effective_sample_limit (we rebuilt from THAT), so
+                # shape/nbytes/sha256 are the identity check and the CLI value is
+                # cosmetic — comparing it would falsely abort.  Old signatures
+                # lack the key; there the CLI value built the sample, so keep it.
+                if "effective_sample_limit" not in expected:
+                    fields_to_check.append("eval_data_size_limit")
                 mismatches = [
                     f for f in fields_to_check
                     if expected.get(f) != observed.get(f)
@@ -2141,8 +2149,12 @@ def compress_with_optimal(dataset_file, where_to_write, field_to_compress,
                             f"observed={observed.get(f)}"
                         )
                     click.echo(
-                        "  Most common cause: different --eval-data-size-limit "
-                        "between sweep and reuse.  Re-run with matching flag."
+                        "  Causes: a different --eval-data-size-limit passed "
+                        "here than at sweep time (the 'eval_data_size_limit' "
+                        "field), or the underlying field/dataset changed since "
+                        "the sweep (shape/dtype/sha256).  The sweep's sampling "
+                        "budget and policy are taken from the signature, so a "
+                        "memory auto-shrink on the sweep node is NOT a cause."
                     )
                     sys.exit(1)
                 else:
@@ -2159,11 +2171,15 @@ def compress_with_optimal(dataset_file, where_to_write, field_to_compress,
                     f"{sig_path.name}: {sig_err}.  Proceeding without check."
                 )
         else:
-            click.echo(
-                f"[sample-hash] no {sig_path.name} found - proceeding on "
-                f"trust.  (For the full safety net, run evaluate_combos "
-                f"first with the same --where-to-write.)"
-            )
+            # _expected_sig is None: either the file is absent, or it existed
+            # but failed to parse (a "could not read" warning was already
+            # emitted above).  Either way we proceed without the hash check.
+            if not sig_path.is_file():
+                click.echo(
+                    f"[sample-hash] no {sig_path.name} found - proceeding on "
+                    f"trust.  (For the full safety net, run evaluate_combos "
+                    f"first with the same --where-to-write.)"
+                )
 
         # Full-field range for FixedScaleOffset, computed once on rank 0 and
         # broadcast so it is IDENTICAL to the value evaluate_combos used (the
@@ -2175,6 +2191,26 @@ def compress_with_optimal(dataset_file, where_to_write, field_to_compress,
         filters     = utils.filter_space(sample_for_codec_space, with_lossy, filter_class,
                                          data_range=fso_data_range)
         serializers = utils.serializer_space(sample_for_codec_space, with_lossy, serializer_class)
+
+        # Extreme-tail (q99) cut for the production verify gate.  Recomputed from
+        # the SAME sample the sweep used (reconstructed above), so it equals the
+        # sweep's q99_abs — no need to store it, and it works with pre-gate
+        # manifests.  Cells with |value| >= q99_abs are the tail; the gate below
+        # checks the full-field relative L1 over that tail against the manifest
+        # q99 threshold.  Only meaningful with --verify; harmless otherwise.
+        verify_q99_abs = None
+        if verify:
+            try:
+                _samp = np.ascontiguousarray(sample_for_codec_space.values)
+                _finite = _samp[np.isfinite(_samp)]
+                if _finite.size:
+                    verify_q99_abs = float(np.quantile(np.abs(_finite), 0.99))
+                del _samp, _finite
+            except Exception as _q99_err:
+                click.echo(
+                    f"[verify-gate] WARNING: could not compute q99 cut for "
+                    f"{field_to_compress}: {_q99_err}; q99 gate will be skipped."
+                )
 
         # Index validation
         for name, idx, arr in [("comp_idx", comp_idx, compressors),
@@ -2188,11 +2224,16 @@ def compress_with_optimal(dataset_file, where_to_write, field_to_compress,
         optimal_filter     = filters[filt_idx][1]     if filt_idx != -1 else None
         optimal_serializer = serializers[ser_idx][1]  if ser_idx  != -1 else None
 
-        # Per-serializer data shaping (on the FULL field, not the sample).
-        # zfpy expects a flat layout.
+        # Guard manual/invalid combos before writing (sweep winners are always
+        # valid; a hand-passed triple might not be).
+        _validate_resolved_combo(
+            optimal_filter, optimal_serializer,
+            context=str(field_to_compress),
+        )
+
+        # Written at natural shape; ZFPY (ZFPYFlat) flattens each chunk to 1-D
+        # internally while the store keeps the real dims.
         data_to_persist = da
-        if _is_zfpy_serializer(optimal_serializer):
-            data_to_persist = da.stack(flat_dim=da.dims)
 
         # Pipeline assembly rules (same semantics as the original)
         filters_ = [optimal_filter]
@@ -2205,11 +2246,10 @@ def compress_with_optimal(dataset_file, where_to_write, field_to_compress,
         if optimal_serializer is None:
             serializer_ = "auto"
 
-        # Compute sharding geometry for the FULL field.  Passes dim names so
-        # vertical-like dims are kept whole when spatial splitting is needed
-        # (hiopy approach).  shards may come back as None -- that signals
-        # "skip sharding" because one inner chunk already meets the shard
-        # target (a shard would bundle <= 1 chunk and add only index overhead).
+        # Sharding geometry for the FULL field.  Dim names are passed so
+        # vertical-like dims stay whole when spatial splitting is needed.
+        # shards=None signals "skip sharding" because one inner chunk already
+        # meets the shard target (a shard would bundle <=1 chunk, only overhead).
         inner_chunks, shards = utils.compute_chunk_and_shard_shape(
             data_to_persist.shape, data_to_persist.dtype,
             inner_mib=inner_chunk_mib, shard_mib=shard_mib,
@@ -2265,12 +2305,10 @@ def compress_with_optimal(dataset_file, where_to_write, field_to_compress,
                 f"{humanize.naturalsize(_shard_bytes, binary=True)})"
             )
 
-        # Refined memory guardrail using ACTUAL write-unit bytes (one task =
-        # one shard if sharded, one chunk otherwise).  The earlier check at
-        # the top of the dask context used `threads * shard_mib` as an
-        # upper-bound estimate, but that can under-count when chunks are
-        # oversized (--no-spatial-split + huge timestep) or over-count when
-        # the field is small.  Now that we know the real geometry, re-check.
+        # Refined memory guardrail using ACTUAL write-unit bytes (one task = one
+        # shard if sharded, else one chunk).  The earlier threads * shard_mib
+        # estimate can under-count with oversized chunks (--no-spatial-split) or
+        # over-count on small fields; re-check now that the geometry is known.
         _write_unit_bytes = _shard_bytes  # == _inner_bytes when shards is None
         _real_write_peak = min(int(threads) * int(_write_unit_bytes), field_bytes)
         _check_memory_headroom(
@@ -2288,6 +2326,7 @@ def compress_with_optimal(dataset_file, where_to_write, field_to_compress,
             filters=filters_, compressors=compressors_, serializer=serializer_,
             inner_chunks=inner_chunks, shards=shards,
             verify=verify, verbose=False, rank=rank,
+            q99_abs=verify_q99_abs,
         )
         persist_seconds = time.perf_counter() - persist_t0
 
@@ -2314,14 +2353,10 @@ def compress_with_optimal(dataset_file, where_to_write, field_to_compress,
             summary += "  (error metrics skipped: --no-verify)"
         click.echo(summary)
 
-        # ------------------------------------------------------------------
-        # Verify gate (Layer: sample-vs-production drift).
-        # When --verify is on, compare the PRODUCTION error norms against the
-        # gate thresholds and abort if any are exceeded.  Thresholds come from
-        # the sweep manifest (manifest_{field}.json) unless overridden on the
-        # CLI.  Runs on rank 0; the decision is broadcast so every rank exits
-        # together.
-        # ------------------------------------------------------------------
+        # Verify gate (sample-vs-production drift): when --verify is on, compare
+        # the PRODUCTION error norms against the gate thresholds (from the sweep
+        # manifest unless overridden on the CLI) and abort if any are exceeded.
+        # Runs on rank 0; the decision is broadcast so every rank exits together.
         gate_abort = False
         if verify and errors is not None:
             # Resolve thresholds: CLI override > sweep manifest > skip-with-warn.
@@ -2375,7 +2410,11 @@ def compress_with_optimal(dataset_file, where_to_write, field_to_compress,
                         l2_rel=errors.get("Relative_Error_L2"),
                         linf_rel=errors.get("Relative_Error_Linf"),
                         bias_rel=errors.get("Bias_Rel"),
-                        q99_rel=None,            # q99 not recomputed on full field
+                        # Full-field extreme-tail error vs the sweep's q99
+                        # threshold, against the sweep's q99_abs cut (recomputed
+                        # from the same sample).  None if q99 wasn't active or the
+                        # cut couldn't be computed -> the gate is a no-op.
+                        q99_rel=errors.get("Q99_Rel"),
                         grad_rel=None,           # gradient not recomputed here
                         decoded_min=None, decoded_max=None,
                         n_corrupt=errors.get("N_Corrupt", 0),
@@ -2390,17 +2429,20 @@ def compress_with_optimal(dataset_file, where_to_write, field_to_compress,
                         )
                     else:
                         failed = [k for k, ok in reasons.items() if not ok]
+                        def _f(x):
+                            return f"{x:.3e}" if isinstance(x, float) else "n/a"
                         click.echo(
                             "[verify-gate] FAIL: production verification "
                             f"exceeded the thresholds ({', '.join(failed)}).\n"
-                            f"  L1={errors.get('Relative_Error_L1'):.3e} "
-                            f"L2={errors.get('Relative_Error_L2'):.3e} "
-                            f"Linf={errors.get('Relative_Error_Linf'):.3e} "
-                            f"bias={errors.get('Bias_Rel'):.3e} "
+                            f"  L1={_f(errors.get('Relative_Error_L1'))} "
+                            f"L2={_f(errors.get('Relative_Error_L2'))} "
+                            f"Linf={_f(errors.get('Relative_Error_Linf'))} "
+                            f"bias={_f(errors.get('Bias_Rel'))} "
+                            f"q99={_f(errors.get('Q99_Rel'))} "
                             f"n_corrupt={errors.get('N_Corrupt', 0)}\n"
                             f"  thresholds: L1={vg_thr['l1']:.3e} "
                             f"L2={vg_thr['l2']:.3e} Linf={vg_thr['linf']:.3e} "
-                            f"bias={vg_thr['bias']:.3e}"
+                            f"bias={vg_thr['bias']:.3e} q99={vg_thr['q99']:.3e}"
                         )
                         if verify_gate:
                             click.echo(
@@ -2419,12 +2461,9 @@ def compress_with_optimal(dataset_file, where_to_write, field_to_compress,
         if gate_abort:
             comm.Abort(2)
 
-        # ------------------------------------------------------------------
-        # Per-field persist manifest (machine-readable).
-        # Mirrors the evaluate_combos manifest so a downstream tool can pick
-        # up the exact combo that was written, which shards were produced,
-        # and how long it took.
-        # ------------------------------------------------------------------
+        # Per-field persist manifest (machine-readable): mirrors the
+        # evaluate_combos manifest so a downstream tool can pick up the exact
+        # combo written, which shards were produced, and the timing.
         persist_manifest = {
             "command": "compress_with_optimal",
             "dataset_file": os.fspath(dataset_file),
@@ -2456,7 +2495,7 @@ def compress_with_optimal(dataset_file, where_to_write, field_to_compress,
             "filter":     str(optimal_filter),
             "serializer": str(optimal_serializer),
             "ratio": float(ratio),
-            "errors": {k: float(v) for k, v in (errors or {}).items()},
+            "errors": {k: (float(v) if v is not None else None) for k, v in (errors or {}).items()},
             "eucd": (float(eucd) if eucd is not None else None),
             "persist_seconds": float(persist_seconds),
             "env": {
@@ -2605,12 +2644,10 @@ def compress_fields_from_results(dataset_file, where_to_write, vars_filter,
         utils.check_thread_oversubscription(
             abort_if_unsafe=oversubscription_check, rank=rank,
         )
-    # Per-variable memory checks (write peak AND codec-space sample) happen
-    # inside the loop below, once we know each variable's actual size.
-    # A single up-front `threads * shard_mib` check would spuriously abort
-    # on small fields (e.g. tigge files where the field is smaller than
-    # one shard) on memory-constrained nodes; a sum-based pre-check would
-    # miss that variables are processed sequentially, not concurrently.
+    # Per-variable memory checks (write peak AND codec sample) run inside the loop
+    # once each variable's size is known.  An up-front threads * shard_mib check
+    # would spuriously abort on small fields (e.g. tigge); a sum-based pre-check
+    # would wrongly assume variables run concurrently rather than sequentially.
 
     # Resolve (var, comp_idx, filt_idx, ser_idx) from where_to_write.  Prefer
     # manifest_{var}.json; fall back to best-ratio in results_{var}.parquet.
@@ -2638,11 +2675,10 @@ def compress_fields_from_results(dataset_file, where_to_write, vars_filter,
         except Exception as e:
             click.echo(f"[batch] WARNING: failed to parse {mpath}: {e}")
 
-    # One-shot library-version cross-check.  Same rationale as the one in
-    # compress_with_optimal: if zarr/numpy/dask differ between the sweep
-    # and now, the sample bytes may shift (decode path) and the per-var
-    # signature checks in the loop below may trip for environmental rather
-    # than user reasons.  Reporting here connects the two for the user.
+    # One-shot library-version cross-check (same rationale as
+    # compress_with_optimal): if zarr/numpy/dask differ from the sweep, the
+    # sample bytes may shift and the per-var signature checks below could trip
+    # for environmental rather than user reasons.  Reporting connects the two.
     if sweep_env:
         current_env = {
             "zarr":  getattr(zarr, "__version__", None),
@@ -2678,7 +2714,18 @@ def compress_fields_from_results(dataset_file, where_to_write, vars_filter,
             continue
         try:
             dfp = pd.read_parquet(ppath)
-            kept = dfp[dfp["keep"] == True] if "keep" in dfp.columns else dfp
+            # Robust keep parse (mirrors the manifest derivation in
+            # evaluate_combos).  A bare `dfp["keep"] == True` is fragile to
+            # parquet/pandas dtype round-trips (string "True"/"False", NaN object
+            # cols) and could match nothing, so normalise to string first.
+            if "keep" in dfp.columns:
+                _keep_mask = (
+                    dfp["keep"].astype(str).str.strip().str.lower()
+                    .isin(("true", "1"))
+                )
+                kept = dfp[_keep_mask]
+            else:
+                kept = dfp
             if len(kept) == 0:
                 click.echo(f"[batch] {var_name}: no kept rows in {ppath.name}; skipping.")
                 continue
@@ -2767,14 +2814,11 @@ def compress_fields_from_results(dataset_file, where_to_write, vars_filter,
                 field_t0 = time.perf_counter()
                 da = ds[var]
 
-                # Per-variable memory guards: check the ACTUAL allocation
-                # size against available RAM, not configuration upper bounds.
-                # Both the write peak (threads * shard_mib) and the codec-
-                # space sample (eval_data_size_limit) are upper bounds; for
-                # fields smaller than those bounds, the real allocation is
-                # capped by field_bytes.  Aborting on the upper bound would
-                # spuriously trip on tiny fields (e.g. tigge dx=2) on
-                # memory-constrained nodes.
+                # Per-variable memory guards: check the ACTUAL allocation against
+                # available RAM, not config upper bounds.  The write peak
+                # (threads * shard_mib) and codec sample (eval_data_size_limit)
+                # are upper bounds; for small fields the real allocation is capped
+                # by field_bytes, so the bound would spuriously trip (e.g. tigge).
                 field_bytes = int(da.dtype.itemsize) * int(np.prod(da.shape))
 
                 write_peak_bytes = min(
@@ -2798,15 +2842,45 @@ def compress_fields_from_results(dataset_file, where_to_write, vars_filter,
                 )
 
                 # Build codec space from the sample (same contract as
-                # compress_with_optimal).  Verify against signature when present.
-                sample_for_codec_space = utils.build_representative_sample(
-                    da, eval_data_size_limit,
-                ).compute()
-
+                # compress_with_optimal).  Reproduce the EXACT sweep sample from
+                # the signature's recorded budget + policy/floor; without one,
+                # fall back to the raw CLI limit.  Prevents a spurious hash
+                # mismatch (and silent skip) when the sweep auto-shrank the budget.
                 sig_path = _signature_path(where_to_write, str(var))
+                _expected_sig = None
                 if sig_path.is_file():
                     try:
-                        expected = json.loads(sig_path.read_text())
+                        _expected_sig = json.loads(sig_path.read_text())
+                    except Exception as _sig_read_err:
+                        click.echo(
+                            f"[sample-hash] WARNING {var}: could not read "
+                            f"{sig_path.name}: {_sig_read_err}; "
+                            f"falling back to --eval-data-size-limit."
+                        )
+                        _expected_sig = None
+
+                _build_limit = int(eval_data_size_limit)
+                _build_policy = "cascade"
+                _build_vfloor = None
+                if _expected_sig is not None:
+                    _build_limit = int(
+                        _expected_sig.get(
+                            "effective_sample_limit", eval_data_size_limit
+                        )
+                    )
+                    _build_policy = (
+                        _expected_sig.get("sampling_policy", "cascade") or "cascade"
+                    )
+                    _build_vfloor = _expected_sig.get("vertical_floor", None)
+
+                sample_for_codec_space = utils.build_representative_sample(
+                    da, _build_limit,
+                    policy=_build_policy, vertical_floor=_build_vfloor,
+                ).compute()
+
+                if _expected_sig is not None:
+                    try:
+                        expected = _expected_sig
                         sample_np_view = np.ascontiguousarray(
                             sample_for_codec_space.values
                         )
@@ -2816,11 +2890,18 @@ def compress_fields_from_results(dataset_file, where_to_write, vars_filter,
                             eval_data_size_limit=int(eval_data_size_limit),
                             sample_np=sample_np_view,
                         )
+                        _fields_to_check = [
+                            "dataset_stem", "var",
+                            "shape", "dtype", "nbytes", "sha256",
+                        ]
+                        # See compress_with_optimal: compare the CLI
+                        # eval_data_size_limit only for old-style signatures
+                        # where it built the sample.  New-style ones rebuild from
+                        # effective_sample_limit (shape/nbytes/sha256 authoritative).
+                        if "effective_sample_limit" not in expected:
+                            _fields_to_check.append("eval_data_size_limit")
                         mismatches = [
-                            f for f in (
-                                "dataset_stem", "var", "eval_data_size_limit",
-                                "shape", "dtype", "nbytes", "sha256",
-                            )
+                            f for f in _fields_to_check
                             if expected.get(f) != observed.get(f)
                         ]
                         del sample_np_view
@@ -2831,8 +2912,10 @@ def compress_fields_from_results(dataset_file, where_to_write, vars_filter,
                             )
                             if continue_on_error:
                                 click.echo(
-                                    f"[batch] skipping {var} (use matching "
-                                    f"--eval-data-size-limit to fix)."
+                                    f"[batch] skipping {var}: a different "
+                                    f"--eval-data-size-limit than at sweep time, "
+                                    f"or the field/dataset changed since the "
+                                    f"sweep."
                                 )
                                 results_by_var[var] = {"status": "signature-mismatch"}
                                 continue
@@ -2857,6 +2940,24 @@ def compress_fields_from_results(dataset_file, where_to_write, vars_filter,
                     sample_for_codec_space, with_lossy, serializer_class,
                 )
 
+                # Extreme-tail (q99) cut for the verify gate, recomputed from
+                # the same sample the sweep used (so it matches the sweep's
+                # q99_abs exactly).  Only used when --verify is on; the gate
+                # itself fires only if the manifest carries a q99 threshold.
+                verify_q99_abs = None
+                if verify:
+                    try:
+                        _samp = np.ascontiguousarray(sample_for_codec_space.values)
+                        _finite = _samp[np.isfinite(_samp)]
+                        if _finite.size:
+                            verify_q99_abs = float(np.quantile(np.abs(_finite), 0.99))
+                        del _samp, _finite
+                    except Exception as _q99_err:
+                        click.echo(
+                            f"[verify-gate] {var}: WARNING could not compute q99 "
+                            f"cut: {_q99_err}; q99 gate skipped."
+                        )
+
                 comp_idx = c["comp_idx"]; filt_idx = c["filt_idx"]; ser_idx = c["ser_idx"]
                 for name, idx2, arr in [("comp_idx", comp_idx, compressors),
                                         ("filt_idx", filt_idx, filters_space),
@@ -2870,9 +2971,14 @@ def compress_fields_from_results(dataset_file, where_to_write, vars_filter,
                 optimal_filter     = filters_space[filt_idx][1] if filt_idx != -1 else None
                 optimal_serializer = serializers[ser_idx][1]  if ser_idx  != -1 else None
 
+                # Guard against an invalid resolved combo (sweep winners are
+                # always valid; a stale/foreign manifest might not be).
+                _validate_resolved_combo(
+                    optimal_filter, optimal_serializer, context=str(var),
+                )
+
+                # Natural shape for every serializer, including ZFPY.
                 data_to_persist = da
-                if _is_zfpy_serializer(optimal_serializer):
-                    data_to_persist = da.stack(flat_dim=da.dims)
 
                 filters_ = [optimal_filter]
                 compressors_ = [optimal_compressor]
@@ -2950,6 +3056,7 @@ def compress_fields_from_results(dataset_file, where_to_write, vars_filter,
                         filters=filters_, compressors=compressors_, serializer=serializer_,
                         inner_chunks=inner_chunks, shards=shards,
                         verify=verify, verbose=False, rank=rank,
+                        q99_abs=verify_q99_abs,
                     )
                 finally:
                     close = getattr(store, "close", None)
@@ -3000,7 +3107,9 @@ def compress_fields_from_results(dataset_file, where_to_write, vars_filter,
                             l2_rel=errors.get("Relative_Error_L2"),
                             linf_rel=errors.get("Relative_Error_Linf"),
                             bias_rel=errors.get("Bias_Rel"),
-                            q99_rel=None, grad_rel=None,
+                            # Full-field extreme-tail error vs the sweep's q99
+                            # threshold (None -> gate is a no-op).
+                            q99_rel=errors.get("Q99_Rel"), grad_rel=None,
                             decoded_min=None, decoded_max=None,
                             n_corrupt=errors.get("N_Corrupt", 0),
                             thr=thr, grad_threshold=None, grad_gate=False,
@@ -3008,12 +3117,15 @@ def compress_fields_from_results(dataset_file, where_to_write, vars_filter,
                         )
                         if not keep:
                             failed = [k for k, ok in reasons.items() if not ok]
+                            def _f(x):
+                                return f"{x:.3e}" if isinstance(x, float) else "n/a"
                             msg = (
                                 f"{var}: verify gate FAILED "
                                 f"({', '.join(failed)}) | "
-                                f"L1={errors.get('Relative_Error_L1'):.3e} "
-                                f"L2={errors.get('Relative_Error_L2'):.3e} "
-                                f"Linf={errors.get('Relative_Error_Linf'):.3e}"
+                                f"L1={_f(errors.get('Relative_Error_L1'))} "
+                                f"L2={_f(errors.get('Relative_Error_L2'))} "
+                                f"Linf={_f(errors.get('Relative_Error_Linf'))} "
+                                f"q99={_f(errors.get('Q99_Rel'))}"
                             )
                             if verify_gate:
                                 raise RuntimeError(msg)
@@ -3086,7 +3198,7 @@ def compress_fields_from_results(dataset_file, where_to_write, vars_filter,
                                         if predicted_ratio is not None else None),
                     "cr_drift": (float(cr_drift_value)
                                  if cr_drift_value is not None else None),
-                    "errors": {k: float(v) for k, v in (errors or {}).items()},
+                    "errors": {k: (float(v) if v is not None else None) for k, v in (errors or {}).items()},
                     "eucd": (float(eucd) if eucd is not None else None),
                     "seconds": float(field_seconds),
                     "comp_idx": int(comp_idx),
@@ -3160,10 +3272,9 @@ def merge_compressed_fields(dataset_file: str, compressed_files_location: str):
         sys.exit(1)
 
     # Open in a try/finally so the LocalStore handles are released even if
-    # consolidate_metadata or the subsequent array listing raises.  Zarr v3's
-    # LocalStore holds open file descriptors; at CLI-shape the OS would reap
-    # them on process exit, but merging via an imported function (notebook /
-    # longer-lived process) would leak them without an explicit close.
+    # consolidate_metadata or the array listing raises.  Zarr v3's LocalStore
+    # holds open fds; the OS reaps them on CLI exit, but merging via an imported
+    # function (notebook / long-lived process) would leak them without a close.
     store = zarr.storage.LocalStore(merged_path, read_only=False)
     try:
         zarr.consolidate_metadata(store)
@@ -3363,11 +3474,10 @@ def from_nc_to_zarr(nc_path: str, out_zarr: str | None,
         threads = utils.detect_cores_available()
 
     click.echo(f"[nc->zarr] reading {nc_path} ...")
-    # chunks={} -> dask chunks track HDF5 chunks 1:1 (the default for this
-    # command).  chunks="auto" -> dask picks a chunking, used as a fallback
-    # for non-chunked sources.  We never use chunks=None because that would
-    # eagerly materialise the whole field in RAM, and there's no need: we
-    # always want lazy reads paired with the streaming to_zarr write.
+    # chunks={} -> dask tracks HDF5 chunks 1:1 (the default here); chunks="auto"
+    # -> dask picks a chunking, a fallback for non-chunked sources.  Never
+    # chunks=None: that eagerly materialises the whole field in RAM, and we want
+    # lazy reads paired with the streaming to_zarr write.
     chunks = {} if preserve_source_chunks else "auto"
     # mask_and_scale=False keeps packed int dtypes packed; decode_times=False
     # keeps time coords as raw numerics.  See the docstring and the option
@@ -3388,14 +3498,12 @@ def from_nc_to_zarr(nc_path: str, out_zarr: str | None,
             f"| dask workers = {threads}"
         )
 
-        # Per-variable encoding override.  Two layers of defense:
-        # 1. Clear .encoding on every variable so any netCDF-side encoding keys
-        #    (zlib, shuffle, chunksizes, _FillValue, ...) inherited from
-        #    xr.open_dataset don't leak into xarray's encoding-translation layer.
-        # 2. Pass an explicit `compressors=None, filters=None` per variable to
-        #    `to_zarr`, which wins over anything still residual.
-        # We iterate over ds.variables (data_vars + coords) so coordinate arrays
-        # are included; see the docstring for why.
+        # Per-variable encoding override, two layers of defense:
+        # 1. Clear .encoding on every variable so netCDF-side keys (zlib, shuffle,
+        #    chunksizes, _FillValue, ...) from open_dataset don't leak in.
+        # 2. Pass explicit `compressors=None, filters=None` to `to_zarr`, which
+        #    wins over anything residual.
+        # Iterate ds.variables (data_vars + coords) so coordinate arrays are included.
         encoding = {}
         for name in ds.variables:
             ds[name].encoding = {}
@@ -3466,12 +3574,10 @@ def from_zarr_to_netcdf(zarr_path: str, out_nc: str | None,
     _apply_codec_threads(codec_threads)
     _check_thread_product(threads, codec_threads)
 
-    # Load via xarray; this preserves dims/coords if consolidated metadata exists.
-    # The previous heuristic (Path(zarr_path)/"zarr.json").exists() was wrong:
-    # every zarr v3 store has a zarr.json, consolidated or not.  Consolidation
-    # in v3 is a `consolidated_metadata` field *inside* that zarr.json.  We try
-    # consolidated first (fast path) and fall back to a metadata scan if the
-    # store wasn't processed by `merge_compressed_fields`.
+    # Load via xarray (preserves dims/coords if consolidated metadata exists).
+    # Every zarr v3 store has a zarr.json; consolidation is a
+    # `consolidated_metadata` field inside it, so try consolidated first (fast
+    # path) and fall back to a metadata scan.
     with dask.config.set(scheduler="threads", num_workers=int(threads)):
         try:
             ds = xr.open_zarr(zarr_path, chunks="auto", consolidated=True)
@@ -3545,9 +3651,28 @@ def perform_clustering(npy_file: str, l_error: str):
     scored_results_pd = scored_results_pd[mask].dropna()
     l_options = ["L1", "L2", "LInf"]
     error_index = [i_l+1 for i_l, l in enumerate(l_options) if l_error == l]
+    if not error_index:
+        raise click.ClickException(
+            f"--l-error must be one of {l_options}; got {l_error!r}."
+        )
+
+    # Robustness guard.  The scored-results .npy holds only combos that PASSED, so
+    # a field where little passed yields a tiny/empty table.  KMeans needs
+    # n_samples >= n_clusters and silhouette 2 <= k <= n-1, so bail out clearly
+    # (and cap k to the row count) instead of crashing.
+    n_rows = len(scored_results_pd)
+    k_max = min(9, n_rows - 1)
+    if k_max < 3:
+        click.echo(
+            f"[perform_clustering] only {n_rows} finite passing combo(s) in "
+            f"{Path(npy_file).name}; need >= 4 to cluster (k>=3).  Nothing to "
+            f"plot.  A near-empty .npy usually means almost no combo passed the "
+            f"sweep gates for this field."
+        )
+        return
     clean_arr_inf = np.hstack((np.asarray(scored_results_pd[[0]]), np.asarray(scored_results_pd[[error_index[0]]])))
 
-    k_values = range(3, 10)
+    k_values = range(3, k_max + 1)
     inertias = []
     silhouette_scores = []
 
@@ -3611,14 +3736,10 @@ def analyze_clustering(npy_file: str, where_to_write: str, var: str):
     import plotly.graph_objects as go
     from plotly.subplots import make_subplots
 
-    # evaluate_combos now writes config_space_{var}.csv into {where_to_write}
-    # (renamed from the old cwd-relative `config_space.csv`).  Resolve it
-    # explicitly from the required flags so analyze_clustering can be run
-    # from any working directory.  Both flags are required — no magic
-    # fallback to cwd — because guessing would reintroduce the same
-    # footgun: the old `pd.read_csv("config_space.csv")` silently picked
-    # up whatever happened to be in cwd (possibly a stale file from a
-    # different run).
+    # evaluate_combos writes config_space_{var}.csv into {where_to_write}; resolve
+    # it from the required flags so analyze_clustering runs from any directory.
+    # Both flags are required (no cwd fallback): the old read_csv("config_space.csv")
+    # silently picked up whatever stale file was in cwd.
     config_csv_path = Path(where_to_write) / f"config_space_{var}.csv"
     if not config_csv_path.is_file():
         raise click.FileError(
@@ -3638,12 +3759,28 @@ def analyze_clustering(npy_file: str, where_to_write: str, var: str):
     mask = np.isfinite(scored_results_pd[numeric_cols]).all(axis=1)
     scored_results_pd = scored_results_pd[mask].dropna()
 
+    # Robustness guard: the scored-results .npy holds only combos that PASSED
+    # the sweep gates.  An empty table (almost nothing passed) has no columns to
+    # slice and would make n_clusters degenerate, so bail out clearly.
+    n_rows = len(scored_results_pd)
+    if n_rows == 0:
+        click.echo(
+            f"[analyze_clustering] no finite passing combos in "
+            f"{Path(npy_file).name}; nothing to cluster or plot.  (The .npy "
+            f"holds only combos that passed the sweep gates for this field.)"
+        )
+        return
+
     clean_arr_l1 = utils.slice_array(scored_results_pd, [0, 1, 5, 6, 7])
     clean_arr_l2 = utils.slice_array(scored_results_pd, [0, 2, 5, 6, 7])
     clean_arr_linf = utils.slice_array(scored_results_pd, [0, 3, 5, 6, 7])
 
     max_n_rows, max_nclusters = 42976, 6
-    adjusted_n_clusters = math.ceil(max_nclusters * len(scored_results_pd) / max_n_rows)
+    # Clamp to [1, n_rows] so KMeans never gets n_clusters == 0 (tiny tables) or
+    # n_clusters > n_samples.
+    adjusted_n_clusters = max(
+        1, min(n_rows, math.ceil(max_nclusters * n_rows / max_n_rows))
+    )
 
     # Plot Error and Similarity Metrics VS Ratio
     kmeans = KMeans(n_clusters=adjusted_n_clusters, random_state=0, n_init="auto")
@@ -3884,6 +4021,12 @@ def plot_compression_errors(dataset_file: str, where_to_write: str, field_to_com
     selected_filter = filters[filt_idx][1] if filt_idx != -1 else None
     selected_serializer = serializers[ser_idx][1] if ser_idx != -1 else None
 
+    # Re-check the manual (comp, filt, ser) triple before compressing; the
+    # pairing check (e.g. FixedScaleOffset->ZFPY) catches invalid combos.
+    _validate_resolved_combo(
+        selected_filter, selected_serializer, context=field_to_compress,
+    )
+
     chunks_size = 'auto'
 
     filters_ = [selected_filter,]
@@ -3911,15 +4054,8 @@ def plot_compression_errors(dataset_file: str, where_to_write: str, field_to_com
     shifted_da = da.roll({lon_dim: -half_idx}, roll_coords=False)
     shifted_da_backshifted = shifted_da.roll({lon_dim: half_idx}, roll_coords=False)
 
-    # Flatten data for ZFPY serializer
-    if isinstance(selected_serializer, zarrcodecs_nc.ZFPY):
-        # Save the original dims BEFORE mutating `da`.  Using `da.dims` on the
-        # second stack call after the first one runs would read the stacked
-        # shape (`("flat_dim",)`), so xarray would try to stack `shifted_da`
-        # on a dimension it doesn't have and raise ValueError.
-        orig_dims = da.dims
-        da = da.stack(flat_dim=orig_dims)
-        shifted_da = shifted_da.stack(flat_dim=orig_dims)
+    # No DataArray stacking needed: the field is written at its natural
+    # (lat, lon) shape; ZFPYFlat handles any chunk shape internally.
 
     ############
     # COMPRESS #
@@ -3959,12 +4095,8 @@ def plot_compression_errors(dataset_file: str, where_to_write: str, field_to_com
     # Shifted
     shifted_da_decompressed = xr.DataArray(shifted_da_compressed[:], dims=da.dims, coords=da.coords)
 
-    # Reshape the data to its original dimensions for ZFPY serializer
-    if isinstance(selected_serializer, zarrcodecs_nc.ZFPY):
-        da = da.unstack("flat_dim")
-        shifted_da = shifted_da.unstack("flat_dim")
-        da_decompressed = da_decompressed.unstack("flat_dim")
-        shifted_da_decompressed = shifted_da_decompressed.unstack("flat_dim")
+    # No unstacking: ZFPY compressed the field at its natural (lat, lon) shape,
+    # so the decompressed arrays are already 2-D.
 
     shifted_da_decompressed_backshifted = shifted_da_decompressed.roll({lon_dim: half_idx}, roll_coords=False)
 
