@@ -1,0 +1,594 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Compressing the DYAMOND Archive — Final Report</title>
+<style>
+:root{
+  --paper:#ffffff; --paper2:#f6f3ec; --paper3:#efeadd;
+  --ink:#211d18; --ink2:#3a342c; --mut:#6f675a; --faint:#9a9384;
+  --line:#ddd6c7; --line2:#cabfa9;
+  --b06:#b56a2b;        /* coarse resolution accent (terracotta) */
+  --b10:#2f6d54;        /* fine resolution accent (deep green) */
+  --b08:#7a6a9c;        /* intermediate resolution accent (muted violet) */
+  --accent:#8a5a1a;
+  --red:#b1422c; --redbg:#f1e2db;
+  --green:#3f7a4f; --greenbg:#e3ecde;
+  --amber:#c2872a;
+}
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{
+  margin:0; background:var(--paper); color:var(--ink);
+  font-family:"Charter","Bitstream Charter","Sitka Text",Georgia,"Times New Roman",serif;
+  font-size:18px; line-height:1.66; -webkit-font-smoothing:antialiased;
+}
+.wrap{max-width:860px; margin:0 auto; padding:56px 26px 90px}
+.label,.kicker,.n,.pill,.legend,table.lt thead th,.statlabel,.axisnote,.tag,.toc a{
+  font-family:ui-sans-serif,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+}
+mono,.m,.mono{font-family:"SF Mono","JetBrains Mono",ui-monospace,"Cascadia Code",Menlo,Consolas,monospace}
+
+/* header */
+header{border-bottom:3px double var(--line); padding-bottom:30px; margin-bottom:40px}
+.kicker{font-size:11.5px; letter-spacing:.16em; text-transform:uppercase; color:var(--b06); font-weight:700}
+h1{font-size:42px; line-height:1.1; margin:14px 0 12px; font-weight:800; letter-spacing:-.012em}
+h1 em{font-style:italic; color:var(--b10); font-weight:800}
+.sub{font-size:19px; color:var(--ink2); margin:0; max-width:42em}
+.byline{margin-top:18px; font-size:12.5px; color:var(--mut); font-family:ui-sans-serif,sans-serif; letter-spacing:.02em}
+.byline b{color:var(--ink2)}
+
+/* table of contents */
+.toc{background:var(--paper2); border:1.5px solid var(--line); border-radius:4px; padding:18px 22px; margin:34px 0}
+.toc h4{margin:0 0 10px; font-family:ui-sans-serif,sans-serif; font-size:12px; letter-spacing:.12em; text-transform:uppercase; color:var(--mut)}
+.toc ol{margin:0; padding-left:0; list-style:none; columns:2; column-gap:30px}
+@media(max-width:640px){.toc ol{columns:1}}
+.toc li{margin:3px 0; font-size:14px; break-inside:avoid}
+.toc a{color:var(--ink2); text-decoration:none; font-size:13.5px}
+.toc a:hover{color:var(--b06); text-decoration:underline}
+.toc .tn{color:var(--faint); font-weight:700; margin-right:7px; font-variant-numeric:tabular-nums}
+
+/* sections */
+h2{font-size:25px; margin:64px 0 6px; padding-top:18px; border-top:1px solid var(--line); font-weight:800; letter-spacing:-.01em; line-height:1.18}
+h2 .n{display:inline-block; font-size:13px; color:var(--b06); font-weight:800; letter-spacing:.05em; margin-right:4px; vertical-align:2px}
+h3{font-size:18.5px; margin:30px 0 4px; font-weight:700; color:var(--ink2)}
+.lead{font-size:18px; color:var(--ink2); margin:8px 0 16px}
+p{margin:14px 0}
+.first{margin-top:10px}
+em{color:inherit}
+b,strong{font-weight:700}
+.hl{background:linear-gradient(transparent 56%, #f4dd92 56%); padding:0 1px}
+.hl2{background:linear-gradient(transparent 56%, #cfe3d4 56%); padding:0 1px}
+a{color:var(--b06)}
+.mono,.m{font-size:.92em}
+code{background:var(--paper3); padding:1px 5px; border-radius:3px; font-family:"SF Mono",ui-monospace,monospace; font-size:14px; color:var(--ink2)}
+
+/* callout / glossary */
+.box{background:var(--paper2); border:1.5px solid var(--line); border-left:4px solid var(--b06); border-radius:0 4px 4px 0; padding:16px 20px; margin:22px 0}
+.box.green{border-left-color:var(--b10)}
+.box.amber{border-left-color:var(--amber)}
+.box h4{margin:0 0 8px; font-family:ui-sans-serif,sans-serif; font-size:12px; letter-spacing:.1em; text-transform:uppercase; color:var(--mut)}
+.box p{margin:8px 0; font-size:16px; line-height:1.58}
+dl.gloss{margin:6px 0 0}
+dl.gloss dt{font-weight:700; color:var(--ink); margin-top:12px; font-size:16.5px}
+dl.gloss dt:first-child{margin-top:0}
+dl.gloss dd{margin:2px 0 0; font-size:15.5px; color:var(--ink2); line-height:1.55}
+
+/* stat strip */
+.stats{display:grid; grid-template-columns:repeat(4,1fr); gap:0; border:1.5px solid var(--line); border-radius:4px; overflow:hidden; margin:24px 0}
+@media(max-width:640px){.stats{grid-template-columns:repeat(2,1fr)}}
+.stat{padding:16px 14px; background:var(--paper2); border-right:1px solid var(--line); border-bottom:1px solid var(--line)}
+.stat:nth-child(4n){border-right:none}
+.stat .v{font-family:"SF Mono",ui-monospace,monospace; font-size:27px; font-weight:800; color:var(--b10); line-height:1}
+.stat .v.b06{color:var(--b06)}
+.statlabel{font-size:11px; letter-spacing:.04em; color:var(--mut); margin-top:7px; text-transform:uppercase}
+
+/* split panels */
+.split{display:grid; grid-template-columns:1fr 1fr; gap:0; border:1.5px solid var(--line); border-radius:4px; overflow:hidden; margin:22px 0}
+@media(max-width:680px){.split{grid-template-columns:1fr}}
+.half{padding:18px 20px; background:var(--paper2)}
+.half:first-child{border-right:1.5px solid var(--line)}
+@media(max-width:680px){.half:first-child{border-right:none; border-bottom:1.5px solid var(--line)}}
+.half h4{margin:0 0 4px; font-size:16px; font-family:ui-sans-serif,sans-serif; font-weight:700}
+.half .big{font-family:"SF Mono",ui-monospace,monospace; font-size:26px; font-weight:800; line-height:1.1}
+.half.red{background:var(--redbg)} .half.green{background:var(--greenbg)}
+.half.red h4{color:var(--red)} .half.green h4{color:var(--green)}
+.half.red .big{color:var(--red)} .half.green .big{color:var(--green)}
+.half p{font-size:13.5px; line-height:1.5; color:var(--ink2); margin:8px 0 0}
+
+/* charts */
+figure{margin:26px 0; border:1.5px solid var(--line); border-radius:5px; background:var(--paper); overflow:hidden}
+figure .cap{padding:13px 18px 0; font-family:ui-sans-serif,sans-serif}
+figure .cap .t{font-size:14.5px; font-weight:700; color:var(--ink)}
+figure .cap .d{font-size:12.5px; color:var(--mut); margin-top:2px; line-height:1.45}
+.chartbox{position:relative; padding:14px 16px 18px; min-height:60px}
+.legend{display:flex; gap:16px; flex-wrap:wrap; font-size:12px; margin:8px 18px 0; color:var(--ink2)}
+.legend span{display:flex; align-items:center; gap:6px}
+.sw{width:13px; height:13px; border-radius:2px; display:inline-block; border:1px solid rgba(0,0,0,.12)}
+.cerr{display:none; padding:16px; font-family:"SF Mono",monospace; font-size:11px; color:var(--red); text-align:center}
+
+/* data table */
+table.lt{width:100%; border-collapse:collapse; margin:18px 0; font-size:14.5px}
+table.lt thead th{font-size:11px; letter-spacing:.05em; text-transform:uppercase; color:var(--mut); text-align:left; border-bottom:2px solid var(--line); padding:7px 9px; font-weight:700}
+table.lt td{padding:7px 9px; border-bottom:1px solid var(--line); vertical-align:top}
+table.lt td.m{font-family:"SF Mono",ui-monospace,monospace; font-size:12.5px}
+table.lt td.cr{font-weight:700; color:var(--b10); font-family:"SF Mono",monospace}
+table.lt tr:last-child td{border-bottom:none}
+table.lt .grp{background:var(--paper2); font-weight:700; font-family:ui-sans-serif,sans-serif; font-size:12px; letter-spacing:.05em; text-transform:uppercase; color:var(--ink2)}
+
+/* pills/tags */
+.pill{display:inline-block; font-family:ui-sans-serif,sans-serif; font-size:10px; padding:2px 8px; border-radius:3px; background:var(--ink); color:var(--paper); letter-spacing:.08em; font-weight:700; text-transform:uppercase}
+.tag{display:inline-block; font-size:11px; padding:1px 7px; border-radius:10px; border:1px solid var(--line2); color:var(--ink2); margin:1px 2px}
+.tag.zfpy{background:#e7f0ea; border-color:#bcd6c5; color:#2c6045}
+.tag.pcodec{background:#efe9f2; border-color:#d0c2dc; color:#5b487a}
+
+ol.steps{counter-reset:s; list-style:none; padding-left:0; margin:18px 0}
+ol.steps>li{position:relative; padding-left:48px; margin:18px 0; min-height:32px}
+ol.steps>li::before{counter-increment:s; content:counter(s); position:absolute; left:0; top:-2px; width:32px; height:32px; border-radius:50%; background:var(--ink); color:var(--paper); font-family:ui-sans-serif,sans-serif; font-weight:800; font-size:15px; display:flex; align-items:center; justify-content:center}
+ol.steps>li b{color:var(--ink)}
+ol.steps>li .sd{font-size:15.5px; color:var(--ink2); line-height:1.55; margin-top:1px}
+
+.foot{margin-top:70px; border-top:3px double var(--line); padding-top:20px; font-size:12.5px; color:var(--mut); line-height:1.6; font-family:ui-sans-serif,sans-serif}
+.foot b{color:var(--ink2)}
+.divider{text-align:center; color:var(--faint); letter-spacing:.5em; margin:30px 0; font-size:13px}
+hr.soft{border:none; border-top:1px solid var(--line); margin:30px 0}
+.note{font-size:13px; color:var(--mut); font-style:italic; line-height:1.5; margin-top:10px}
+sup.fn{font-size:.7em; color:var(--b06); font-weight:700}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <div class="kicker">dc_toolkit · DYAMOND archive · final compression report</div>
+  <h1>Shrinking a <em>6.6&nbsp;petabyte</em> climate archive — what we did, and what we learned</h1>
+  <p class="sub">A description of how we chose a compression recipe for the 872,951 files of this weather-model archive, proved it keeps the science intact, and weighed it against the alternative of storing the data uncompressed.</p>
+  <div class="byline">Compression sweep across <b>257 representative fields</b> · <b>cross-resolution study</b> (R02B06 / R02B08 / R02B10) · comparison with the <b>VAST</b> approach. All figures are computed directly from the on-disk manifests in the attached results.</div>
+</header>
+
+<div class="toc">
+  <h4>What's inside</h4>
+  <ol>
+    <li><a href="#s0"><span class="tn">00</span>The problem, in one minute</a></li>
+    <li><a href="#s1"><span class="tn">01</span>A glossary for newcomers</a></li>
+    <li><a href="#s2"><span class="tn">02</span>The two-phase strategy</a></li>
+    <li><a href="#s3"><span class="tn">03</span>Choosing 257 representative fields</a></li>
+    <li><a href="#s4"><span class="tn">04</span>The sweep: 8,844 recipes per field</a></li>
+    <li><a href="#s5"><span class="tn">05</span>The fidelity gates — our safety net</a></li>
+    <li><a href="#s6"><span class="tn">06</span>Sweep results</a></li>
+    <li><a href="#s7"><span class="tn">07</span>Does the recipe travel across resolutions?</a></li>
+    <li><a href="#s8"><span class="tn">08</span>The VAST alternative, compared</a></li>
+    <li><a href="#s9"><span class="tn">09</span>From recipe to finished archive</a></li>
+    <li><a href="#s10"><span class="tn">10</span>The bottom line</a></li>
+  </ol>
+</div>
+
+<!-- ============================ BEGINNING ============================ -->
+<h2 id="s0"><span class="n">00</span> The problem, in one minute</h2>
+<p class="lead first">This study concerns the <b>DYAMOND</b> simulation output currently held in temporary storage at <code>/capstor/store1/cscs/userlab/cwp03/zemanc/Data_Dyamond*</code>. The question we set out to answer is operational: <span class="hl">where and how should this archive ultimately be stored</span> — on <b>capstor</b> or on <b>VAST</b>, and <b>compressed</b> or <b>uncompressed</b>?</p>
+<p>The archive holds <b>872,951 files</b> totalling <b>6.61&nbsp;PiB</b>. Storing and moving data at this scale is expensive, so the underlying goal is concrete: make the archive substantially smaller without discarding anything a scientist would actually need. This report works through the evidence end to end — how the data was sampled, how a compression recipe was chosen and proven safe, how it behaves across resolutions, and how it compares with the simpler VAST route — so the storage decision can rest on measurements rather than intuition.</p>
+<p>The archive spans three model resolutions — <b>R02B06</b>, <b>R02B08</b>, and <b>R02B10</b> — and the finest, R02B10, dominates it almost entirely:</p>
+
+<div class="stats">
+  <div class="stat"><div class="v">6.61<span style="font-size:15px"> PiB</span></div><div class="statlabel">Total archive</div></div>
+  <div class="stat"><div class="v">872,951</div><div class="statlabel">Files</div></div>
+  <div class="stat"><div class="v">5.75<span style="font-size:15px"> PiB</span></div><div class="statlabel">In the finest level alone</div></div>
+  <div class="stat"><div class="v">~9×</div><div class="statlabel">Median shrink we achieved</div></div>
+</div>
+
+<figure>
+  <div class="cap"><div class="t">Where the 6.6 petabytes actually live</div><div class="d">The five storage roots of the archive. The single finest-resolution dataset (R02B10) holds 87% of all the bytes — so most of the prize is there.</div></div>
+  <div class="chartbox"><canvas id="cInv" height="190" role="img" aria-label="Bar chart of storage size per dataset root: R02B10 holds 5.75 PiB, the two R02B08 datasets about 425 TiB each, R02B06 about 31 TiB."></canvas><div class="cerr" id="eInv">chart unavailable</div></div>
+</figure>
+
+<p>To shrink the data we re-pack it with a <b>compression recipe</b>. The hard part is not the squeezing — it is choosing a recipe that squeezes <i>hard</i> while provably preserving the physics. This report explains how we found such a recipe, how we proved it is safe, and what is left before the whole archive is compressed.</p>
+
+<h2 id="s1"><span class="n">01</span> A glossary for newcomers</h2>
+<p class="lead first">Five ideas are enough to follow everything that follows.</p>
+<div class="box">
+  <h4>The five words that matter</h4>
+  <dl class="gloss">
+    <dt>NetCDF &amp; Zarr — two file formats</dt>
+    <dd><b>NetCDF</b> is the format the simulation wrote. <b>Zarr</b> is the modern format we convert to: it stores an array as many small "chunks," which makes it fast to read in parallel and friendly to compression. Think of it as moving from one giant document to a well-organised binder.</dd>
+    <dt>Compression ratio (CR)</dt>
+    <dd>How many times smaller the data becomes. <span class="m">CR = original size ÷ compressed size.</span> A CR of 9 means the file is one-ninth its original size. Bigger is better.</dd>
+    <dt>Lossless vs. lossy</dt>
+    <dd><b>Lossless</b> compression is perfectly reversible — like a ZIP file — but on this kind of scientific data it barely helps (about 1.5×). <b>Lossy</b> compression throws away detail too fine to matter (the digits past what the instrument could ever measure), which is what unlocks the big savings. The entire challenge is doing this <i>safely</i>.</dd>
+    <dt>A "codec" — the <i>recipe</i> — = three parts working together</dt>
+    <dd>The recipe applied to each variable is a <b>codec stack</b>: three layers, applied in order. We use the words "recipe" and "codec stack" interchangeably throughout.
+      <br>• <b>Serializer</b> — how numbers are turned into bytes (the fundamental representation). Our two options are <span class="tag zfpy">ZFPY</span>, which is excellent on smooth fields, and <span class="tag pcodec">PCodec</span>, which tolerates noisy ones.
+      <br>• <b>Filter</b> — an array-to-array transform that <i>prepares</i> the data for the compressor. A few filters are lossless (e.g. <i>Delta</i>), but the ones we mostly rely on — <i>BitRound</i> and <i>Quantize</i> — are deliberately <b>lossy</b>: they round away trailing precision that carries no real information. That rounding is exactly where this pipeline's loss comes from — which is why it is held inside a strict, gate-checked budget (§05). The compressor that follows is always lossless.
+      <br>• <b>Compressor</b> — a general byte-squeezer applied last (e.g. <i>LZMA</i>, <i>BZ2</i>, <i>Zstd</i>), the same family as everyday ZIP tools.</dd>
+    <dt>Fidelity gates</dt>
+    <dd>A panel of automatic quality checks. A recipe is only allowed to win if every check passes — guaranteeing the compressed data stays within a tiny, pre-agreed error budget of the original. This is the scientific safety net, explained in §05.</dd>
+  </dl>
+</div>
+<p class="note">Throughout, a "field" means one physical variable at one resolution — for example, <i>temperature at the finest grid</i>, or <i>sea-level pressure at the coarsest</i>. Each field gets its own tailored recipe.</p>
+
+<!-- ============================ MIDDLE ============================ -->
+<h2 id="s2"><span class="n">02</span> The two-phase strategy</h2>
+<p class="lead first">A <b>recipe</b> — the per-variable <b>codec stack</b> of serializer + filter + compressor from §01 — must be chosen for each kind of data. We could never test every candidate recipe on every one of the 872,951 files, so we split the work into a cheap thinking phase and an expensive doing phase.</p>
+<div class="split">
+  <div class="half">
+    <h4>Phase 1 — Discovery sweep <span class="pill" style="background:var(--b06)">cheap</span></h4>
+    <p style="font-size:14.5px">Take <b>one small representative sample</b> of each field. Try <b>thousands of recipes</b> on it. Score each by how much it shrinks the data and whether it survives the fidelity gates. Record the single best recipe per field in a small file called a <b>manifest</b>. This runs in minutes per field and touches a tiny fraction of the data.</p>
+  </div>
+  <div class="half">
+    <h4>Phase 2 — Persist <span class="pill" style="background:var(--b10)">expensive</span></h4>
+    <p style="font-size:14.5px">Take the winning recipe from each manifest and <b>apply it to every matching file</b> in the archive — hundreds of thousands of them. No searching here, just applying the already-chosen answer. This is the heavy, large-scale step that actually reclaims the storage.</p>
+  </div>
+</div>
+<p>This report is mostly about <b>Phase 1</b> — finding and trusting the recipes — because that is where all the scientific judgement lives. Phase 2 is described at the end (§09). The key insight that makes the split worthwhile: the <i>best recipe depends mostly on the variable, not on the individual file</i>, so a recipe learned from one sample can be reused across thousands of files of the same variable.</p>
+
+<h2 id="s3"><span class="n">03</span> Choosing 257 representative fields</h2>
+<p class="lead first">We did not pick files at random. We picked exactly one per distinct kind of data.</p>
+<p>Every file in the archive belongs to a combination of <b>resolution × output-stream × variable</b> (the "stream" is just which group of variables were written together, like <code>out_11</code> for pressure-level fields). Files that share the same combination are statistically near-identical from a compression standpoint — the same variable on the same grid, only a different day. So one well-chosen file <i>represents</i> all its siblings.</p>
+<p>That logic gives <b>257 representative fields</b>: <b>120</b> at the coarsest resolution (R02B06) and <b>137</b> at the finest (R02B10). These 257 are the entire subject of the discovery sweep. The three resolutions differ enormously in size, which is exactly why the recipe must be checked at more than one of them (§07):</p>
+
+<table class="lt">
+  <thead><tr><th>Resolution</th><th>Grid cells (horizontal)</th><th>Approx. spacing</th><th>Role in this study</th></tr></thead>
+  <tbody>
+    <tr><td><b>R02B06</b></td><td class="m">327,680</td><td class="m">~40 km</td><td>Coarsest — swept (120 fields)</td></tr>
+    <tr><td><b>R02B08</b></td><td class="m">5,242,880</td><td class="m">~10 km</td><td>Intermediate — used as a tie-breaker</td></tr>
+    <tr><td><b>R02B10</b></td><td class="m">83,886,080</td><td class="m">~2.5 km</td><td>Finest — swept (137 fields), 87% of the archive</td></tr>
+  </tbody>
+</table>
+<p class="note">Each step up the ladder multiplies the number of grid cells by 16 (the resolution doubles in each of two horizontal directions per level, twice over). The finest grid has 256× as many cells as the coarsest — verified directly from the data, not assumed.</p>
+
+<h2 id="s4"><span class="n">04</span> The sweep: 8,844 recipes per field</h2>
+<p class="lead first">For each of the 257 fields, we built every recipe the toolkit can express and tested them all on the sample.</p>
+<p>Each codec layer comes in a handful of <i>families</i>, and every family is instantiated at many parameter settings:</p>
+<div class="stats">
+  <div class="stat"><div class="v">2</div><div class="statlabel">Serializers (ZFPY, PCodec)</div></div>
+  <div class="stat"><div class="v">4</div><div class="statlabel">Filter families</div></div>
+  <div class="stat"><div class="v">6</div><div class="statlabel">Compressor families</div></div>
+  <div class="stat"><div class="v">8,844</div><div class="statlabel">Recipes tried per field</div></div>
+</div>
+<p>These families are not used as-is. Each is first <i>instantiated</i> into a list of concrete codec objects — one object per parameter setting: <i>BitRound</i> at each candidate keep-bits value, <i>Quantize</i> at each digit count, <i>ZFPY</i> at each accuracy / precision / rate setting, <i>LZMA</i> at each preset, <i>Blosc</i> at each (algorithm, level, byte-shuffle), and so on. The recipe space is then the <b>Cartesian product</b> of the three resulting lists — every instantiated serializer × every instantiated filter × every instantiated compressor (literally an <span class="m">itertools.product(compressors, filters, serializers)</span>) — which for a typical field expands to <b>8,844 fully-specified recipes</b>. Each recipe is applied to the field's sample, the result is decompressed, and we measure two things: <b>how much smaller</b> it got, and <b>how far the decompressed values drifted</b> from the original.</p>
+<p>To keep this affordable we used carefully sized samples — a default budget of <b>2&nbsp;GiB</b> per field, dropped further for a handful of memory-heavy 3-D fields. We confirmed that the answer (which recipe wins) is already stable well below that budget, so smaller samples do not change the verdict. The sweep ran on the CSCS "Santis" supercomputer across eight nodes per job, packed into cost-aware batches by how long each field was expected to take.</p>
+<div class="box amber">
+<h4>Why the winner is trustworthy from a small sample</h4>
+<p>Compression behaviour is governed by a field's <i>statistics</i> — its smoothness, its range, how much genuine randomness it contains. Those statistics converge quickly: a few gigabytes of a field look, statistically, like the whole field. And we sample deliberately rather than grabbing one contiguous block: the toolkit keeps the full horizontal grid intact — so the codecs still see the real spatial structure they exploit — while thinning only the time and vertical axes, picking <i>evenly-spaced</i> slices through them with <span class="m">np.linspace</span> (edge-inclusive and deterministic, so the same sample is reproduced when the recipe is later applied). Draining the time axis first captures temporal variety, the most informative axis for ranking codecs. The result spans the field's full range instead of one localised snapshot — exactly what a fair codec comparison needs. So the recipe that wins on the sample is overwhelmingly the recipe that would win on the full data. The persist phase later re-checks this on real files (§09), so nothing rides on the assumption alone.</p>
+</div>
+
+<h2 id="s5"><span class="n">05</span> The fidelity gates — our safety net</h2>
+<p class="lead first">This is the heart of the method. A recipe that shrinks the data 300× is worthless if it corrupts the science. The gates decide what "corrupt" means — and we chose them deliberately.</p>
+<p>Among the thousands of recipes, the high-compression ones are always lossy: they discard detail. The question is <i>which</i> detail is safe to discard. We answer it by forcing every candidate recipe through a panel of <b>eight independent error checks</b>. A recipe is "kept" only if it passes <i>all eight</i>; the winner is the highest-compression recipe still standing.</p>
+
+<table class="lt">
+  <thead><tr><th>Gate</th><th>What it limits</th><th>Why it exists</th><th>Budget</th></tr></thead>
+  <tbody>
+    <tr><td><b>L1</b> (mean error)</td><td>Average deviation across all points</td><td>The headline "is it close on average" test</td><td class="m">≤ 1%<sup class="fn">†</sup></td></tr>
+    <tr><td><b>L2</b> (energy error)</td><td>Root-mean-square deviation</td><td>Penalises larger errors more heavily</td><td class="m">≤ 2%</td></tr>
+    <tr><td><b>L∞</b> (worst point)</td><td>The single largest error anywhere</td><td>Stops one catastrophic outlier hiding behind a good average</td><td class="m">≤ 10%</td></tr>
+    <tr><td><b>Bias</b></td><td>Net systematic drift up or down</td><td>Errors must cancel, not accumulate into a trend</td><td class="m">≤ 0.5%</td></tr>
+    <tr><td><b>q99</b> (tail)</td><td>Error in the most extreme 1% of values</td><td>Protects storms, peaks, rare events</td><td class="m">≤ 2%</td></tr>
+    <tr><td><b>Bounds</b></td><td>Values stay physically possible</td><td>e.g. a humidity or cloud fraction can't go negative</td><td class="m">phys&nbsp;limits</td></tr>
+    <tr><td><b>Gradient</b></td><td>Spatial structure / sharpness</td><td>Wind and dynamics fields must keep their texture, not be smeared</td><td class="m">≤ 0.1</td></tr>
+    <tr><td><b>Finiteness</b></td><td>No NaN / infinity introduced</td><td>Basic data-integrity guarantee</td><td class="m">exact</td></tr>
+  </tbody>
+</table>
+<p class="note"><sup class="fn">†</sup> The L1 budget is the master dial. Every other gate is keyed off it: L2 at 2×, L∞ at 10×, bias at ½×, q99 at 2×. Tighten L1 and the whole panel tightens in proportion.</p>
+
+<div class="box">
+<h4>How each gate is computed</h4>
+<p style="font-size:14.5px;margin-top:0">Let <span class="m">x</span> be the original values and <span class="m">y</span> the values recovered after compression, with every sum taken over the cells that are finite in the original. Each metric is a <i>relative</i> error — normalised by the field's own magnitude — so one "1%" budget means the same thing across variables with wildly different units and scales.</p>
+<table class="lt">
+  <thead><tr><th>Gate</th><th>Definition</th><th>Pass</th></tr></thead>
+  <tbody>
+    <tr><td><b>L1</b></td><td class="m">Σ|y−x| / Σ|x|</td><td class="m">≤ τ</td></tr>
+    <tr><td><b>L2</b></td><td class="m">√(Σ(y−x)²) / √(Σx²)</td><td class="m">≤ 2τ</td></tr>
+    <tr><td><b>L∞</b></td><td class="m">max|y−x| / max|x|</td><td class="m">≤ 10τ</td></tr>
+    <tr><td><b>Bias</b></td><td class="m">|Σ(y−x)| / Σ|x|</td><td class="m">≤ ½τ</td></tr>
+    <tr><td><b>q99</b></td><td class="m">Σ|y−x| / Σ|x|, over cells with |x| ≥ Q<sub>99</sub></td><td class="m">≤ 2τ</td></tr>
+    <tr><td><b>Gradient</b></td><td class="m">Σ|∇y−∇x| / Σ|∇x|&nbsp; (finite differences along each spatial axis)</td><td class="m">≤ 0.1</td></tr>
+    <tr><td><b>Bounds</b></td><td class="m">phys<sub>min</sub> ≤ y ≤ phys<sub>max</sub>&nbsp; (every cell)</td><td>within</td></tr>
+    <tr><td><b>Finiteness</b></td><td class="m">every cell finite in x stays finite in y</td><td>0 corrupt</td></tr>
+  </tbody>
+</table>
+<p class="note">Here <span class="m">τ</span> is the field's L1 budget (the master dial, ≤ 1%) and <span class="m">Q<sub>99</sub></span> is the 99th percentile of <span class="m">|x|</span>, so the q99 gate scores error only on the most extreme 1% of cells. The bias denominator is identical to L1's, so <span class="m">bias ≤ L1</span> always holds by construction. The gradient and bounds gates are activated only for the field types that need them (below).</p>
+</div>
+
+<h3>How we actually <i>chose</i> the gating</h3>
+<p>The gate budgets were not picked by taste. Two principles drove them:</p>
+<p><b>1. The budget starts from the field's own variability, following the climate-compression literature.</b> The guiding principle, from Klöwer et al. (2021) and Baker et al. (2014; 2016/2017), is that the error introduced by compression must stay well below a field's <i>natural variability</i> — only the bits carrying real information should be kept. We make that concrete by requiring the <b>absolute</b> mean (L1) error to remain below <b>0.5% of the field's standard deviation σ</b>: <span class="m">mean|y − x| &lt; 0.005·σ</span>. The error is then an order of magnitude or more below the signal's own spread, so it cannot masquerade as physics.</p>
+<p>The gates, however, are evaluated as <i>relative</i> errors (the table above divides by the field's own magnitude). So this absolute target is converted into each field's relative L1 budget by dividing by the field's mean magnitude: <span class="m">τ = 0.005·σ / mean|x|</span>. That single step is why the budget adapts per field — temperature, whose spread is small next to its mean, lands at <span class="m">τ ≈ 0.055%</span>; geopotential at <span class="m">τ ≈ 0.34%</span>; while spiky fields such as precipitation and CAPE (large σ relative to a near-zero mean) would push τ higher. Two clamps finish the job: τ is <b>capped at 1%</b> so no field is ever allowed more than 1% relative mean error however large its variability, and <b>floored</b> at a small value for near-constant fields so we do not demand impossible precision. The rare field with no usable statistics falls back to a safe default.</p>
+<p class="note">Two different halves appear in this method and should not be confused: the <b>0.5% of σ</b> above is the <i>absolute</i> design target that sets each field's budget; the <b>½τ</b> bias limit in the gate panel is a separate rule capping one-directional drift at half of that budget.</p>
+<p><b>2. Physics-driven extra gates, switched on by variable type.</b> Not every gate applies to every field, and turning irrelevant gates on would needlessly reject good recipes. So the toolkit switches gates on by physical archetype:</p>
+<div class="split">
+  <div class="half green">
+    <h4>Gradient gate → dynamical fields</h4>
+    <p>Winds (<span class="m">u, v, w, omega</span>), vertical velocity, <span class="m">pv, tke</span>, temperature and geopotential. These carry meaning in their <i>spatial texture</i> — fronts, eddies, sharp transitions — so we explicitly forbid recipes that smear that structure, even slightly.</p>
+  </div>
+  <div class="half red">
+    <h4>Extremes-sensitive → tail-driven fields</h4>
+    <p>Precipitation, hail, hydrometeors (<span class="m">qr, qg, qc, qs, qi</span>), and convection indices (CAPE, CIN). For these the <i>rare extreme</i> is the whole point, so the tail (q99) and worst-point gates are enforced more strictly.</p>
+  </div>
+</div>
+<p>Physical-bounds gates were likewise attached only to variables that have hard limits (non-negative quantities like humidity; the 0–100% range for cloud cover and relative humidity). This per-variable gate policy is what lets the sweep be both <i>aggressive</i> on smooth fields and <i>conservative</i> on dangerous ones, automatically.</p>
+<p class="note"><b>References.</b> The "error below natural variability" and "real information content" principles behind the threshold above come from M. Klöwer, M. Razinger, J. J. Domínguez, P. D. Düben &amp; T. N. Palmer, <i>Compressing atmospheric data into its real information content</i>, Nature Computational Science <b>1</b>, 713–724 (2021); and A. H. Baker et al., <i>A methodology for evaluating the impact of data compression on climate simulation data</i> (HPDC '14, 2014) and subsequent work (2016/2017) establishing that compression error should be statistically indistinguishable from a model's internal variability.</p>
+
+<h2 id="s6"><span class="n">06</span> Sweep results</h2>
+<p class="lead first">All <b>257 representative fields</b> produced a validated winning recipe — one that survived every one of the eight fidelity gates. The winners shrink the data substantially while staying far inside the error budget:</p>
+<div class="stats">
+  <div class="stat"><div class="v">257</div><div class="statlabel">Representative fields, all with a recipe</div></div>
+  <div class="stat"><div class="v">~8.7×</div><div class="statlabel">Median compression</div></div>
+  <div class="stat"><div class="v b06">7.4×</div><div class="statlabel">Median — coarse (R02B06)</div></div>
+  <div class="stat"><div class="v">10.0×</div><div class="statlabel">Median — fine (R02B10)</div></div>
+</div>
+<p>The median is a deliberately conservative summary; many fields compress far more. The error stays tiny across the board: the <b>median mean-error is 0.14%</b> and <b>no winner exceeds 0.99%</b> — every single one sits under the 1% ceiling by construction.</p>
+
+<figure>
+  <div class="cap"><div class="t">Compression ratios achieved (by resolution)</div><div class="d">How many fields land in each compression band. The finest resolution (R02B10) compresses a little better — there is more redundancy to exploit at high resolution.</div></div>
+  <div class="legend"><span><span class="sw" style="background:var(--b06)"></span>R02B06 (coarse)</span><span><span class="sw" style="background:var(--b10)"></span>R02B10 (fine)</span></div>
+  <div class="chartbox"><canvas id="cCR" height="210" role="img" aria-label="Histogram of compression ratios by resolution, most fields between 3 and 13 times, with a long tail of fields compressing far more."></canvas><div class="cerr" id="eCR">chart unavailable</div></div>
+</figure>
+
+<h3>Lossy always wins — and it is not close</h3>
+<p>For 132 fields, a perfectly-reversible (lossless) recipe also passed every gate. So we can compare fairly: on those fields, the best <i>lossless</i> recipe achieved a median of just <b>1.53×</b>, while the best <i>lossy</i> recipe reached <b>~9×</b> — and lossy won on <b>all 132</b>. At this scale, on this data, lossless compression is simply not competitive; the fidelity gates are what make lossy safe to use.</p>
+<div class="split">
+  <div class="half red">
+    <h4>Best lossless recipe</h4>
+    <div class="big">1.53×</div>
+    <p>Median, on the 132 fields where a lossless recipe passed the gates. Reversible, but barely shrinks scientific data.</p>
+  </div>
+  <div class="half green">
+    <h4>Best lossy recipe</h4>
+    <div class="big">~9×</div>
+    <p>Median across all winners — roughly 6× more storage saved at the median, and far more in the tail. Safe because every winner cleared all eight gates.</p>
+  </div>
+</div>
+
+<h3>What the winning recipes look like</h3>
+<p>A clear pattern emerges across the 257 winners. One serializer dominates, and the compressor is almost always one of the two slow-but-thorough entropy coders that work best <i>after</i> a lossy filter has already collapsed the data's complexity:</p>
+<figure>
+  <div class="cap"><div class="t">Composition of the 257 winning recipes</div><div class="d">Counts of each component across all winners. ZFPY is the near-universal serializer; LZMA and BZ2 lead the compressors; Quantize and BitRound lead the filters.</div></div>
+  <div class="chartbox"><canvas id="cCodec" height="245" role="img" aria-label="Grouped bar chart of recipe components, colour-coded by role with a legend. Serializers: ZFPY 221, PCodec 36. Compressors: LZMA 143, BZ2 85, Zstd 20, Blosc 7, Zlib 2. Filters: Quantize 138, BitRound 107, FixedScaleOffset 12."></canvas><div class="cerr" id="eCodec">chart unavailable</div></div>
+</figure>
+<p>In plain terms: <b>ZFPY</b> turns the smooth physical fields into compact bytes; a <b>rounding filter</b> (BitRound for clean physical fields, Quantize for accumulated or thresholded ones) discards the meaningless trailing precision; and a <b>heavy compressor</b> (LZMA or BZ2) squeezes what remains. This three-step shape recurs in almost every winner.</p>
+
+<h2 id="s7"><span class="n">07</span> Does the recipe travel across resolutions?</h2>
+<p class="lead first">We only swept two of the three resolutions. The whole plan depends on a recipe learned at one resolution working at another. So we tested that assumption hard — and the answer is nuanced but reassuring.</p>
+<p>We compared the winning recipe for every variable present at both the coarse (R02B06) and fine (R02B10) resolutions — <b>106 comparable pairs</b>. Asking whether the <i>entire</i> three-part recipe matches exactly is too strict a test, so we looked at which part disagrees, because the parts matter very unequally:</p>
+
+<figure>
+  <div class="cap"><div class="t">Cross-resolution agreement, broken down by which part disagrees</div><div class="d">Of 106 variables swept at both resolutions: half match exactly; most disagreements are in the harmless compressor/filter layer; only a few flip the consequential serializer.</div></div>
+  <div class="chartbox"><canvas id="cXres" height="120" role="img" aria-label="Stacked bar: 53 exact matches, 38 same-serializer with only compressor or filter differences, and 15 serializer flips out of 106 comparable pairs."></canvas><div class="cerr" id="eXres">chart unavailable</div></div>
+</figure>
+
+<table class="lt">
+  <thead><tr><th>Outcome</th><th>Count</th><th>How much it matters</th></tr></thead>
+  <tbody>
+    <tr><td>Exact recipe match</td><td class="cr">53 <span style="color:var(--mut);font-weight:400">(50%)</span></td><td>Transfers perfectly.</td></tr>
+    <tr><td>Same serializer, different compressor/filter</td><td class="cr">38</td><td><b>Near-ties.</b> The compressor choice (LZMA vs BZ2) is two flavours of the same idea working on already-prepared data; forcing the "wrong" one costs almost nothing.</td></tr>
+    <tr><td>Serializer flip (ZFPY ↔ PCodec)</td><td class="cr">15 <span style="color:var(--mut);font-weight:400">(14%)</span></td><td><b>The only consequential disagreements.</b> The serializer is the fundamental numeric representation; a flip here can genuinely cost compression.</td></tr>
+  </tbody>
+</table>
+<p>Read the right way, this is good news: <span class="hl">the serializer — the part that actually matters — agrees in 86% of cases (91 of 106).</span> And the 15 flips are not random. They cluster in exactly one family of fields: the <b>turbulent, convective, and moisture fields</b> — vertical velocity, turbulent energy, raw hydrometeors, omega, potential vorticity, cloud cover. These are the high-randomness fields where ZFPY's smooth-field assumption and PCodec's noise-tolerance genuinely trade places. The smooth, well-behaved fields (pressure, temperature, fluxes, soil, snow) never flip.</p>
+
+<h3>The R02B08 tie-breaker</h3>
+<p>To settle the contested cases we brought in the <b>intermediate resolution (R02B08)</b> as an independent third witness, sweeping it on the fields that had been flagged. Of the fields that produced a winner there, the verdict is emphatic:</p>
+<div class="stats">
+  <div class="stat"><div class="v">22/22</div><div class="statlabel">R02B08 fields agreeing with both neighbours on the serializer</div></div>
+  <div class="stat"><div class="v">22</div><div class="statlabel">Chose ZFPY</div></div>
+  <div class="stat"><div class="v">1</div><div class="statlabel">Chose PCodec (vertical velocity — also PCodec at the other two)</div></div>
+  <div class="stat"><div class="v">10/11</div><div class="statlabel">R02B08 "no-winner" fields are exactly the flip-prone ones</div></div>
+</div>
+<p>Two things fall out of this. First, <span class="hl2">for every well-behaved field, the intermediate resolution lands on the same serializer as its neighbours — a clean third data point confirming the recipe transfers.</span> Second, and just as informative: the handful of fields that <i>refused</i> to produce a winner at R02B08 are almost precisely the same turbulent/moisture fields that flip between the coarse and fine resolutions. The same intrinsic property — high, scale-dependent randomness — makes these fields both hard to gate and unstable across resolutions.</p>
+
+<div class="box">
+<h4>The cross-resolution verdict, in one paragraph</h4>
+<p><b>For the smooth, well-behaved majority</b> — pressure, temperature, radiative and surface fluxes, soil and snow, winds on pressure levels — a recipe learned once transfers across all three resolutions (the compressor/filter may differ harmlessly). <b>For the turbulent minority</b> — raw moisture and hydrometeors, vertical velocity, convection indices — the serializer genuinely depends on resolution, so each is swept afresh at its own resolution rather than inheriting a neighbour's. And the <b>maximally safe</b> option is always on the table: skip the transfer assumption entirely and run the full discovery sweep on every field at every resolution. That simply costs more sweeps — still only on samples, never the full archive — so cross-resolution transfer is best seen as the optimisation that buys back that cost wherever the data proves it is safe.</p>
+</div>
+
+<h2 id="s8"><span class="n">08</span> The VAST alternative, compared</h2>
+<p class="lead first">There is a second, completely different way to shrink the archive — and we benchmarked it too. It is worth understanding because the two approaches trade off in opposite directions.</p>
+<p>The <b>VAST approach</b> converts each NetCDF file to Zarr <i>with no compression at all</i>, deliberately keeping the original chunk layout, and then relies on the <b>storage hardware's built-in deduplication</b> to reclaim space behind the scenes. (VAST is a storage appliance that automatically detects and stores identical data blocks only once.) The recipe-based sweep approach, by contrast, does the shrinking <i>in the data itself</i> with lossy codecs.</p>
+
+<div class="split">
+  <div class="half">
+    <h4>Sweep + codecs <span class="pill" style="background:var(--b10)">this report</span></h4>
+    <p><b>Lossy</b>, codec-based. Median <b>~9×</b> smaller. Requires the per-variable sweep, the gate panel, and per-file fidelity verification. The savings are mathematical and portable — they live in the files and survive any copy or move.</p>
+  </div>
+  <div class="half">
+    <h4>VAST in-place + dedup <span class="pill" style="background:var(--b08)">benchmarked</span></h4>
+    <p><b>Lossless</b>, dedup-based. The conversion itself is byte-neutral — uncompressed Zarr is about the same size as the source NetCDF — so there is no inflation to undo. VAST's storage layer then deduplicates and compresses what was written: on the converted R02B06 trees it took <b>37.5 TiB logical down to 10.8 TiB</b> physical, a measured <b>data-reduction ratio of 3.5×</b> — entirely lossless, with no per-variable tuning, and very fast.</p>
+  </div>
+</div>
+
+<p>VAST reports this directly on its dashboard: across the converted R02B06 trees the data-reduction ratio is <b>3.5×</b>, entirely lossless. It was measured on the ~37.5 TiB converted so far, so the whole-archive figure may land higher or lower.</p>
+
+<p>The VAST conversion is also fast and reliable: one production run converted <b>183,670 files in about 8.8 hours with zero failures or verification failures</b>. Its parallelism is <b>not MPI</b> — just a single-node process pool. A <b>worker</b> is a separate process (its own memory) that handles whole files; <b>threads</b> run inside a worker (shared memory) to speed up a single file. More workers means more files in flight; more threads means each file finishes sooner. The sweet spot was <b>32 workers × 4 threads</b>, sustaining ~531 MB/s:</p>
+
+<figure>
+  <div class="cap"><div class="t">VAST conversion throughput (100-file benchmark, ~17.3 GB)</div><div class="d">Wall-clock time for the same 100 files under different parallelism settings. More parallelism helps up to a point, then storage bandwidth saturates. 32×4 was fastest.</div></div>
+  <div class="chartbox"><canvas id="cVast" height="200" role="img" aria-label="Bar chart of conversion wall time by worker/thread configuration; 32 workers by 4 threads is fastest at 31 seconds."></canvas><div class="cerr" id="eVast">chart unavailable</div></div>
+</figure>
+
+<table class="lt">
+  <thead><tr><th></th><th>Sweep + codecs</th><th>VAST in-place + dedup</th></tr></thead>
+  <tbody>
+    <tr><td class="grp" colspan="3">Head-to-head</td></tr>
+    <tr><td>Reversible?</td><td>No (lossy, gated)</td><td>Yes (lossless)</td></tr>
+    <tr><td>Typical shrink</td><td class="cr">~9× (in the data)</td><td class="cr">~3.5× (lossless)</td></tr>
+    <tr><td>Tuning needed</td><td>Per-variable sweep + gates</td><td>None</td></tr>
+    <tr><td>Savings portable off this hardware?</td><td>Yes</td><td>No — tied to the VAST appliance</td></tr>
+    <tr><td>Speed / risk</td><td>Slower; needs fidelity checks</td><td>Very fast; minimal risk</td></tr>
+  </tbody>
+</table>
+<p>They are not mutually exclusive — one could run codecs first and let dedup mop up afterwards, though the gains are sub-additive (lossy-compressed chunks are less likely to be byte-identical, so they dedupe less). The real trade-off: <b>the sweep reaches ~9× but is lossy (within a bounded ≤1% error) and needs per-variable tuning, and its savings travel with the files; VAST reaches a measured ~3.5× losslessly, with no tuning and at high speed — but only while the data lives on the VAST appliance.</b> If the archive will sit on VAST anyway and losslessness is paramount, ~3.5× essentially for free is hard to beat; if maximum, portable reduction is the goal and a small, gate-verified loss is acceptable, the sweep's ~9× wins.</p>
+
+<!-- ============================ END ============================ -->
+<h2 id="s9"><span class="n">09</span> From recipe to finished archive</h2>
+<p class="lead first">With recipes chosen and trusted, Phase 2 applies them to all 872,951 files. Here is the full journey of a single file, end to end.</p>
+<ol class="steps">
+  <li><b>Look up the recipe.</b><div class="sd">The file's resolution, stream, and variable identify which manifest applies. The winning serializer + filter + compressor are read from it. No searching — the answer is already known.</div></li>
+  <li><b>Read &amp; re-pack into Zarr.</b><div class="sd">The NetCDF file is read and written out as a compressed Zarr store using the recipe, with chunking aligned so the conversion is efficient.</div></li>
+  <li><b>Verify the fidelity (the verify-gate).</b><div class="sd">The freshly compressed data is decompressed and re-measured against the <i>same eight gates</i> the sweep used. If the real file somehow violates the error budget, the toolkit <b>aborts that file</b> rather than ship corrupted data. This turns the sweep's sample-based promise into a per-file guarantee, and it is on by default.</div></li>
+  <li><b>Check the compression actually held (CR-drift).</b><div class="sd">The achieved compression is compared to what the sweep predicted. A large drift (default ±25%) flags the file for review — a cheap early-warning that a file is unlike its representative sample.</div></li>
+  <li><b>Consolidate &amp; finalise.</b><div class="sd">Metadata is consolidated so the store reads back quickly, and the result is recorded in an audit trail. The original is only ever removed after a successful verified write.</div></li>
+</ol>
+<p>Because the verify-gate re-runs the full quality panel on real data, the large-scale phase is <i>self-checking</i>: a recipe that was safe on the sample but somehow unsafe on a particular file cannot slip through silently.</p>
+
+<div class="box amber">
+<h4>What full compression could reclaim — an order-of-magnitude estimate</h4>
+<p>The archive is 6.61 PiB, and 87% of it is the finest resolution, where the median shrink is about 10×. If the per-variable medians carry across the bulk of the data, the compressed archive would land in the neighbourhood of <b>well under 1 PiB</b> — a multi-petabyte saving. This is a projection, not a promise: the true archive-wide ratio depends on the exact mix of variables and on the handful of hard fields still being finalised. The verify-gate ensures that whatever ratio we get, the science inside it is intact.</p>
+</div>
+
+
+<h2 id="s10"><span class="n">10</span> The bottom line</h2>
+<p class="lead first">The storage question comes down to a genuine trade-off rather than a single verdict. The <b>codec sweep</b> reaches roughly <b>9×</b>, but lossily — within a strict, gate-checked ≤1% budget — and with per-variable tuning; its savings are portable and live in the files. <b>VAST</b> reaches a measured <b>3.5×</b> data-reduction ratio <i>losslessly</i>, with no tuning and at high speed, but only while the data sits on the VAST appliance. If the archive will live on VAST and losslessness is the priority, 3.5× essentially for free is compelling; if maximum, portable reduction matters most and a bounded sub-1% error is acceptable, the ~9× sweep wins.</p>
+<p>We learned the best compression recipe for each kind of data by trying nearly nine thousand recipes on small samples and keeping only those that pass an eight-point fidelity panel tuned to each variable's physics. We found that lossy compression beats per-file lossless by a wide margin and is safe under those gates; that the chosen serializer — the part that matters — transfers across resolutions for the smooth majority of fields while the turbulent minority needs its own sweep; and that the storage-dedup alternative (VAST) is faster and lossless and reaches a measured ~3.5× — substantial, though below the sweep's ~9×, and tied to the VAST hardware. What remains is the heavy, mechanical, self-checking step of applying the finished recipes to the whole archive.</p>
+<p>One scoping choice is worth stating plainly. Every recipe here is built only from codecs available in the <b>NumCodecs / Zarr</b> ecosystem — a deliberately conservative, tried-and-tested foundation: well-maintained, widely deployed, and trivially readable by any standard Zarr client, with no exotic dependencies. The ~9× reported here is therefore a <i>floor</i>, not a ceiling. There is likely another tier of compression to unlock by bringing in codecs outside that core set — for example <b>EBCC</b> or <b>NumCodecs-WASM</b> — but as a first, defensible analysis we chose the bulletproof path and left those gains as a clearly-marked next step.</p>
+
+<div class="divider">· · ·</div>
+<div class="foot">
+  <p>Full method and code — the discovery sweep, the fidelity gates, and the persist pipeline (<b>dc_toolkit</b>): <a href="https://github.com/C2SM/data-compression.git">github.com/C2SM/data-compression</a></p>
+</div>
+
+</div>
+
+<script>
+/* ---- robust multi-CDN Chart.js loader, then render with per-chart isolation ---- */
+(function(){
+  var CDNS=[
+    "https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js",
+    "https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js",
+    "https://unpkg.com/chart.js@4.4.1/dist/chart.umd.min.js"
+  ];
+  function load(i){
+    if(i>=CDNS.length){ showAllErrors(); return; }
+    var s=document.createElement("script");
+    s.src=CDNS[i];
+    s.onload=function(){ try{ renderAll(); }catch(e){ console.error(e); } };
+    s.onerror=function(){ load(i+1); };
+    document.head.appendChild(s);
+  }
+  function showAllErrors(){
+    ["eInv","eCR","eCodec","eXres","eVast"].forEach(function(id){
+      var el=document.getElementById(id); if(el) el.style.display="block";
+      var c=el?el.previousElementSibling:null; if(c) c.style.display="none";
+    });
+  }
+  var INK="#211d18", MUT="#6f675a", LINE="#ddd6c7",
+      B06="#b56a2b", B10="#2f6d54", B08="#7a6a9c",
+      RED="#b1422c", AMBER="#c2872a", GREEN="#3f7a4f", FAINT="#bdb6a6";
+  var FONT="ui-sans-serif,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif";
+
+  function guard(id, fn){
+    try{ fn(); }
+    catch(e){
+      console.error("chart "+id+" failed", e);
+      var err=document.getElementById("e"+id.slice(1));
+      if(err){ err.style.display="block"; var cv=document.getElementById(id); if(cv) cv.style.display="none"; }
+    }
+  }
+  function baseOpts(extra){
+    var o={
+      responsive:true, maintainAspectRatio:false,
+      plugins:{ legend:{display:false},
+        tooltip:{backgroundColor:INK, titleFont:{family:FONT,size:12}, bodyFont:{family:FONT,size:12}, padding:9} },
+      scales:{
+        x:{ grid:{display:false}, ticks:{color:MUT, font:{family:FONT,size:11}} },
+        y:{ grid:{color:LINE}, border:{display:false}, ticks:{color:MUT, font:{family:FONT,size:11}} }
+      }
+    };
+    if(extra) for(var k in extra) o[k]=extra[k];
+    return o;
+  }
+
+  function renderAll(){
+    /* 00 — inventory (log scale, TiB) */
+    guard("cInv", function(){
+      new Chart(document.getElementById("cInv"),{
+        type:"bar",
+        data:{ labels:["R02B10\n(finest)","R02B08","R02B08\nshallow","R02B06","R02B06\nicon-exclaim"],
+          datasets:[{ data:[5750,425,425,30.9,6.82],
+            backgroundColor:[B10,B08,B08,B06,B06], borderRadius:3, barPercentage:0.72 }] }, /* tooltip divides by 1000: 5750->5.75 PiB, matches headline */
+        options:baseOpts({ scales:{
+          x:{grid:{display:false},ticks:{color:MUT,font:{family:FONT,size:10.5},maxRotation:0,
+              callback:function(v){return this.getLabelForValue(v).split("\n");}}},
+          y:{type:"logarithmic",grid:{color:LINE},border:{display:false},
+             ticks:{color:MUT,font:{family:FONT,size:10.5},callback:function(v){
+               if(v===10)return"10 TiB"; if(v===100)return"100 TiB"; if(v===1000)return"1 PiB"; if(v===10000)return"10 PiB"; return"";}}}
+        }, plugins:{legend:{display:false},tooltip:{callbacks:{label:function(c){
+          var t=c.parsed.y; return t>=1000? (t/1000).toFixed(2)+" PiB" : t.toFixed(1)+" TiB";}}}} })
+      });
+    });
+
+    /* 06 — CR histogram by resolution */
+    guard("cCR", function(){
+      var L=["3–5","5–8","8–13","13–21","21–34","34–55","55–100","100+"];
+      new Chart(document.getElementById("cCR"),{
+        type:"bar",
+        data:{ labels:L, datasets:[
+          {label:"R02B06", data:[36,29,18,7,5,10,8,7], backgroundColor:B06, borderRadius:2, barPercentage:0.9, categoryPercentage:0.78},
+          {label:"R02B10", data:[23,28,29,16,14,8,7,12], backgroundColor:B10, borderRadius:2, barPercentage:0.9, categoryPercentage:0.78}
+        ] },
+        options:baseOpts({ scales:{
+          x:{grid:{display:false},ticks:{color:MUT,font:{family:FONT,size:11}},title:{display:true,text:"compression ratio (×)",color:MUT,font:{family:FONT,size:11}}},
+          y:{grid:{color:LINE},border:{display:false},ticks:{color:MUT,font:{family:FONT,size:11},precision:0},title:{display:true,text:"number of fields",color:MUT,font:{family:FONT,size:11}}}
+        }})
+      });
+    });
+
+    /* 06 — codec composition (grouped) */
+    guard("cCodec", function(){
+      new Chart(document.getElementById("cCodec"),{
+        type:"bar",
+        data:{ labels:["ZFPY","PCodec","LZMA","BZ2","Zstd","Blosc","Zlib","Quantize","BitRound","FixedScale\nOffset"],
+          datasets:[
+            {label:"Serializer", data:[221,36,null,null,null,null,null,null,null,null], backgroundColor:B10, borderRadius:3},
+            {label:"Compressor", data:[null,null,143,85,20,7,2,null,null,null], backgroundColor:B06, borderRadius:3},
+            {label:"Filter", data:[null,null,null,null,null,null,null,138,107,12], backgroundColor:AMBER, borderRadius:3}
+          ] },
+        options:baseOpts({ scales:{
+          x:{stacked:true,grid:{display:false},ticks:{color:INK,font:{family:FONT,size:10.5},maxRotation:0,
+             callback:function(v){return this.getLabelForValue(v).split("\n");}}},
+          y:{stacked:true,grid:{color:LINE},border:{display:false},ticks:{color:MUT,font:{family:FONT,size:11},precision:0}}
+        }, plugins:{legend:{display:true,position:"bottom",labels:{color:INK,font:{family:FONT,size:11.5},boxWidth:12,padding:12}},tooltip:{enabled:true}} })
+      });
+      /* annotate group separators via subtitle */
+    });
+
+    /* 08 — cross-resolution stacked single bar */
+    guard("cXres", function(){
+      new Chart(document.getElementById("cXres"),{
+        type:"bar",
+        data:{ labels:["106 comparable variable pairs"],
+          datasets:[
+            {label:"Exact recipe match (53)", data:[53], backgroundColor:B10, borderRadius:2},
+            {label:"Same serializer, diff compressor/filter (38)", data:[38], backgroundColor:AMBER, borderRadius:2},
+            {label:"Serializer flip — turbulent fields (15)", data:[15], backgroundColor:RED, borderRadius:2}
+          ] },
+        options:{ indexAxis:"y", responsive:true, maintainAspectRatio:false,
+          plugins:{ legend:{position:"bottom",labels:{color:INK,font:{family:FONT,size:11.5},boxWidth:12,padding:9}},
+            tooltip:{backgroundColor:INK,bodyFont:{family:FONT,size:12}} },
+          scales:{ x:{stacked:true,max:106,grid:{color:LINE},border:{display:false},ticks:{color:MUT,font:{family:FONT,size:11}}},
+                   y:{stacked:true,grid:{display:false},ticks:{display:false}} } }
+      });
+    });
+
+    /* 09 — VAST throughput */
+    guard("cVast", function(){
+      new Chart(document.getElementById("cVast"),{
+        type:"bar",
+        data:{ labels:["8×8","16×8","64×1","16×4","32×2","32×4"],
+          datasets:[{ data:[118.1,68.0,56.2,51.1,43.9,31.0],
+            backgroundColor:["#c9c2b2","#c9c2b2","#c9c2b2","#c9c2b2","#9aaf8f",B10],
+            borderRadius:3, barPercentage:0.7 }] },
+        options:baseOpts({ scales:{
+          x:{grid:{display:false},ticks:{color:INK,font:{family:FONT,size:11}},title:{display:true,text:"workers × threads",color:MUT,font:{family:FONT,size:11}}},
+          y:{grid:{color:LINE},border:{display:false},ticks:{color:MUT,font:{family:FONT,size:11},callback:function(v){return v+"s";}},title:{display:true,text:"wall time (lower is better)",color:MUT,font:{family:FONT,size:11}}}
+        }, plugins:{legend:{display:false},tooltip:{callbacks:{label:function(c){return c.parsed.y+" s for 100 files";}}}} })
+      });
+    });
+  }
+
+  if(document.readyState==="loading"){ document.addEventListener("DOMContentLoaded",function(){ load(0); }); }
+  else { load(0); }
+})();
+</script>
+</body>
+</html>
