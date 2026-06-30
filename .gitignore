@@ -10,3 +10,5 @@ out-*
 *.parquet
 *manifest*.json
 sample*.json
+SWEEP*/
+VAST*/

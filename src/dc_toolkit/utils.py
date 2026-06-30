@@ -7,11 +7,13 @@
 # SPDX-License-Identifier: BSD-3-Clause
 import os
 import math
+import warnings
 import click
 import humanize
 import threading
+import asyncio
 from pathlib import Path
-from typing import Tuple, Optional
+from typing import Tuple, Optional, List
 
 import numpy as np
 import dask
@@ -19,12 +21,9 @@ import dask.array
 import pandas as pd
 import xarray as xr
 import zarr
-from zarr_any_numcodecs import AnyNumcodecsArrayArrayCodec, AnyNumcodecsArrayBytesCodec
 import numcodecs
-import numcodecs.zarr3
+from zarr.codecs import numcodecs as zarrcodecs_nc  # zarr-native codecs (replaces deprecated numcodecs.zarr3)
 import zfpy
-from ebcc.filter_wrapper import EBCC_Filter
-from ebcc.zarr_filter import EBCCZarrFilter
 from mpi4py import MPI
 import time
 from collections import defaultdict
@@ -32,13 +31,48 @@ from itertools import product
 import atexit
 import re
 
-# numcodecs-wasm filters
-from numcodecs_wasm_asinh import Asinh
-from numcodecs_wasm_fixed_offset_scale import FixedOffsetScale
-# numcodecs-wasm serializers
-from numcodecs_wasm_zfp import Zfp
 
-os.environ["EBCC_LOG_LEVEL"] = "4"  # ERROR (suppress WARN and below)
+class CombinationProducedNonFiniteError(Exception):
+    """
+    Raised when a codec combination's decoded sample contains NaN or
+    +/-inf values, signalling that the (compressor, filter, serializer)
+    triple is unsuitable for this field's value range.
+
+    Caught by the per-combo try/except in `cli.evaluate_combos`, which
+    routes it to `failures_<var>_rank<n>.csv` with a clear reason
+    string.  Without this exception, the float64 cast in the metrics
+    loop would raise a `RuntimeWarning: invalid value encountered in
+    cast` per non-finite chunk - the combo would still be filtered out
+    by the L1 threshold downstream, but the warning floods the SLURM
+    log (191 occurrences in production job 843234) and the failure
+    reason wouldn't be recorded explicitly.
+    """
+    pass
+
+
+class SampleTooLargeError(Exception):
+    """
+    Raised by `build_representative_sample` when a field's irreducible
+    spatial footprint exceeds the requested size limit.
+
+    "Irreducible" means: after striding every available time-like and
+    vertical-like dim down to a single index, a single horizontal slab
+    of the field still exceeds the byte limit.  Subsampling horizontal
+    dims is not permitted because it changes the spatial structure
+    codecs exploit during compression scoring.
+
+    Callers should surface this with a clear remedy (raise the limit,
+    drop --threads-per-rank, or move to a larger node).  The exception
+    carries the irreducible byte count and the limit it failed for so
+    the caller can format a precise message.
+    """
+    def __init__(self, message, irreducible_bytes=None, size_limit_bytes=None,
+                 dims=None, spatial_dims=None):
+        super().__init__(message)
+        self.irreducible_bytes = irreducible_bytes
+        self.size_limit_bytes  = size_limit_bytes
+        self.dims              = dims
+        self.spatial_dims      = spatial_dims
 
 
 # =============================================================================
@@ -157,28 +191,15 @@ def is_lat_lon(da):
 # REPRESENTATIVE SAMPLING  (replaces the old corner-slice strategy)
 # =============================================================================
 
-# Time-like dim name patterns, used as a FALLBACK by build_representative_sample
-# when CF metadata isn't available.  The primary detection path uses
-# CF-conventions attributes (units, standard_name, axis, calendar) on
-# the coord variable corresponding to each dim — that's the principled
-# answer.  The regex below is a name-matching backstop for files with
-# missing or sloppy CF metadata.  Conservative on purpose: a missed
-# match falls back to "return whole field with warning", which is a
-# soft failure (slightly more memory at sweep time) rather than a
-# silent biased-sample bug.  Add patterns here if you encounter
-# datasets whose temporal axis is named differently AND lacks CF
-# metadata to identify it structurally.
+# Time-like dim name patterns; FALLBACK when CF metadata is unavailable.
+# Primary detection uses CF-conventions attributes on the coord variable.
 _TIME_LIKE_DIM_RE = re.compile(
     r'^(?:time|.*_time|t|step|forecast_reference_time|forecast_period|'
     r'ensemble|realization|member|reftime|valid_time|epoch)$',
     re.IGNORECASE,
 )
 
-# CF time-units pattern: "<unit> since <reference time>".  CF spec allows
-# unit names like 'seconds', 'minutes', 'hours', 'days', 'months', 'years'
-# (and their abbreviations).  We deliberately don't enumerate those — any
-# alphanumeric token followed by 'since' is uniquely a time-unit string
-# in CF conventions; no other coordinate type uses this format.
+# CF time-units pattern: "<unit> since <reference time>".
 _CF_TIME_UNITS_RE = re.compile(r'^\s*\w+\s+since\s+', re.IGNORECASE)
 
 # CF standard_name values that mark a time-related axis.
@@ -221,7 +242,7 @@ def _is_time_like_coord(da: xr.DataArray, dim_name: str) -> bool:
         # Merge attrs and encoding; encoding wins on conflicts because
         # decoded time vars store the original units/calendar in
         # encoding rather than attrs.
-        merged = {**dict(coord.attrs), **dict(coord.encoding)}
+        merged = {**dict(coord.attrs), **dict(coord.encoding)
 
         units = merged.get('units')
         if isinstance(units, str) and _CF_TIME_UNITS_RE.match(units):
@@ -249,37 +270,126 @@ def _find_time_like_dim(da: xr.DataArray) -> Tuple[Optional[int], Optional[str]]
     return None, None
 
 
+def _is_vertical_like_coord(da: xr.DataArray, dim_name: str) -> bool:
+    """
+    Classify a dim as vertical (level/height/depth-like).
+
+    Order of evidence (most authoritative first), mirroring
+    `_is_time_like_coord`:
+      1. Coord's `axis` attr is 'Z' (CF standard for vertical).
+      2. Coord's `standard_name` matches a vertical-axis CF name
+         (height, altitude, depth, atmosphere_*_coordinate, ...).
+      3. Coord's `positive` attr is set ('up' or 'down') — CF vertical
+         marker that's allowed even without axis=Z.
+      4. Name fallback via `_is_vertical_like_dim` (the existing name
+         heuristic used by `_shrink_order`).
+    """
+    coord = da.coords.get(dim_name)
+    if coord is not None:
+        merged = {**dict(coord.attrs), **dict(coord.encoding)}
+        if merged.get('axis') == 'Z':
+            return True
+        sn = merged.get('standard_name')
+        if isinstance(sn, str) and sn.lower() in {
+            'height', 'altitude', 'depth', 'air_pressure', 'pressure',
+            'model_level_number', 'atmosphere_hybrid_sigma_pressure_coordinate',
+            'atmosphere_hybrid_height_coordinate',
+            'atmosphere_sigma_coordinate',
+            'atmosphere_ln_pressure_coordinate',
+            'atmosphere_sleve_coordinate',
+        }:
+            return True
+        if 'positive' in merged and str(merged['positive']).lower() in ('up', 'down'):
+            return True
+
+    return _is_vertical_like_dim(dim_name)
+
+
+def _classify_sample_dims(
+    da: xr.DataArray,
+) -> Tuple[List[Tuple[int, str]], List[Tuple[int, str]], List[Tuple[int, str]]]:
+    """
+    Classify every dim of `da` into one of:
+      - time-like (CF axis=T or time-units or name regex)
+      - vertical-like (CF axis=Z or vertical CF standard_name or name regex)
+      - spatial (everything else; preserved during sampling)
+
+    Returns (time_dims, vertical_dims, spatial_dims), each as a list of
+    (position-in-da.dims, name).  Time and vertical are STRIDE dims;
+    spatial dims are preserved whole so codec scoring sees the real
+    spatial structure of the field.
+
+    Note: the time check runs first.  If a coord is both T- and Z-like
+    (impossible under CF, but defensive), it's classified as time.
+    """
+    time_dims: List[Tuple[int, str]]     = []
+    vertical_dims: List[Tuple[int, str]] = []
+    spatial_dims: List[Tuple[int, str]]  = []
+    for i, name in enumerate(da.dims):
+        if _is_time_like_coord(da, name):
+            time_dims.append((i, name))
+        elif _is_vertical_like_coord(da, name):
+            vertical_dims.append((i, name))
+        else:
+            spatial_dims.append((i, name))
+    return time_dims, vertical_dims, spatial_dims
+
+
 def build_representative_sample(
     da: xr.DataArray,
     size_limit_bytes: int,
     rank: int = 0,
+    policy: str = "cascade",
+    vertical_floor: int | None = None,
 ) -> xr.DataArray:
     """
-    Return a subset of `da` that fits within `size_limit_bytes`, built to be
-    representative of the full field.
+    Return a subset of `da` that fits STRICTLY within `size_limit_bytes`,
+    built to be representative of the full field.
 
     Strategy
     --------
     - If the whole field fits under the limit: return it unchanged.
-    - Otherwise: find the first time-like dim of `da` (using CF metadata
-      on the corresponding coord variable when available — `units`,
-      `standard_name`, `axis`, `calendar` — and falling back to a name
-      regex when CF metadata is absent), and stride-sample along it.
-      Non-time dims are kept full so codecs can still exploit spatial
-      smoothness; striding along time samples across the temporal axis
-      instead of taking a corner.  See `_is_time_like_coord` for the
-      detection rules.
-    - If NO time-like dim is present (e.g. CF coordinate-bounds arrays
-      like `clat_bnds`, or SCRIP remapping artifacts like
-      `src_grid_area`), there is no axis the sweep can meaningfully
-      stride over.  We return the whole field with a warning rather
-      than silently striding along the wrong axis (the pre-patch
-      behaviour, which produced a biased sample for these vars).  In
-      practice the variables that hit this branch are small bookkeeping
-      arrays where the size cap was never going to bite; if a large
-      variable lacks a time axis, the warning makes the case visible.
-    - A deterministic `np.linspace`-style stride is used so results are
-      reproducible between `evaluate_combos` and `compress_with_optimal`.
+    - Otherwise: classify dims into time / vertical / spatial.  Spatial
+      dims (horizontal grid: lat, lon, cell, ncells, x, y, ...) are
+      preserved whole so codecs still see the real spatial structure
+      they exploit during scoring.  Time and vertical dims are
+      stride-sampled.
+    - The slice budget is divided between the time group and the vertical
+      group according to `policy`:
+        * "cascade" (default): drain the time axis first (temporal
+          diversity is what codec scoring cares about for time-varying
+          fields), keeping a budget-aware minimum of vertical levels
+          (`vertical_floor`).  Adjacent model levels are highly
+          correlated, so spending budget on temporal spread captures more
+          of the variety that affects codec ranking.
+        * "balanced": the legacy log-space split, giving each stride axis
+          ~budget^(1/n_dims) indices (equal treatment).
+      For single-axis fields (no vertical, or no time) the two policies are
+      identical.  For under-budget fields neither runs (full field returned).
+    - Within each strided dim, evenly-spaced indices are picked via
+      `np.linspace`, mirroring the single-dim behaviour:
+      deterministic, edge-inclusive, reproducible across
+      `evaluate_combos` and `compress_with_optimal`.
+    - If a field's irreducible spatial footprint (1 element along every
+      stride dim) exceeds the limit, this raises `SampleTooLargeError`
+      rather than silently violating the budget.  Pre-patch the
+      function used `max(1, …)` and accepted the budget violation; that
+      under-budgeted memory model is what caused the production OOMs
+      on R02B10 out_15 (300 GiB fields, single time slice = 37.5 GiB
+      against a 5 GB budget).
+
+    Memory contract
+    ---------------
+    The caller is entitled to assume `sampled.nbytes <= size_limit_bytes`
+    on successful return.  This is the foundation of the per-rank steady
+    estimate in `cli._per_rank_steady_estimate_bytes` and the cgroup
+    headroom check.
+
+    Errors
+    ------
+    SampleTooLargeError: irreducible spatial footprint > size_limit_bytes.
+      Carries `irreducible_bytes`, `size_limit_bytes`, `dims`,
+      `spatial_dims` for caller-side message formatting.
     """
     nbytes = int(da.dtype.itemsize) * int(np.prod(da.shape))
     if nbytes <= size_limit_bytes:
@@ -292,91 +402,353 @@ def build_representative_sample(
             )
         return da
 
-    # Locate the time-like dim using CF metadata (units, standard_name,
-    # axis, calendar) on the coord variable, with a name-regex fallback.
-    # This handles three cases consistently: time at dims[0] (the common
-    # case), time at a non-leading position, and no time axis at all.
-    time_idx, time_dim = _find_time_like_dim(da)
+    time_dims, vertical_dims, spatial_dims = _classify_sample_dims(da)
+    # Stride priority: time first (captures temporal variation, the most
+    # informative axis for codec scoring across forecast steps), then vertical.
+    stride_dims: List[Tuple[int, str]] = list(time_dims) + list(vertical_dims)
 
-    if time_dim is None:
-        # No axis we can stride over.  Return the field whole and warn.
-        # The variables that hit this branch in well-formed climate data
-        # are CF bounds and SCRIP remap arrays - small enough that
-        # returning them whole is safe.  A LARGE variable without a
-        # time axis would deserve human review; the warning surfaces it.
+    if not stride_dims:
+        # Nothing safe to thin — return the whole field with a warning.  These
+        # are usually small bookkeeping arrays (CF coord-bounds, SCRIP weights)
+        # where a few GiB over is fine; a LARGE axis-less variable would deserve
+        # review, so surface it via the warning rather than passing silently.
         if rank == 0:
             click.echo(
                 f"[sample] WARNING: variable '{da.name}' has dims {da.dims} "
-                f"with no time-like axis; cannot stride-sample.  Returning "
-                f"the full field "
+                f"with no time-like or vertical axis; cannot stride-sample.  "
+                f"Returning the full field "
                 f"({humanize.naturalsize(nbytes, binary=True)}), which "
                 f"exceeds the "
-                f"{humanize.naturalsize(size_limit_bytes, binary=True)} "
-                f"cap.  This is normal for small bookkeeping arrays "
-                f"(coord bounds, remap weights); investigate if the "
+                f"{humanize.naturalsize(size_limit_bytes, binary=True)} cap.  "
+                f"Normal for small bookkeeping arrays; investigate if the "
                 f"variable is large and downstream OOMs."
             )
         return da
 
-    leading_size = da.sizes[time_dim]
+    # Irreducible footprint = bytes at 1 index along every stride dim.
+    spatial_sizes = [da.sizes[d] for _, d in spatial_dims]
+    irreducible_bytes = int(da.dtype.itemsize) * int(
+        np.prod(spatial_sizes) if spatial_sizes else 1
+    )
 
-    # Per-slice byte cost = product of the OTHER dims' sizes * itemsize.
-    # Pre-patch this was hardcoded as `da.shape[1:]`, which assumed
-    # dims[0] was the axis being subset.  Now we exclude whichever
-    # position the time-like axis sits at, so e.g. (height, time, lat,
-    # lon) computes trailing across (height, lat, lon) and strides
-    # along time at position 1.
-    trailing_shape = tuple(s for i, s in enumerate(da.shape) if i != time_idx)
-    trailing_bytes = int(da.dtype.itemsize) * int(np.prod(trailing_shape))
-    if trailing_bytes == 0:
-        return da  # degenerate; nothing to sample
+    if irreducible_bytes > size_limit_bytes:
+        spatial_names = [d for _, d in spatial_dims]
+        msg = (
+            f"variable '{da.name}' has irreducible spatial footprint "
+            f"{humanize.naturalsize(irreducible_bytes, binary=True)} "
+            f"(spatial dims {spatial_names}) which exceeds the "
+            f"{humanize.naturalsize(size_limit_bytes, binary=True)} budget.  "
+            f"Spatial dims must be preserved for codec representativeness.  "
+            f"Remedies (any one):\n"
+            f"  - raise --eval-data-size-limit (memory permitting)\n"
+            f"  - reduce --threads-per-rank to free memory for a larger sample\n"
+            f"  - request more RAM (#SBATCH --mem=0) or a larger node"
+        )
+        if rank == 0:
+            click.echo(f"[sample] FATAL: {msg}")
+        raise SampleTooLargeError(
+            msg,
+            irreducible_bytes=irreducible_bytes,
+            size_limit_bytes=int(size_limit_bytes),
+            dims=tuple(da.dims),
+            spatial_dims=tuple(spatial_names),
+        )
 
-    max_slices = max(1, size_limit_bytes // trailing_bytes)
-    max_slices = int(min(max_slices, leading_size))
+    # Slice budget: how many (time x level) index-combinations fit once the
+    # spatial dims are preserved whole.
+    max_product = float(size_limit_bytes) / float(irreducible_bytes)
 
-    # Evenly-spaced indices spanning [0, leading_size-1].  Deterministic
-    # so evaluate_combos and compress_with_optimal reproduce the same
-    # sample given the same size_limit_bytes.
-    indices = np.linspace(0, leading_size - 1, num=max_slices, dtype=int)
-    indices = np.unique(indices).tolist()
+    plan = _allocate_stride_plan(
+        da, time_dims, vertical_dims, max_product,
+        policy=policy, vertical_floor=vertical_floor,
+    )
 
-    sampled = da.isel({time_dim: indices})
+    # Build isel dict; only set indices for dims we actually thinned.  Index
+    # selection is evenly-spaced (linspace), edge-inclusive, for EVERY thinned
+    # stride dim (time and vertical alike) — never consecutive.
+    stride_dims = list(time_dims) + list(vertical_dims)
+    indices_isel: dict = {}
+    for _, name in stride_dims:
+        size = int(da.sizes[name])
+        n_keep = plan[name]
+        if n_keep < size:
+            idx = np.linspace(0, size - 1, num=n_keep, dtype=int)
+            indices_isel[name] = np.unique(idx).tolist()
+
+    sampled = da.isel(indices_isel) if indices_isel else da
 
     if rank == 0:
-        position_note = (
-            "" if time_idx == 0
-            else f" (at dim position {time_idx}, not leading)"
+        # Compact plan summary, in original dim order:
+        plan_parts = []
+        for _, name in stride_dims:
+            plan_parts.append(f"{name}={plan[name]}/{da.sizes[name]}")
+        spatial_part = (
+            f" | preserved spatial: {', '.join(d for _, d in spatial_dims)}"
+            if spatial_dims else ""
         )
         click.echo(
             f"[sample] field is "
             f"{humanize.naturalsize(nbytes, binary=True)} > limit "
             f"{humanize.naturalsize(size_limit_bytes, binary=True)}; "
-            f"sampled {len(indices)}/{leading_size} along "
-            f"'{time_dim}'{position_note} "
-            f"-> {humanize.naturalsize(sampled.nbytes, binary=True)}."
+            f"policy={policy}; "
+            f"strided {', '.join(plan_parts)}"
+            f"{spatial_part} -> "
+            f"{humanize.naturalsize(int(sampled.nbytes), binary=True)}."
         )
 
     return sampled
+
+def _balanced_group_plan(dims_info, budget) -> dict:
+    """
+    Legacy log-space split of `budget` slices across the dims in `dims_info`
+    (list of (pos, name, size)).  Sort ascending by size so small dims clamp
+    early and pass freed budget upward.  Returns {name: n_keep}.
+    """
+    plan: dict = {}
+    remaining = float(budget)
+    remaining_dims = len(dims_info)
+    for _, name, size in sorted(dims_info, key=lambda t: t[2]):
+        target = remaining ** (1.0 / remaining_dims) if remaining_dims > 0 else 1.0
+        n_keep = max(1, min(size, int(target)))
+        plan[name] = n_keep
+        remaining = remaining / max(1, n_keep)
+        remaining_dims -= 1
+    return plan
+
+
+def _allocate_stride_plan(
+    da, time_dims, vertical_dims, max_product, policy="cascade",
+    vertical_floor=None,
+) -> dict:
+    """
+    Decide how many indices to keep along each stride dim.
+
+    Returns {dim_name: n_keep} covering every time and vertical dim.
+
+    cascade (default)
+    -----------------
+    Drain the time group first; protect a budget-aware minimum of vertical
+    levels.  With combined time size T and vertical size V and slice budget
+    P = max_product:
+
+        vfloor     = vertical_floor (default max(4, ceil(log2 V)), capped at V)
+        base_level = min(vfloor, floor(sqrt(P)))   # never exceeds balanced's
+                                                    # level count -> cascade
+                                                    # keeps >= balanced timesteps
+        time_keep  = min(T, floor(P / base_level))
+        level_keep = min(V, floor(P / time_keep))   # spill time slack to levels
+
+    The min(vfloor, floor(sqrt P)) cap is what prevents a tight-budget
+    inversion: at small P it collapses to the balanced split; only when the
+    budget is generous (sqrt(P) > vfloor) does cascade trade levels for
+    timesteps.  Within the time group (or vertical group) the group's
+    allocation is distributed across its member dims log-space.
+
+    balanced
+    --------
+    The legacy behaviour: one log-space split across all stride dims jointly.
+    """
+    time_info = [(i, name, int(da.sizes[name])) for i, name in time_dims]
+    vert_info = [(i, name, int(da.sizes[name])) for i, name in vertical_dims]
+
+    if policy == "balanced":
+        return _balanced_group_plan(time_info + vert_info, max_product)
+
+    # --- cascade ---
+    T = int(np.prod([s for _, _, s in time_info])) if time_info else 1
+    V = int(np.prod([s for _, _, s in vert_info])) if vert_info else 1
+    P = max(1.0, float(max_product))
+
+    if vertical_floor is not None:
+        vfloor = max(1, int(vertical_floor))
+    else:
+        # max(4, ceil(log2 V)): 10 lev -> 4, 60 -> 6, 137 -> 8.
+        vfloor = max(4, int(math.ceil(math.log2(V)))) if V > 1 else 1
+    vfloor = min(vfloor, V)
+
+    sqrtP = int(math.floor(math.sqrt(P)))
+    base_level = max(1, min(vfloor, sqrtP))
+    time_keep = max(1, min(T, int(math.floor(P / base_level))))
+    level_keep = max(1, min(V, int(math.floor(P / time_keep))))
+
+    # Distribute each group's allocation across its member dims (log-space),
+    # so multi-time or multi-vertical fields are handled gracefully.  Single
+    # dim per group is the common case and reduces to {name: keep}.
+    plan: dict = {}
+    plan.update(_distribute_group(time_info, time_keep))
+    plan.update(_distribute_group(vert_info, level_keep))
+    return plan
+
+
+def _distribute_group(dims_info, group_keep) -> dict:
+    """Distribute `group_keep` total indices across the dims in a group.
+
+    One dim -> {name: min(size, group_keep)}.  Multiple dims -> log-space
+    split (reusing the balanced splitter on the group's own budget).
+    """
+    if not dims_info:
+        return {}
+    if len(dims_info) == 1:
+        _, name, size = dims_info[0]
+        return {name: max(1, min(size, int(group_keep)))}
+    return _balanced_group_plan(dims_info, group_keep)
 
 
 # =============================================================================
 # CHUNK & SHARD SIZING
 # =============================================================================
 
-def compute_chunk_shape_for_eval(shape, dtype, target_mib: int = 16):
+# -----------------------------------------------------------------------------
+# Vertical-dim recognition for hiopy-style shrink order.
+# -----------------------------------------------------------------------------
+_VERTICAL_DIM_NAMES = {
+    "lev", "level", "levels", "plev", "plevs", "pressure", "pressure_level",
+    "height", "altitude", "alt", "depth", "z",
+    "model_level", "model_level_number", "ml",
+    "vertical", "vert",
+    "bottom_top", "bottom_top_stag",
+    "mlev", "ilev", "lev_p", "lev_l", "soil_layers_stag",
+    "isobaric", "isobaric1", "isobaric2",
+    "sigma", "sigma_level",
+    "hybrid", "hybrid_level",
+}
+
+
+def _is_vertical_like_dim(name) -> bool:
+    """True if `name` looks like a vertical (level/height/depth) dim."""
+    if name is None:
+        return False
+    n = str(name).lower().strip()
+    if n in _VERTICAL_DIM_NAMES:
+        return True
+    if n.startswith(("lev", "plev", "ilev", "mlev")):
+        return True
+    if n.endswith(("_lev", "_level", "_levels")):
+        return True
+    return False
+
+
+def _shrink_order(shape, dims) -> list:
     """
-    Pick a simple chunk shape for in-memory evaluation.  Target ~target_mib
-    per chunk.  Chunks the leading dim; keeps trailing dims whole.
+    Return axis indices in the order they should be shrunk when the chunk
+    is over target.  Skips axis 0 (the leading dim, handled separately).
+
+    hiopy approach: shrink non-vertical (horizontal/cell) dims first, last
+    spatial dim first (C-order); shrink vertical dims last.  When `dims`
+    is None or empty, fall back to plain last-dim-first.
     """
-    itemsize = np.dtype(dtype).itemsize
-    trailing = int(np.prod(shape[1:])) if len(shape) > 1 else 1
+    ndim = len(shape)
+    if ndim <= 1:
+        return []
+    if dims is None or len(dims) != ndim:
+        return list(range(ndim - 1, 0, -1))
+
+    horizontal, vertical = [], []
+    for i, name in enumerate(dims):
+        if i == 0:
+            continue
+        (vertical if _is_vertical_like_dim(name) else horizontal).append(i)
+    # Within each group, shrink the LAST (fastest-varying) dim first.
+    return sorted(horizontal, reverse=True) + sorted(vertical, reverse=True)
+
+
+def _compute_inner_chunk_shape(
+    shape,
+    dtype,
+    dims,
+    target_bytes: int,
+    allow_spatial_split: bool = True,
+) -> Tuple[Tuple[int, ...], str]:
+    """
+    Core inner-chunk sizing algorithm.  Returns (inner_chunk_shape, mode).
+
+    `mode` is a short string describing which branch was taken, suitable
+    for logging:
+      - "leading-fits"   : one leading slice fits in target; chunked along leading
+      - "spatial-split"  : leading slice exceeds target; spatial dims also shrunk
+      - "temporal-only"  : leading slice exceeds target but split was disabled;
+                           one timestep per chunk, full spatial (may exceed target)
+
+    Algorithm:
+      1. If one slice along the leading dim fits in target, pack as many
+         leading slices as fit.
+      2. Else set leading=1.  If allow_spatial_split is False, return now
+         (caller is responsible for any oversize warning).
+      3. Else walk spatial dims in `_shrink_order` and reduce each until
+         the chunk fits in target_bytes.
+    """
+    itemsize = int(np.dtype(dtype).itemsize)
+    shape = tuple(int(s) for s in shape)
+    ndim = len(shape)
+    if ndim == 0:
+        return (), "leading-fits"
+
+    inner = list(shape)
+
+    # Bytes for one leading slice (the full trailing tile).
+    trailing = int(np.prod(shape[1:])) if ndim > 1 else 1
     bytes_per_leading = itemsize * trailing
     if bytes_per_leading == 0:
-        return tuple(shape)
-    target_bytes = target_mib * 2**20
-    leading_chunk = max(1, target_bytes // bytes_per_leading)
-    leading_chunk = int(min(leading_chunk, shape[0]))
-    return (leading_chunk,) + tuple(shape[1:])
+        return tuple(inner), "leading-fits"
+
+    if bytes_per_leading <= target_bytes:
+        leading = max(1, target_bytes // bytes_per_leading)
+        inner[0] = int(min(shape[0], leading))
+        return tuple(int(x) for x in inner), "leading-fits"
+
+    # One leading slice already exceeds target.
+    inner[0] = 1
+
+    if not allow_spatial_split:
+        return tuple(int(x) for x in inner), "temporal-only"
+
+    # Walk spatial dims in hiopy shrink order, reducing each until we fit.
+    for axis in _shrink_order(shape, dims):
+        chunk_bytes = itemsize * int(np.prod(inner))
+        if chunk_bytes <= target_bytes:
+            break
+        per_row = chunk_bytes // inner[axis] if inner[axis] > 0 else chunk_bytes
+        if per_row <= 0:
+            inner[axis] = 1
+            continue
+        new_size = max(1, target_bytes // per_row)
+        inner[axis] = int(min(inner[axis], new_size))
+
+    return tuple(int(x) for x in inner), "spatial-split"
+
+
+def compute_chunk_shape_for_eval(
+    shape,
+    dtype,
+    target_mib: int = 16,
+    dims=None,
+    max_target_mib: int = 256,
+    allow_spatial_split: bool = True,
+):
+    """
+    Pick a chunk shape for in-memory evaluation.  Same algorithm as the
+    persist path so the measured compression ratio reflects production.
+
+    Parameters
+    ----------
+    shape, dtype : array geometry.
+    target_mib : soft target chunk size in MiB.
+    dims : tuple of dim names (used to keep vertical-like dims whole when
+           spatial splitting is needed).  Pass None to fall back to plain
+           last-dim-first ordering.
+    max_target_mib : hard ceiling in MiB.  Only relevant when
+           allow_spatial_split=False (in that case we may emit a chunk
+           larger than target_mib; we warn once if it also exceeds this
+           ceiling).  Caller is responsible for the warning.
+    allow_spatial_split : if False, never split spatial dims; keep
+           (1, ...full spatial...) and accept oversized chunks.
+    """
+    target_bytes = int(target_mib) * 2**20
+    inner, _mode = _compute_inner_chunk_shape(
+        shape, dtype, dims, target_bytes,
+        allow_spatial_split=allow_spatial_split,
+    )
+    return inner
 
 
 def compute_chunk_and_shard_shape(
@@ -384,256 +756,292 @@ def compute_chunk_and_shard_shape(
     dtype,
     inner_mib: int = 16,
     shard_mib: int = 512,
-) -> Tuple[Tuple[int, ...], Tuple[int, ...]]:
+    dims=None,
+    max_inner_mib: int = 256,
+    allow_spatial_split: bool = True,
+) -> Tuple[Tuple[int, ...], Optional[Tuple[int, ...]]]:
     """
     Auto-compute (inner_chunk_shape, shard_shape) for zarr v3 sharding.
 
-    Rules of thumb:
-      - Inner chunks: ~inner_mib (good for partial reads).
-      - Shards:       ~shard_mib (amortizes per-file overhead; big write unit).
-      - Shard is an integer multiple of inner on every axis.
+    Returns
+    -------
+    (inner, shards) where:
+      - `inner` is the inner chunk shape.
+      - `shards` is the shard shape, OR `None` to signal "skip sharding"
+        (the inner chunk already meets/exceeds the shard target, so a
+        shard would bundle <= 1 chunk and add only index overhead).
+
+    Parameters
+    ----------
+    inner_mib : soft target for inner chunk (MiB).
+    shard_mib : soft target for shard (MiB).  Each shard must contain an
+                integer number of inner chunks on every axis.
+    dims : optional tuple of dim names.  When provided, vertical-like
+           dims are shrunk last (hiopy approach).
+    max_inner_mib : hard ceiling on inner chunk size in MiB.  Used by the
+           caller to decide whether to warn; the algorithm itself respects
+           inner_mib when allow_spatial_split=True.
+    allow_spatial_split : if True (default), spatial dims are split when a
+           single timestep already exceeds inner_mib.  If False, chunks
+           remain (1, ...full spatial...) and may exceed the target.
     """
-    itemsize = np.dtype(dtype).itemsize
-    ndim = len(shape)
+    itemsize = int(np.dtype(dtype).itemsize)
+    inner_target_bytes = int(inner_mib) * 2**20
+    shard_target_bytes = int(shard_mib) * 2**20
 
-    # ---- inner chunk shape: target inner_mib bytes ----
-    inner_target_bytes = inner_mib * 2**20
-    inner = list(shape)
-    # Reduce the leading dim first; keep trailing dims whole where possible.
-    trailing = int(np.prod(shape[1:])) if ndim > 1 else 1
-    bytes_per_leading = itemsize * trailing
-    if bytes_per_leading > 0:
-        inner[0] = max(1, min(shape[0], inner_target_bytes // bytes_per_leading))
-    inner = tuple(int(x) for x in inner)
+    inner, _mode = _compute_inner_chunk_shape(
+        shape, dtype, dims, inner_target_bytes,
+        allow_spatial_split=allow_spatial_split,
+    )
 
-    # ---- shard shape: integer multiple of inner, target shard_mib ----
+    # ---- shard shape ----
+    # Skip sharding when one chunk already fills (or exceeds) a shard:
+    # bundling a single chunk in a shard buys nothing and costs index bytes.
     inner_bytes = itemsize * int(np.prod(inner))
-    if inner_bytes == 0:
-        return inner, inner
-    shard_target_bytes = shard_mib * 2**20
-    multiplier = max(1, shard_target_bytes // inner_bytes)
+    if inner_bytes == 0 or inner_bytes >= shard_target_bytes:
+        return inner, None
 
-    # Grow the leading dim by `multiplier`, capped by the array extent.
+    multiplier = shard_target_bytes // inner_bytes
+    if multiplier <= 1:
+        return inner, None
+
     shard = list(inner)
-    shard[0] = min(shape[0], inner[0] * multiplier)
-    # Round down to an exact multiple of inner[0].
+    shard[0] = min(int(shape[0]), inner[0] * int(multiplier))
+    # Must be an integer multiple of inner[0].
     shard[0] = (shard[0] // inner[0]) * inner[0]
     shard[0] = max(shard[0], inner[0])
-    shard = tuple(int(x) for x in shard)
-
-    return inner, shard
-
-
-# -----------------------------------------------------------------------------
-# Kept from original: EBCC-specific chunk search
-# -----------------------------------------------------------------------------
-def compute_chunks(data, min_height=0, max_height=None, min_width=0, max_width=None):
-    lat_dim = data.shape[0]
-    lon_dim = data.shape[1]
-    height = lat_dim
-    width = lon_dim
-
-    if max_height is None:
-        max_height = lat_dim
-    if max_width is None:
-        max_width = lat_dim
-
-    keep_searching_height = True
-    keep_searching_width = True
-
-    for n in [2, 3, 5]:
-        for m in range(10):
-            d = n * (m + 1)
-            for p in range(7, -1, -1):
-                if keep_searching_height or keep_searching_width:
-                    if keep_searching_height:
-                        n_chunks_height = d ** p
-                        if height % n_chunks_height == 0:
-                            new_height = height / n_chunks_height
-                            if (new_height >= min_height) and (new_height <= max_height):
-                                height = new_height
-                                keep_searching_height = False
-                    if keep_searching_width and p > 0:
-                        n_chunks_width = d ** (p - 1)
-                        if width % n_chunks_width == 0:
-                            new_width = width / n_chunks_width
-                            if (new_width >= min_width) and (new_width <= max_width):
-                                width = new_width
-                                keep_searching_width = False
-                else:
-                    return (height, width, n_chunks_height, n_chunks_width)
-
-    # All loops exhausted without both dims having found a valid factoring.
-    # Before this raise, control fell off the end and the function implicitly
-    # returned None; the caller (serializer_space's EBCC branch) then tried to
-    # unpack None into 4 names and crashed with a cryptic TypeError.  Now we
-    # report the actual problem: no (height_divisor, width_divisor) of the form
-    # (n*(m+1))^p with n in {2,3,5}, m in [0..9], p in [0..7] maps both
-    # dimensions into their allowed [min_*, max_*] bands.  Typical trigger:
-    # a field with one dimension that doesn't factor cleanly into small primes
-    # (e.g. a prime width, or a dimension smaller than min_*).
-    raise ValueError(
-        f"compute_chunks: no valid EBCC chunking found for shape "
-        f"({lat_dim}, {lon_dim}) under constraints "
-        f"height in [{min_height}, {max_height}], "
-        f"width in [{min_width}, {max_width}]. "
-        f"EBCC needs each dim divisible by (n*(m+1))^p for small n/m/p so the "
-        f"resulting block fits in the allowed range.  Resolved so far: "
-        f"height_done={not keep_searching_height}, "
-        f"width_done={not keep_searching_width}.  "
-        f"Workarounds: widen the min/max bounds, pad the field to a "
-        f"factor-friendly shape, or pick a non-EBCC serializer."
-    )
+    shard_t = tuple(int(x) for x in shard)
+    if shard_t == inner:
+        return inner, None
+    return inner, shard_t
 
 
 # =============================================================================
 # CODEC SPACES
 # =============================================================================
 
-def compressor_space(da, with_lossy=True, with_numcodecs_wasm=True, with_ebcc=True, compressor_class="all"):
-    compressor_space = []
+# ---- Compressor parameter grids (bytes -> bytes, data-independent) ----------
+_BLOSC_CNAMES      = ("lz4", "lz4hc", "zstd")               # dropped blosclz
+_BLOSC_CLEVELS     = (1, 5, 9)
+_BLOSC_SHUFFLES    = (0, 1)                                 # dropped shuffle=2 bit
+_LZ4_ACCELERATIONS = (1, 10, 100)
+_ZSTD_LEVELS       = (6, 12, 22)                            # dropped 1
+_ZLIB_LEVELS       = (3, 6, 9)                              # dropped 1
+_BZ2_LEVELS        = (3, 6, 9)                              # dropped 1
+_LZMA_PRESETS      = (3, 6, 9)                              # dropped 1
+
+# ---- Filter parameter grids (array -> array) --------------------------------
+# The top value in each tuple is effectively lossless
+# and acts as the upper-bound reference point.
+_BITROUND_KEEPBITS_F32 = (3, 7, 11, 13, 17, 23)             # dropped 5, 9, 15; 23 -> lossless
+_BITROUND_KEEPBITS_F64 = (3, 7, 11, 17, 23, 30, 37, 44, 52) # dropped 5, 9, 13 (mirroring f32 logic); 52 -> lossless
+_QUANTIZE_DIGITS_F32   = (1, 3, 4, 5, 6, 7)                 # dropped 2 (adjacent-redundant); 7 -> ~lossless
+_QUANTIZE_DIGITS_F64   = (1, 3, 4, 5, 6, 7, 9, 11, 13, 15)  # dropped 2 (adjacent-redundant); 15 -> ~lossless
+
+# ---- FixedScaleOffset target integer widths (array -> array, data-dependent) -
+# The field's [min, max] maps onto the full range of each integer width: more
+# bits -> finer precision but larger ints (uint32 is ~lossless for f32).
+# uint8 is EXCLUDED: it has no viable serializer here — ZFPY rejects all FSO
+# (combo_is_valid), and PCodec refuses 8-bit input.  An empirical pres_msl trial
+# had every uint8-FSO->PCodec combo crash (264 failures/field), and 256 levels
+# is too coarse for a sub-1% gate anyway.
+_FSO_TARGET_UINTS      = ("uint16", "uint32")
+
+# ---- Serializer parameter grids (array -> bytes) ----------------------------
+_PCODEC_LEVELS         = (6, 8, 10, 12)      # dropped 4; dropped 0 ("no compression")
+_PCODEC_DELTA_ORDERS   = (0, 7)              # dropped 3 (middle); endpoints cover delta-mode space
+_ZFPY_K_GRID           = (0, 1, 2, 3)        # k -> compute_fixed_*_param(k);
+                                             # fixed-rate / fixed-precision: 8/16/32/64 bits
+                                             # fixed-accuracy:               0.5/0.25/0.0625/0.0039
+
+
+def compressor_space(da, with_lossy=True, compressor_class="all"):
+    """
+    Bytes->bytes compressor space.  Data-independent: the `da` argument is
+    accepted only for signature symmetry with filter_space / serializer_space,
+    and the lossy flag is ignored (every codec here is lossless).
+    Returns [(index, codec), ...].
+
+    Byte-shuffle note: a STANDALONE numcodecs Shuffle codec cannot be used in
+    this pipeline.  Shuffle is a bytes->bytes codec that requires its input
+    length to be an exact multiple of `elementsize`; in Zarr v3 the bytes->bytes
+    stage runs AFTER the array->bytes serializer, so with a compressing
+    serializer (ZFPY / PCodec) Shuffle receives an already-compressed,
+    variable-length blob and raises "buffer is not an integer multiple of
+    elementsize".  The byte-shuffle transform is instead obtained via Blosc's
+    own `shuffle` parameter (swept in _BLOSC_SHUFFLES), which is the supported
+    way to byte-shuffle in Zarr v3.
+
+    Note: standalone GZip has been removed from the space.  GZip and Zlib
+    both run DEFLATE with different wrapping headers, so they produce
+    identical CR for identical input; keeping both was strict redundancy.
+    """
     _COMPRESSORS = [
-        numcodecs.zarr3.Blosc, numcodecs.zarr3.LZ4, numcodecs.zarr3.Zstd,
-        numcodecs.zarr3.Zlib, numcodecs.zarr3.GZip, numcodecs.zarr3.BZ2,
-        numcodecs.zarr3.LZMA,
+        zarrcodecs_nc.Blosc, zarrcodecs_nc.LZ4, zarrcodecs_nc.Zstd,
+        zarrcodecs_nc.Zlib, zarrcodecs_nc.BZ2, zarrcodecs_nc.LZMA,
     ]
     _COMPRESSOR_MAP = {cls.__name__.lower(): cls for cls in _COMPRESSORS}
 
+    space = []
     if compressor_class.lower() == "all":
         pass
     elif compressor_class.lower() in _COMPRESSOR_MAP:
         _COMPRESSORS = [_COMPRESSOR_MAP[compressor_class.lower()]]
     elif compressor_class.lower() == "none":
         _COMPRESSORS = []
-        compressor_space.append(None)
+        space.append(None)
 
     for compressor in _COMPRESSORS:
-        if compressor == numcodecs.zarr3.Blosc:
-            for cname in numcodecs.blosc.list_compressors():
-                for clevel in [1, 6, 9]:
-                    for shuffle in [-1, 0, 1, 2]:
-                        compressor_space.append(compressor(cname=cname, clevel=clevel, shuffle=shuffle))
-        elif compressor == numcodecs.zarr3.LZ4:
-            for acceleration in [1, 10, 100]:
-                compressor_space.append(compressor(acceleration=acceleration))
-        elif compressor == numcodecs.zarr3.Zstd:
-            for level in [0, 1, 9, 22]:
-                compressor_space.append(compressor(level=level))
-        elif compressor == numcodecs.zarr3.Zlib:
-            for level in [1, 6, 9]:
-                compressor_space.append(compressor(level=level))
-        elif compressor == numcodecs.zarr3.GZip:
-            for level in [1, 6, 9]:
-                compressor_space.append(compressor(level=level))
-        elif compressor == numcodecs.zarr3.BZ2:
-            for level in [1, 6, 9]:
-                compressor_space.append(compressor(level=level))
-        elif compressor == numcodecs.zarr3.LZMA:
-            for preset in [1, 6, 9]:
-                compressor_space.append(compressor(preset=preset))
+        if compressor is zarrcodecs_nc.Blosc:
+            for cname in _BLOSC_CNAMES:
+                for clevel in _BLOSC_CLEVELS:
+                    for shuffle in _BLOSC_SHUFFLES:
+                        space.append(compressor(cname=cname, clevel=clevel, shuffle=shuffle))
+        elif compressor is zarrcodecs_nc.LZ4:
+            for acceleration in _LZ4_ACCELERATIONS:
+                space.append(compressor(acceleration=acceleration))
+        elif compressor is zarrcodecs_nc.Zstd:
+            for level in _ZSTD_LEVELS:
+                space.append(compressor(level=level))
+        elif compressor is zarrcodecs_nc.Zlib:
+            for level in _ZLIB_LEVELS:
+                space.append(compressor(level=level))
+        elif compressor is zarrcodecs_nc.BZ2:
+            for level in _BZ2_LEVELS:
+                space.append(compressor(level=level))
+        elif compressor is zarrcodecs_nc.LZMA:
+            for preset in _LZMA_PRESETS:
+                space.append(compressor(preset=preset))
 
-    return list(zip(range(len(compressor_space)), compressor_space))
+    return list(enumerate(space))
 
 
-def filter_space(da, with_lossy=True, with_numcodecs_wasm=True, with_ebcc=True, filter_class="all"):
-    filter_space = []
+def filter_space(da, with_lossy=True, filter_class="all", data_range=None):
+    """
+    Array->array filter space.  For integer dtypes only Delta is meaningful
+    (BitRound/Quantize are float-only).  If the user asks for a filter class
+    that is incompatible with the dtype, we warn explicitly rather than
+    silently honouring the dtype override.
 
-    _FILTERS = [numcodecs.zarr3.Delta]
+    `data_range`: optional (global_min, global_max) of the FULL field, used to
+    build FixedScaleOffset's affine integer packing.  Pass the true full-field
+    extremes here whenever `da` is only a strided evaluation sample, so the
+    uint packing cannot overflow on production values outside the sample range.
+    If None, FixedScaleOffset falls back to the min/max of `da` (safe only when
+    `da` is the whole field).
+
+    Returns [(index, codec), ...].
+    """
+    is_int = (da.dtype.kind == "i")
+    _FILTERS = [zarrcodecs_nc.Delta]
     if with_lossy:
-        _FILTERS += [numcodecs.zarr3.BitRound, numcodecs.zarr3.Quantize]
-    if with_numcodecs_wasm:
-        if with_lossy:
-            _FILTERS.append(Asinh)
-        _FILTERS.append(FixedOffsetScale)
-    if da.dtype.kind == "i":
-        _FILTERS = [numcodecs.zarr3.Delta]
+        _FILTERS += [zarrcodecs_nc.BitRound, zarrcodecs_nc.Quantize,
+                     zarrcodecs_nc.FixedScaleOffset]
+        # AsType down-cast is only meaningful when the field is WIDER than
+        # 32-bit float (e.g. f64 -> f32).  For already-32-bit fields there is
+        # nothing to narrow, so it is not added.
+        if np.issubdtype(da.dtype, np.floating) and da.dtype.itemsize > 4:
+            _FILTERS.append(zarrcodecs_nc.AsType)
+    if is_int:
+        # Integer fields: only Delta is algorithmically meaningful.  Surface
+        # the override to the user instead of silently dropping their
+        # --filter-class request.
+        if filter_class.lower() not in ("all", "delta", "none"):
+            click.echo(
+                f"[filter_space] integer dtype {da.dtype}: only Delta is "
+                f"available; ignoring --filter-class={filter_class}.",
+                err=True,
+            )
+        _FILTERS = [zarrcodecs_nc.Delta]
 
     _FILTER_MAP = {cls.__name__.lower(): cls for cls in _FILTERS}
 
+    space = []
     if filter_class.lower() == "all":
         pass
     elif filter_class.lower() in _FILTER_MAP:
         _FILTERS = [_FILTER_MAP[filter_class.lower()]]
     elif filter_class.lower() == "none":
         _FILTERS = []
-        filter_space.append(None)
+        space.append(None)
 
     for filt in _FILTERS:
-        if filt == numcodecs.zarr3.Delta:
+        if filt is zarrcodecs_nc.Delta:
             if np.issubdtype(da.dtype, np.number):
-                filter_space.append(filt(dtype=str(da.dtype)))
-        elif filt == numcodecs.zarr3.BitRound:
-            for keepbits in valid_keepbits_for_bitround(da, step=9):
-                filter_space.append(filt(keepbits=keepbits))
-        elif filt == numcodecs.zarr3.Quantize:
-            for digits in valid_digits_for_quantize(da, step=4):
-                filter_space.append(filt(digits=digits, dtype=str(da.dtype)))
-        elif filt == Asinh:
-            filter_space.append(
-                AnyNumcodecsArrayArrayCodec(
-                    filt(linear_width=compute_linear_width(da, quantile=0.01, compute=True))
-                )
-            )
-        elif filt == FixedOffsetScale:
-            mean_val, std_val, min_val, max_val = dask.compute(
-                da.mean(skipna=True), da.std(skipna=True),
-                da.min(skipna=True), da.max(skipna=True),
-            )
+                space.append(filt(dtype=str(da.dtype)))
+        elif filt is zarrcodecs_nc.BitRound:
+            for keepbits in valid_keepbits_for_bitround(da):
+                space.append(filt(keepbits=keepbits))
+        elif filt is zarrcodecs_nc.Quantize:
+            for digits in valid_digits_for_quantize(da):
+                space.append(filt(digits=digits, dtype=str(da.dtype)))
+        elif filt is zarrcodecs_nc.FixedScaleOffset:
+            for cfg in fixed_scale_offset_configs(da, data_range=data_range):
+                space.append(filt(**cfg))
+        elif filt is zarrcodecs_nc.AsType:
+            # Down-cast wider floats to float32 as a cheap ~2x lossy pre-step.
+            # encode_dtype is the narrowed type; decode_dtype is the original.
+            space.append(filt(encode_dtype="float32", decode_dtype=str(da.dtype)))
 
-            def _safe_scale(x, min_eps=1e-12):
-                if not np.isfinite(x):
-                    return None
-                if abs(x) < min_eps:
-                    return None
-                return float(x)
-
-            std_safe = _safe_scale(std_val)
-            if np.isfinite(mean_val) and std_safe is not None:
-                filter_space.append(AnyNumcodecsArrayArrayCodec(
-                    filt(offset=float(mean_val), scale=std_safe)
-                ))
-
-            rng = max_val - min_val
-            rng_safe = _safe_scale(rng)
-            if np.isfinite(min_val) and rng_safe is not None:
-                filter_space.append(AnyNumcodecsArrayArrayCodec(
-                    filt(offset=float(min_val), scale=rng_safe)
-                ))
-
-    return list(zip(range(len(filter_space)), filter_space))
+    return list(enumerate(space))
 
 
-def serializer_space(da, with_lossy=True, with_numcodecs_wasm=True, with_ebcc=True, serializer_class="all"):
+class ZFPYFlat(zarrcodecs_nc.ZFPY, codec_name="zfpy"):
+    """ZFPY serializer that flattens each chunk to 1-D before zfp.
+
+    zfp stores the array shape in its stream header with a per-axis budget that
+    shrinks with rank (2**48 in 1-D, 2**24 in 2-D, 2**16 in 3-D, 2**12 in 4-D);
+    the DYAMOND cell dimension (327680+) overflows it at >=3-D, so natural-shape
+    chunks fail with "Failed to write header to stream".  Flattening each chunk
+    to 1-D keeps every shape under the 2**48 ceiling.  The store still holds the
+    array's natural shape + dim names (only the per-chunk stream is 1-D; the
+    inherited decode reshapes back), and the codec name stays "zfpy", so a stock
+    zarr+numcodecs reader needs no custom code.  (zfp thus can't use multi-D
+    decorrelation, but the unstructured cell axis can't be a zfp dimension
+    anyway.)
+    """
+    async def _encode_single(self, chunk_data, chunk_spec):
+        # Flatten to a C-contiguous 1-D view; the inherited decode reshapes back
+        # to chunk_spec.shape, so the C-order round-trip is an identity.
+        arr = np.ascontiguousarray(chunk_data.as_ndarray_like()).reshape(-1)
+        out = await asyncio.to_thread(self._codec.encode, arr)
+        return chunk_spec.prototype.buffer.from_bytes(out)
+
+def serializer_space(da, with_lossy=True, serializer_class="all"):
+    """
+    Array->bytes serializer space.  PCodec is always present.  ZFPY is added
+    when with_lossy=True.
+
+    For integer dtypes only ZFPY's fixed-rate mode is meaningful; the other
+    two modes are skipped.
+
+    Returns [(index, codec), ...].
+    """
     is_int = (da.dtype.kind == "i")
-    serializer_space = []
-
-    _SERIALIZERS = [numcodecs.zarr3.PCodec]
+    _SERIALIZERS = [zarrcodecs_nc.PCodec]
     if with_lossy:
-        _SERIALIZERS.append(numcodecs.zarr3.ZFPY)
-    if with_ebcc and with_lossy:
-        _SERIALIZERS.append(EBCCZarrFilter)
-    if with_numcodecs_wasm and with_lossy:
-        _SERIALIZERS.append(Zfp)
+        _SERIALIZERS.append(zarrcodecs_nc.ZFPY)
 
     _SERIALIZER_MAP = {cls.__name__.lower(): cls for cls in _SERIALIZERS}
 
+    space = []
     if serializer_class.lower() == "all":
         pass
     elif serializer_class.lower() in _SERIALIZER_MAP:
         _SERIALIZERS = [_SERIALIZER_MAP[serializer_class.lower()]]
     elif serializer_class.lower() == "none":
         _SERIALIZERS = []
-        serializer_space.append(None)
+        space.append(None)
 
     for serializer in _SERIALIZERS:
-        if serializer == numcodecs.zarr3.PCodec:
-            for level in [0, 4, 8, 12]:
-                for delta_encoding_order in [0, 3, 7]:
-                    serializer_space.append(serializer(
+        if serializer is zarrcodecs_nc.PCodec:
+            for level in _PCODEC_LEVELS:
+                for delta_encoding_order in _PCODEC_DELTA_ORDERS:
+                    space.append(serializer(
                         level=level, mode_spec="auto",
                         delta_spec="auto", delta_encoding_order=delta_encoding_order,
                     ))
-        elif serializer in (numcodecs.zarr3.ZFPY, Zfp):
+        elif serializer is zarrcodecs_nc.ZFPY:
             _ZFP_MODES = [
                 ("fixed-accuracy",  zfpy.mode_fixed_accuracy,  "tolerance", compute_fixed_accuracy_param),
                 ("fixed-precision", zfpy.mode_fixed_precision, "precision", compute_fixed_precision_param),
@@ -642,48 +1050,174 @@ def serializer_space(da, with_lossy=True, with_numcodecs_wasm=True, with_ebcc=Tr
             if is_int:
                 _ZFP_MODES = [m for m in _ZFP_MODES if m[0] == "fixed-rate"]
             for mode_str, zfpy_mode, param_name, param_fn in _ZFP_MODES:
-                for k in range(3):
+                for k in _ZFPY_K_GRID:
                     val = param_fn(k)
-                    if serializer is numcodecs.zarr3.ZFPY:
-                        serializer_space.append(serializer(mode=zfpy_mode, **{param_name: val}))
-                    else:
-                        codec = serializer(mode=mode_str, **{param_name: val})
-                        serializer_space.append(AnyNumcodecsArrayBytesCodec(codec))
-        elif serializer == EBCCZarrFilter:
-            data = da.squeeze()  # TODO: add more checks on the shape of the data
-            height, width, n_chunks_height, n_chunks_width = compute_chunks(
-                data, min_height=32, max_height=2047, min_width=32, max_width=2047
-            )
-            for atol in [1e-2, 1e-3, 1e-6, 1e-9]:
-                ebcc_filter = EBCC_Filter(
-                    base_cr=2, height=height, width=width,
-                    data_dim=len(data.shape),
-                    residual_opt=("max_error_target", atol),
-                )
-                zarr_filter = serializer(ebcc_filter.hdf_filter_opts)
-                serializer_space.append(AnyNumcodecsArrayBytesCodec(zarr_filter))
+                    # ZFPYFlat (flattening ZFPY subclass) so oversized dims
+                    # work; still a zarrcodecs_nc.ZFPY, so isinstance checks, the
+                    # "zfpy" selector, and the stored codec name are unchanged.
+                    space.append(ZFPYFlat(mode=zfpy_mode, **{param_name: val}))
 
-    return list(zip(range(len(serializer_space)), serializer_space))
+    return list(enumerate(space))
 
 
-def valid_keepbits_for_bitround(xr_dataarray, step=1):
+def valid_keepbits_for_bitround(xr_dataarray):
+    """Return the BitRound keepbits grid for the dtype of `xr_dataarray`."""
     dtype = xr_dataarray.dtype
     if np.issubdtype(dtype, np.float64):
-        return inclusive_range(1, 52, step)
+        return _BITROUND_KEEPBITS_F64
     elif np.issubdtype(dtype, np.float32):
-        return inclusive_range(1, 23, step)
+        return _BITROUND_KEEPBITS_F32
     else:
-        raise TypeError(f"Unsupported dtype '{dtype}'. BitRound only supports float32 and float64.")
+        raise TypeError(
+            f"Unsupported dtype '{dtype}'. BitRound only supports float32 and float64."
+        )
 
 
-def valid_digits_for_quantize(xr_dataarray, step=1):
+def valid_digits_for_quantize(xr_dataarray):
+    """Return the Quantize digits grid for the dtype of `xr_dataarray`."""
     dtype = xr_dataarray.dtype
     if np.issubdtype(dtype, np.float64):
-        return inclusive_range(1, 15, step)
+        return _QUANTIZE_DIGITS_F64
     elif np.issubdtype(dtype, np.float32):
-        return inclusive_range(1, 7, step)
+        return _QUANTIZE_DIGITS_F32
     else:
-        raise TypeError(f"Unsupported dtype '{dtype}'. Quantize only supports float32 and float64.")
+        raise TypeError(
+            f"Unsupported dtype '{dtype}'. Quantize only supports float32 and float64."
+        )
+
+
+def full_field_data_range(da):
+    """
+    Compute the finite (global_min, global_max) over the ENTIRE field, for use
+    as FixedScaleOffset's affine anchor.  This is a single streaming reduction
+    (no compression), far cheaper than the codec sweep, and parallelises over
+    dask chunks.  Returns None if the field has no finite values or is
+    constant (in which case FixedScaleOffset is not applicable anyway).
+
+    Computed once (e.g. on rank 0) and broadcast to all ranks so the codec
+    space is identical everywhere and reproducible in compress_with_optimal.
+    """
+    import dask.array as _dask_array
+    data = da.data if hasattr(da, "data") else np.asarray(da)
+    try:
+        if isinstance(data, _dask_array.Array):
+            finite = _dask_array.isfinite(data)
+            # masked reductions; nan-aware min/max over finite entries only
+            mn = _dask_array.where(finite, data, np.inf).min()
+            mx = _dask_array.where(finite, data, -np.inf).max()
+            dmin = float(mn.compute())
+            dmax = float(mx.compute())
+        else:
+            arr = np.asarray(data)
+            fin = arr[np.isfinite(arr)]
+            if fin.size == 0:
+                return None
+            dmin = float(fin.min())
+            dmax = float(fin.max())
+    except Exception:
+        return None
+    if not (np.isfinite(dmin) and np.isfinite(dmax)) or dmax <= dmin:
+        return None
+    return (dmin, dmax)
+
+
+def fixed_scale_offset_configs(xr_dataarray, data_range=None):
+    """
+    Build FixedScaleOffset (offset, scale, astype) tuples that map the field's
+    [min, max] onto the full range of each target unsigned-integer width.
+
+    Encode is round((x - offset) * scale); to fill [0, 2**bits - 1] we use
+    offset = data_min and scale = (2**bits - 1) / (data_max - data_min).
+
+    CRITICAL - range source.  FixedScaleOffset packs floats into unsigned
+    integers anchored to [data_min, data_max].  numcodecs does NO overflow
+    clipping (see its docstring warning), so a production value OUTSIDE the
+    range used to build the codec encodes to a negative or too-large integer
+    and silently CORRUPTS on the unsigned cast.  The range therefore MUST cover
+    the WHOLE field, not just the strided evaluation sample (which may miss the
+    global extremes on un-sampled timesteps/levels).
+
+      - `data_range=(global_min, global_max)`: use these true full-field
+        extremes (the correct production path; caller computes them once over
+        the full dask array and threads them through filter_space).
+      - `data_range=None`: fall back to the min/max of `xr_dataarray` itself.
+        Only safe when that array IS the full field (e.g. small fields that
+        fit under the eval-data-size-limit, or unit tests).  A WARNING-worthy
+        path for strided samples; callers that have the full field should
+        always pass `data_range`.
+
+    Returns [] for constant / non-finite fields (no usable range) and skips
+    integer widths that cannot improve on the source itemsize.  dtype is the
+    decoded (original) dtype.
+    """
+    dtype = xr_dataarray.dtype
+    if not np.issubdtype(dtype, np.floating):
+        return []
+
+    if data_range is not None:
+        dmin, dmax = float(data_range[0]), float(data_range[1])
+    else:
+        # Fallback: derive from the given array (valid only if it is the full
+        # field).  Finite values only.
+        arr = np.asarray(xr_dataarray.values)
+        finite = arr[np.isfinite(arr)]
+        if finite.size == 0:
+            return []
+        dmin = float(finite.min())
+        dmax = float(finite.max())
+
+    span = dmax - dmin
+    if not (np.isfinite(dmin) and np.isfinite(dmax)) or span <= 0.0:
+        # constant / non-finite field: nothing for an affine packer to do
+        return []
+
+    src_itemsize = dtype.itemsize
+    configs = []
+    for uw in _FSO_TARGET_UINTS:
+        bits = np.dtype(uw).itemsize * 8
+        # Only worth it if the packed integer is smaller than the source value.
+        if np.dtype(uw).itemsize >= src_itemsize:
+            continue
+        scale = (float(2 ** bits) - 1.0) / span
+        configs.append(dict(offset=dmin, scale=scale,
+                            dtype=str(dtype), astype=uw))
+    return configs
+
+
+def combo_is_valid(filt, serializer):
+    """
+    Reject (filter, serializer) pairings that are known to be broken or
+    meaningless, so the product builder can skip them instead of paying for a
+    guaranteed per-combo failure.
+
+    1. FixedScaleOffset emits an UNSIGNED-INTEGER array.  Feeding that to a
+       ZFPY serializer in anything other than fixed-rate mode crashes inside
+       numcodecs' zfpy backend (AttributeError: 'ZFPY' object has no attribute
+       'compression_kwargs'); ZFPY's integer support is fixed-rate only, but
+       serializer_space derives its ZFPY mode from the ORIGINAL float dtype
+       (all three modes present), so FSO->ZFPY must be rejected here.  PCodec
+       handles integer output natively, so FSO->PCodec is the intended pairing.
+
+    2. An 8-bit (uint8) FixedScaleOffset output -> PCodec also crashes: PCodec
+       refuses 8-bit input ("compressing 8-bit types with Pco is often a
+       mistake").  uint8 is excluded from _FSO_TARGET_UINTS for this reason, so
+       this branch is belt-and-suspenders should the grid ever be widened.
+
+    AsType(encode='float32') keeps the data floating, so it is unaffected.
+    """
+    if isinstance(filt, zarrcodecs_nc.FixedScaleOffset):
+        # FSO -> ZFPY: integer-mode crash.
+        if isinstance(serializer, zarrcodecs_nc.ZFPY):
+            return False
+        # 8-bit FSO -> PCodec: PCodec rejects 8-bit input.
+        if isinstance(serializer, zarrcodecs_nc.PCodec):
+            astype = None
+            cfg = getattr(filt, "codec_config", None)
+            if isinstance(cfg, dict):
+                astype = cfg.get("astype")
+            if astype is not None and np.dtype(astype).itemsize == 1:
+                return False
+    return True
 
 
 def compute_fixed_precision_param(param: int) -> int:  return 1 << (param + 3)
@@ -707,26 +1241,6 @@ def inclusive_range(start, end, step=1):
         if values[-1] != end:
             values.append(end)
     return values
-
-
-def compute_linear_width(
-    da: xr.DataArray, *,
-    quantile: float = 0.01, skipna: bool = True,
-    floor: float | None = None, cap: float | None = None,
-    compute: bool = False,
-) -> float | xr.DataArray:
-    finite = xr.apply_ufunc(np.isfinite, da, dask="parallelized")
-    abs_da = xr.apply_ufunc(np.abs, da.where(finite), dask="parallelized")
-    lw = abs_da.quantile(quantile, skipna=skipna)
-    if "quantile" in lw.dims:
-        lw = lw.squeeze("quantile", drop=True)
-    if floor is not None or cap is not None:
-        lw = lw.clip(
-            min=floor if floor is not None else None,
-            max=cap   if cap   is not None else None,
-        )
-    return float(lw.compute()) if compute else lw
-
 
 # =============================================================================
 # CODEC PIPELINE ASSEMBLY
@@ -757,7 +1271,6 @@ def _codec_kwargs(filters, compressors, serializer):
     if serializer is not None:
         kwargs["serializer"] = serializer
     return kwargs
-
 
 # =============================================================================
 # CODEC PIPELINE - EVALUATION (no persistence, thread-safe)
@@ -790,6 +1303,180 @@ def _iter_chunk_slices(shape, chunk_shape):
         )
 
 
+
+# =============================================================================
+# ZARR SYNC-API BYPASS  (opt-in via cli --bypass-zarr-sync)
+# =============================================================================
+# zarr 3's sync wrapper runs every coroutine on a process-global event loop,
+# serialising codec calls from concurrent worker threads down to ~1 core (5x
+# slowdown at 1x32 vs 32x1).  We bypass it by calling
+# zarr.api.asynchronous.create_array directly on a persistent per-thread loop.
+# A single shared bounded ThreadPoolExecutor is wired as each loop's default
+# executor; without it, asyncio.to_thread() inside zarr's codecs spawns a
+# 32-worker default executor per loop -> 32 x 32 = ~1024 OS threads.  The shared
+# executor caps total OS threads at user_threads + shared_workers.
+
+try:
+    from zarr.api.asynchronous import create_array as _zarr_async_create_array
+    _ASYNC_BYPASS_AVAILABLE = True
+except ImportError:
+    _zarr_async_create_array = None
+    _ASYNC_BYPASS_AVAILABLE = False
+
+
+_thread_local_loops = threading.local()
+_shared_executor = None
+_shared_executor_lock = threading.Lock()
+
+
+def _get_or_create_shared_executor(max_workers: int):
+    """Lazy, thread-safe singleton ThreadPoolExecutor."""
+    global _shared_executor
+    if _shared_executor is None:
+        with _shared_executor_lock:
+            if _shared_executor is None:
+                from concurrent.futures import ThreadPoolExecutor
+                _shared_executor = ThreadPoolExecutor(
+                    max_workers=max(1, int(max_workers)),
+                    thread_name_prefix="bypass_codec",
+                )
+    return _shared_executor
+
+
+def _shutdown_shared_executor() -> None:
+    global _shared_executor
+    with _shared_executor_lock:
+        if _shared_executor is not None:
+            _shared_executor.shutdown(wait=False, cancel_futures=False)
+            _shared_executor = None
+
+
+def _get_thread_event_loop() -> asyncio.AbstractEventLoop:
+    """
+    Return this thread's persistent asyncio loop, creating it on first call.
+    The shared bounded executor is bound as default executor on creation;
+    without this, asyncio.to_thread() inside zarr's native codecs spawns a
+    32-worker default executor PER per-thread loop.
+    """
+    loop = getattr(_thread_local_loops, "loop", None)
+    if loop is None or loop.is_closed():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        if _shared_executor is not None:
+            loop.set_default_executor(_shared_executor)
+        _thread_local_loops.loop = loop
+    return loop
+
+
+class _AsyncBypass:
+    """Toggle for the async-direct codec dispatch (cli --bypass-zarr-sync)."""
+    enabled: bool = False
+    threads_per_rank: int = 1
+
+    @classmethod
+    def enable(cls, threads_per_rank: int = 1) -> None:
+        if not _ASYNC_BYPASS_AVAILABLE:
+            raise RuntimeError(
+                "Cannot enable --bypass-zarr-sync: "
+                "zarr.api.asynchronous.create_array is not importable. "
+                "Upgrade zarr or run without the flag."
+            )
+        cls.enabled = True
+        cls.threads_per_rank = max(1, int(threads_per_rank))
+        _get_or_create_shared_executor(cls.threads_per_rank)
+
+    @classmethod
+    def disable(cls) -> None:
+        cls.enabled = False
+        _shutdown_shared_executor()
+
+
+AsyncBypass = _AsyncBypass
+
+
+async def _zarr_pipeline_async(sample_np, dims, codec_kwargs, chunks):
+    """async create + encode + info + decode."""
+    store = zarr.storage.MemoryStore()
+
+    with Timer("eval.create_array"):
+        z = await _zarr_async_create_array(
+            store=store,
+            name="_tmp_eval",
+            shape=sample_np.shape,
+            dtype=sample_np.dtype,
+            chunks=chunks,
+            zarr_format=3,
+            dimension_names=tuple(dims),
+            **codec_kwargs,
+        )
+
+    with Timer("eval.encode"):
+        # See _zarr_pipeline_sync: suppress only the benign NaN-fill cast warning.
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message="invalid value encountered in cast",
+                category=RuntimeWarning,
+            )
+            await z.setitem(Ellipsis, sample_np)
+
+    with Timer("eval.info_complete"):
+        info = await z.info_complete()
+        count_bytes, count_bytes_stored = _info_bytes(info)
+        ratio = count_bytes / count_bytes_stored
+
+    with Timer("eval.decode"):
+        decomp_full = await z.getitem(Ellipsis)
+
+    return decomp_full, ratio
+
+
+def _zarr_pipeline_sync(sample_np, dims, codec_kwargs, chunks):
+    """sync create + encode + info + decode."""
+    store = zarr.storage.MemoryStore()
+
+    with Timer("eval.create_array"):
+        z = zarr.create_array(
+            store=store,
+            name="_tmp_eval",
+            shape=sample_np.shape,
+            dtype=sample_np.dtype,
+            chunks=chunks,
+            zarr_format=3,
+            dimension_names=tuple(dims),
+            **codec_kwargs,
+        )
+
+    with Timer("eval.encode"):
+        # FixedScaleOffset casts NaN-fill cells to int ("invalid value in cast").
+        # Benign: fill cells are masked out of every error norm, so the garbage
+        # ints never affect scoring.  Suppress ONLY this message — a genuine FSO
+        # overflow does NOT warn (numpy wraps silently; guarded by
+        # full_field_data_range + the verify gate), so nothing real is hidden.
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message="invalid value encountered in cast",
+                category=RuntimeWarning,
+            )
+            z[...] = sample_np
+
+    with Timer("eval.info_complete"):
+        info = z.info_complete()
+        count_bytes, count_bytes_stored = _info_bytes(info)
+        ratio = count_bytes / count_bytes_stored
+
+    with Timer("eval.decode"):
+        decomp_full = z[...]
+
+    return decomp_full, ratio
+
+
+# =============================================================================
+# CODEC PIPELINE - EVALUATION (no persistence, thread-safe)
+# =============================================================================
+
+
 def evaluate_codec_pipeline(
     sample_np: np.ndarray,
     dims,
@@ -797,60 +1484,110 @@ def evaluate_codec_pipeline(
     compressors,
     serializer,
     chunks,
+    q99_abs: float | None = None,
+    compute_gradient: bool = False,
+    gradient_axes=None,
+    precheck_thresholds: dict | None = None,
 ):
     """
     Measure (compression_ratio, errors, euclidean_distance) for a codec
-    pipeline against `sample_np` (a numpy array).
+    pipeline against `sample_np`.  In-memory zarr store, no I/O.  Safe to
+    call concurrently from multiple threads.
 
-    Uses an in-memory zarr store - no disk I/O, no zip wrapping.
-    Safe to call from multiple threads concurrently: each call creates its
-    own MemoryStore and does not touch shared state.
+    The full sample is decoded once via z[...]; the metrics loop slices
+    that buffer chunk-wise to bound the float64 promotion peak.  Peak
+    per-rank memory is ~2 * sample_nbytes (original + decoded) — caller
+    must size NTASKS_PER_NODE accordingly.
 
-    Error norms are accumulated chunk-wise to avoid ever holding a full
-    decompressed copy of the sample in memory.
+    Dispatch: if AsyncBypass is enabled, the zarr operations route through
+    a per-thread persistent event loop (sidesteps zarr 3's process-global
+    sync() loop that otherwise serialises codec dispatch from concurrent
+    threads).  The metrics phase is identical in both paths.
     """
-    store = zarr.storage.MemoryStore()
-
     codec_kwargs = _codec_kwargs(filters, compressors, serializer)
 
-    z = zarr.create_array(
-        store=store,
-        name="_tmp_eval",
-        shape=sample_np.shape,
-        dtype=sample_np.dtype,
-        chunks=chunks,
-        zarr_format=3,
-        dimension_names=tuple(dims),
-        **codec_kwargs,
-    )
-    z[...] = sample_np  # triggers full codec pipeline
+    if _AsyncBypass.enabled:
+        loop = _get_thread_event_loop()
+        decomp_full, ratio = loop.run_until_complete(
+            _zarr_pipeline_async(sample_np, dims, codec_kwargs, chunks)
+        )
+    else:
+        decomp_full, ratio = _zarr_pipeline_sync(
+            sample_np, dims, codec_kwargs, chunks
+        )
 
-    # --- compression ratio ---
-    info = z.info_complete()
-    count_bytes, count_bytes_stored = _info_bytes(info)
-    ratio = count_bytes / count_bytes_stored
+    # Chunk-wise error accumulation: bounds the float64 promotion peak at one
+    # chunk's worth.  Non-finite handling:
+    #   - non-finite in the ORIGINAL = legitimate fill (ocean/land, below-surface,
+    #     masks) -> EXCLUDED from every norm so fill never poisons the stats.
+    #   - finite original but non-finite DECODED = corruption -> excluded from the
+    #     norms but COUNTED in `n_corrupt`; the caller treats n_corrupt > 0 as a
+    #     hard reject (replaces the old raise-on-any-non-finite).
+    # Same pass also accumulates: signed error sum -> relative bias; decoded
+    # min/max over valid cells -> physical-bounds gate; and (optional) error over
+    # the extreme tail |o| >= q99_abs -> q99 gate.
+    with Timer("eval.metrics"):
+        l1_err = 0.0; l2_err_sq = 0.0; linf_err = 0.0
+        l1_ori = 0.0; l2_ori_sq = 0.0; linf_ori = 0.0
+        signed_err = 0.0
+        n_valid = 0
+        n_corrupt = 0
+        decoded_min = math.inf
+        decoded_max = -math.inf
+        q99_err = 0.0; q99_ori = 0.0
+        want_q99 = q99_abs is not None and math.isfinite(q99_abs)
 
-    # --- chunk-wise error accumulation (never holds a full decompressed copy) ---
-    l1_err = 0.0; l2_err_sq = 0.0; linf_err = 0.0
-    l1_ori = 0.0; l2_ori_sq = 0.0; linf_ori = 0.0
+        with np.errstate(invalid="ignore"):
+            for sl in _iter_chunk_slices(sample_np.shape, chunks):
+                orig = sample_np[sl]
+                decomp = decomp_full[sl]
 
-    for sl in _iter_chunk_slices(sample_np.shape, chunks):
-        orig = sample_np[sl]
-        decomp = z[sl]
-        # promote to float64 for the accumulation only
-        err = decomp.astype(np.float64, copy=False) - orig.astype(np.float64, copy=False)
-        ori_abs = np.abs(orig, dtype=np.float64) if orig.dtype.kind in "fc" \
-                  else np.abs(orig.astype(np.float64))
-        err_abs = np.abs(err)
+                finite_orig = np.isfinite(orig)
+                finite_dec = np.isfinite(decomp)
+                # Corruption: valid input, broken output.
+                n_corrupt += int(np.count_nonzero(finite_orig & ~finite_dec))
+                # Cells we actually score: finite on both sides.
+                valid = finite_orig & finite_dec
+                nv = int(np.count_nonzero(valid))
+                if nv == 0:
+                    continue
+                n_valid += nv
 
-        l1_err     += float(err_abs.sum())
-        l2_err_sq  += float((err * err).sum())
-        linf_err    = max(linf_err, float(err_abs.max(initial=0.0)))
+                o = orig[valid].astype(np.float64, copy=False)
+                d = decomp[valid].astype(np.float64, copy=False)
+                e = d - o
+                e_abs = np.abs(e)
+                o_abs = np.abs(o)
 
-        l1_ori     += float(ori_abs.sum())
-        l2_ori_sq  += float((ori_abs * ori_abs).sum())
-        linf_ori    = max(linf_ori, float(ori_abs.max(initial=0.0)))
+                l1_err     += float(e_abs.sum())
+                l2_err_sq  += float((e * e).sum())
+                linf_err    = max(linf_err, float(e_abs.max(initial=0.0)))
+                signed_err += float(e.sum())
 
+                l1_ori     += float(o_abs.sum())
+                l2_ori_sq  += float((o_abs * o_abs).sum())
+                linf_ori    = max(linf_ori, float(o_abs.max(initial=0.0)))
+
+                decoded_min = min(decoded_min, float(d.min()))
+                decoded_max = max(decoded_max, float(d.max()))
+
+                if want_q99:
+                    ext = o_abs >= q99_abs
+                    if ext.any():
+                        q99_err += float(e_abs[ext].sum())
+                        q99_ori += float(o_abs[ext].sum())
+
+        del decomp_full
+
+        # A finite accumulator is now guaranteed for ordinary fields because
+        # corrupted cells were excluded above.  This scalar guard only trips
+        # on pathological inputs (e.g. an original that overflowed float64).
+        if not (math.isfinite(l1_err) and math.isfinite(l2_err_sq)
+                and math.isfinite(linf_err)):
+            raise CombinationProducedNonFiniteError(
+                f"error accumulators are non-finite even after masking "
+                f"(l1_err={l1_err}, l2_err_sq={l2_err_sq}, linf_err={linf_err})"
+            )
     l2_err = math.sqrt(l2_err_sq)
     l2_ori = math.sqrt(l2_ori_sq)
 
@@ -861,9 +1598,97 @@ def evaluate_codec_pipeline(
         "Relative_Error_L1":   _safe_div(l1_err,  l1_ori),
         "Relative_Error_L2":   _safe_div(l2_err,  l2_ori),
         "Relative_Error_Linf": _safe_div(linf_err, linf_ori),
+        # Signed mean error / mean |original|.  Same denominator as L1, so
+        # |Bias_Rel| <= Relative_Error_L1 always holds by construction.
+        "Bias_Rel":            _safe_div(abs(signed_err), l1_ori),
+        # Decoded value range over valid cells -> physical-bounds gate.
+        "Decoded_Min":         (decoded_min if n_valid else float("nan")),
+        "Decoded_Max":         (decoded_max if n_valid else float("nan")),
+        # Count of valid-input/broken-output cells -> finite (Layer 6) gate.
+        "N_Corrupt":           int(n_corrupt),
+        "N_Valid":             int(n_valid),
+        # Extreme-tail relative error; None when not requested.
+        "Q99_Rel":             (_safe_div(q99_err, q99_ori) if want_q99 else None),
     }
 
+    # ---- optional gradient (spatial-structure) metric ------------------
+    # Relative L1 error of the per-axis finite-difference field, combined across
+    # the requested axes.  Computed on the in-memory arrays (finite differencing
+    # is a neighbourhood op), one axis at a time with intermediates freed to
+    # bound the transient; NaN-masked to positions finite in both fields.
+    #
+    # SHORT-CIRCUIT: the gradient re-decodes the sample (a second full pipeline)
+    # and is the most expensive part of an evaluation.  A combo that already
+    # fails a cheap gate (L1/L2/Linf/bias) can't be kept, so when
+    # `precheck_thresholds` is given we skip it: Grad_Rel stays None (a no-op in
+    # _evaluate_gates) and the cheap gate rejects the combo anyway.  Identical
+    # kept set and winner, but --gradient-gate becomes nearly free.  None forces
+    # the gradient on every combo (validation/debug path).
+    do_grad = compute_gradient
+    if compute_gradient and precheck_thresholds is not None:
+        def _passes(val, lim):
+            # Mirrors _evaluate_gates._le: a None/+inf limit is a no-op pass.
+            if val is None or lim is None or not math.isfinite(lim):
+                return True
+            return float(val) <= float(lim)
+        do_grad = (
+            _passes(errors["Relative_Error_L1"],   precheck_thresholds.get("l1"))
+            and _passes(errors["Relative_Error_L2"],   precheck_thresholds.get("l2"))
+            and _passes(errors["Relative_Error_Linf"], precheck_thresholds.get("linf"))
+            and _passes(errors["Bias_Rel"],            precheck_thresholds.get("bias"))
+        )
+
+    if do_grad:
+        if _AsyncBypass.enabled:
+            # decomp_full was deleted above to free memory; recompute it.
+            loop = _get_thread_event_loop()
+            decomp_full2, _ = loop.run_until_complete(
+                _zarr_pipeline_async(sample_np, dims, codec_kwargs, chunks)
+            )
+        else:
+            decomp_full2, _ = _zarr_pipeline_sync(
+                sample_np, dims, codec_kwargs, chunks
+            )
+        errors["Grad_Rel"] = _gradient_rel_l1(
+            sample_np, decomp_full2, axes=gradient_axes
+        )
+        del decomp_full2
+    else:
+        errors["Grad_Rel"] = None
+
     return ratio, errors, l2_err
+
+
+def _gradient_rel_l1(orig: np.ndarray, decoded: np.ndarray, axes=None) -> float:
+    """
+    Relative L1 error of the finite-difference (gradient) field, combined
+    over `axes` (default: every axis except the leading one, treated as
+    time).  Returns Sum|d(decoded) - d(orig)| / Sum|d(orig)| accumulated
+    across axes.  Non-finite difference positions are masked out.
+
+    Done axis-by-axis with np.diff so at most one axis' worth of float64
+    differences is live at a time.
+    """
+    ndim = orig.ndim
+    if axes is None:
+        axes = tuple(range(1, ndim)) if ndim > 1 else (0,)
+    err_sum = 0.0
+    ori_sum = 0.0
+    with np.errstate(invalid="ignore"):
+        for ax in axes:
+            do = np.diff(orig.astype(np.float64, copy=False), axis=ax)
+            dd = np.diff(decoded.astype(np.float64, copy=False), axis=ax)
+            m = np.isfinite(do) & np.isfinite(dd)
+            if not m.any():
+                del do, dd, m
+                continue
+            de = np.abs(dd[m] - do[m])
+            err_sum += float(de.sum())
+            ori_sum += float(np.abs(do[m]).sum())
+            del do, dd, m, de
+    if ori_sum == 0:
+        return 0.0 if err_sum == 0 else float("inf")
+    return err_sum / ori_sum
 
 
 # =============================================================================
@@ -882,6 +1707,7 @@ def persist_with_codec_pipeline(
     verify: bool = True,
     verbose: bool = True,
     rank: int = 0,
+    q99_abs=None,
 ):
     """
     Write `da` into `store` at `component` using the codec pipeline.
@@ -889,43 +1715,65 @@ def persist_with_codec_pipeline(
 
     - If `shards` is given: Dask chunks are rechunked to the shard shape so
       each Dask task writes exactly one shard (no write-amplification).
+    - If `shards` is None: sharding is skipped entirely (the `shards=` kwarg
+      is NOT passed to zarr.create_array).  This happens automatically when
+      one inner chunk already meets or exceeds the shard target -- a shard
+      would bundle <= 1 chunk and add only index overhead.  Dask is then
+      rechunked to the inner chunk shape (each task writes one chunk).
     - Uses `overwrite=True` as the dask-level kwarg (replaces the deprecated
       v2-era `mode='w'` shape).  `chunks`, `shards`, codec kwargs,
       `dimension_names`, `zarr_format=3` are passed through **zarr_array_kwargs
       and forwarded by dask to zarr.create_array.  `mode=` is NOT accepted by
-      zarr v3's create_array — it's a storage-level concept, not an array one.
+      zarr v3's create_array -- it's a storage-level concept, not an array one.
     """
     assert isinstance(da.data, dask.array.Array), \
         "persist_with_codec_pipeline expects a dask-backed xr.DataArray"
 
     # Auto-size chunks/shards if not provided.
     if inner_chunks is None or shards is None:
-        auto_inner, auto_shard = compute_chunk_and_shard_shape(da.shape, da.dtype)
-        inner_chunks = inner_chunks or auto_inner
-        shards       = shards       or auto_shard
+        auto_inner, auto_shard = compute_chunk_and_shard_shape(
+            da.shape, da.dtype, dims=tuple(da.dims),
+        )
+        if inner_chunks is None:
+            inner_chunks = auto_inner
+        if shards is None:
+            shards = auto_shard  # may itself be None -> skip sharding
 
     codec_kwargs = _codec_kwargs(filters, compressors, serializer)
 
-    # Align Dask chunks with shard shape so each write = one shard.
-    dask_arr = da.data.rechunk(shards)
+    # Pick the dask write unit:
+    #   - With sharding: one task per shard (avoids partial-shard rewrites).
+    #   - Without sharding: one task per inner chunk.
+    write_unit = shards if shards is not None else inner_chunks
+    dask_arr = da.data.rechunk(write_unit)
 
     zarr_kwargs = dict(
         zarr_format=3,
         dimension_names=tuple(da.dims),
         chunks=inner_chunks,
-        shards=shards,
         **codec_kwargs,
     )
+    if shards is not None:
+        zarr_kwargs["shards"] = shards
 
     with Timer("dask.array.to_zarr"):
-        dask.array.to_zarr(
-            dask_arr,
-            store,
-            component=component,
-            overwrite=True,     # dask-level kwarg; NOT forwarded to zarr.create_array
-            compute=True,
-            **zarr_kwargs,
-        )
+        # See _zarr_pipeline_sync: FixedScaleOffset casts NaN-fill to int and
+        # numpy warns benignly; fill is masked out of the verify norms. Suppress
+        # only that specific message (overflow is silent + guarded elsewhere).
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message="invalid value encountered in cast",
+                category=RuntimeWarning,
+            )
+            dask.array.to_zarr(
+                dask_arr,
+                store,
+                component=component,
+                overwrite=True,     # dask-level kwarg; NOT forwarded to zarr.create_array
+                compute=True,
+                **zarr_kwargs,
+            )
 
     # Reopen the written array and compute stats.  Read-only by design:
     # only info_complete() and the verification read follow, neither writes.
@@ -942,10 +1790,11 @@ def persist_with_codec_pipeline(
     euclidean_distance = None
     if verify:
         with Timer("compute_errors_distances"):
-            # Load back with shard-aligned chunks for efficient reads.
-            z_dask = dask.array.from_zarr(z, chunks=shards)
+            # Load back with shard-aligned (or inner-aligned) chunks for
+            # efficient reads.
+            z_dask = dask.array.from_zarr(z, chunks=write_unit)
             _pprint, errors, euclidean_distance, _nrm = \
-                compute_errors_distances(z_dask, da.data)
+                compute_errors_distances(z_dask, da.data, q99_abs=q99_abs)
         if verbose and rank == 0:
             click.echo("-" * 80)
             click.echo(_pprint)
@@ -960,23 +1809,53 @@ def persist_with_codec_pipeline(
 # ERROR METRICS  (used by the persist path; dask-lazy)
 # =============================================================================
 
-def compute_errors_distances(da_compressed, da):
-    da_error = da_compressed - da
+def compute_errors_distances(da_compressed, da, q99_abs=None):
+    # Mask non-finite cells in the ORIGINAL (legitimate fill); score only
+    # finite-in-original positions, mirroring evaluate_codec_pipeline.  A cell
+    # finite in the original but non-finite in the decoded output is corruption:
+    # excluded from the norms, counted in n_corrupt, surfaced for the gate.
+    finite_orig = np.isfinite(da)
+    finite_dec  = np.isfinite(da_compressed)
+    valid       = finite_orig & finite_dec
+    n_corrupt   = (finite_orig & ~finite_dec).sum()
 
+    # Zero out masked positions so the reductions stay finite; counts of
+    # contributing cells are tracked via `valid`.  NOTE: the caller passes
+    # raw dask arrays (da.data / from_zarr), which have no xarray-style
+    # `.where()` method — use dask.array.where(cond, x, y) instead.
+    o  = dask.array.where(valid, da, 0)
+    dc = dask.array.where(valid, da_compressed, 0)
+    da_error = dc - o
     norm_L1_error    = np.abs(da_error).sum()
     norm_L2_error    = np.sqrt((da_error ** 2).sum())
     norm_Linf_error  = np.abs(da_error).max()
+    signed_error_sum = da_error.sum()
 
-    norm_L1_original   = np.abs(da).sum()
-    norm_L2_original   = np.sqrt((da ** 2).sum())
-    norm_Linf_original = np.abs(da).max()
+    norm_L1_original   = np.abs(o).sum()
+    norm_L2_original   = np.sqrt((o ** 2).sum())
+    norm_Linf_original = np.abs(o).max()
 
-    computed = dask.compute(
+    # Optional extreme-tail (q99) reduction.  `q99_abs` is the sweep's |value|
+    # cut (its sample's 99th pct of |value|); cells with |original| >= q99_abs
+    # are the tail.  Accumulate the masked error/original L1 sums over the tail
+    # and fuse them into the SAME dask.compute as the global norms (one read),
+    # mirroring evaluate_codec_pipeline so production Q99_Rel matches the sweep's.
+    want_q99 = q99_abs is not None
+    reductions = [
         norm_L1_error, norm_L1_original,
         norm_L2_error, norm_L2_original,
         norm_Linf_error, norm_Linf_original,
-    )
-    (l1e, l1o, l2e, l2o, linfe, linfo) = computed
+        signed_error_sum, n_corrupt,
+    ]
+    if want_q99:
+        _o_abs = np.abs(o)
+        _e_abs = np.abs(da_error)
+        _ext = _o_abs >= float(q99_abs)
+        reductions.append(dask.array.where(_ext, _e_abs, 0.0).sum())
+        reductions.append(dask.array.where(_ext, _o_abs, 0.0).sum())
+
+    computed = dask.compute(*reductions)
+    (l1e, l1o, l2e, l2o, linfe, linfo, signed, ncorrupt) = computed[:8]
 
     def _safe_rel(err, ori):
         """Relative error with sane behavior for zero-norm originals.
@@ -989,6 +1868,12 @@ def compute_errors_distances(da_compressed, da):
     relative_error_L1   = _safe_rel(l1e,    l1o)
     relative_error_L2   = _safe_rel(l2e,    l2o)
     relative_error_Linf = _safe_rel(linfe,  linfo)
+    bias_rel            = _safe_rel(abs(float(signed)), l1o)
+
+    q99_rel = None
+    if want_q99:
+        q99e, q99o = computed[8], computed[9]
+        q99_rel = _safe_rel(q99e, q99o)
 
     euclidean_distance = l2e
     normalized_euclidean_distance = relative_error_L2
@@ -997,8 +1882,13 @@ def compute_errors_distances(da_compressed, da):
         "Relative_Error_L1":   relative_error_L1,
         "Relative_Error_L2":   relative_error_L2,
         "Relative_Error_Linf": relative_error_Linf,
+        "Bias_Rel":            bias_rel,
+        "N_Corrupt":           int(ncorrupt),
+        # Extreme-tail relative L1 error; None when no q99_abs cut was given.
+        "Q99_Rel":             q99_rel,
     }
-    errors_ = {k: f"{v:.3e}" for k, v in errors.items()}
+    errors_ = {k: (f"{v:.3e}" if isinstance(v, float) else str(v))
+               for k, v in errors.items()}
     return (
         "\n".join(f"{k:20s}: {v}" for k, v in errors_.items()),
         errors,
@@ -1130,6 +2020,7 @@ def check_thread_oversubscription(abort_if_unsafe: bool = True, rank: int = 0, c
     env_vars = [
         "OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS",
         "BLOSC_NTHREADS", "NUMBA_NUM_THREADS",
+        "VECLIB_MAXIMUM_THREADS", "OMP_THREAD_LIMIT",
     ]
     problems = []
     for v in env_vars:
@@ -1157,7 +2048,8 @@ def check_thread_oversubscription(abort_if_unsafe: bool = True, rank: int = 0, c
             )
             click.echo(
                 "  Suggested: export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 "
-                "OPENBLAS_NUM_THREADS=1 BLOSC_NTHREADS=1 NUMBA_NUM_THREADS=1"
+                "OPENBLAS_NUM_THREADS=1 BLOSC_NTHREADS=1 NUMBA_NUM_THREADS=1 "
+                "VECLIB_MAXIMUM_THREADS=1 OMP_THREAD_LIMIT=1"
             )
             if abort_if_unsafe:
                 click.echo("  Aborting (use --no-oversubscription-check to override).")
@@ -1166,11 +2058,18 @@ def check_thread_oversubscription(abort_if_unsafe: bool = True, rank: int = 0, c
             # rank 0 alone would leave siblings hanging at the next collective.
             comm.Abort(1)
 
-    # Pin zarr v3's internal thread pool (best-effort; may not exist on older versions).
-    try:
-        zarr.config.set({"threading.max_workers": 1})
-    except Exception:
-        pass
+    # Pin zarr v3's internal thread pool only when oversubscription is a real
+    # risk — multi-rank-per-node, where each rank otherwise spawns its own
+    # ~32-worker executor (N_ranks * 32 threads on an N-core node).  With 1
+    # rank-per-node the single ~32-worker pool matches the cores, and the bypass
+    # case has its own bounded executor, so neither needs a pin.
+    if not _AsyncBypass.enabled:
+        try:
+            _, ranks_on_node, _ = detect_node_topology(MPI.COMM_WORLD)
+            if ranks_on_node > 1:
+                zarr.config.set({"threading.max_workers": 1})
+        except Exception:
+            pass
 
 
 # =============================================================================
@@ -1178,23 +2077,46 @@ def check_thread_oversubscription(abort_if_unsafe: bool = True, rank: int = 0, c
 # =============================================================================
 
 def get_indexes(arr, indices):
-    codec_to_id = []
+    """
+    Reverse-map codec repr strings (`arr`) back to their integer indices using
+    the `config_space_{var}.csv` column (`indices`), whose cells are the
+    stringified `(index, codec_repr)` tuples written by evaluate_combos.
+
+    Returns an int array (one entry per item in `arr`):
+      - the codec's integer index when its repr is found,
+      - -1 for the explicit "None" stage (no compressor / filter / serializer).
+
+    The npy and the config CSV are co-produced by the same evaluate_combos run,
+    so every repr in `arr` is expected to appear in `indices`.  A repr that is
+    NOT found is therefore an anomaly (e.g. a config CSV paired with a npy from
+    a different run, or a numcodecs __repr__ change across environments); we map
+    it to -1 but warn so the mismatch is visible rather than silently labelled
+    as "None".  Used only for plot hover labels — not on any compression path.
+    """
+    codec_id_dict = {}
     for ind in indices:
-        codec_to_id.append(ind[1:-1].split(", ", 1))
+        # "(3, Blosc(...))" -> ["3", "Blosc(...)"]
+        idx_str, codec_repr = str(ind)[1:-1].split(", ", 1)
+        codec_id_dict[codec_repr] = int(idx_str)
     id_ls = []
-    codec_id_dict = {key: val for val, key in codec_to_id}
+    _unknown = 0
     for item in arr:
         if item == "None":
             id_ls.append(-1)
-        elif item in list(codec_id_dict.keys()):
+        elif item in codec_id_dict:
             id_ls.append(codec_id_dict[item])
         else:
-            if "EBCC" in item:
-                fetch_new_idx = [value for key, value in codec_id_dict.items() if "EBCC" in key][0]
-                id_ls.append(fetch_new_idx)
-            else:
-                return IndexError(f"{item} not in list {list(codec_id_dict.keys())}")
-    return np.asarray(id_ls)
+            id_ls.append(-1)  # anomaly (see docstring); surfaced via warning below
+            _unknown += 1
+    if _unknown:
+        click.echo(
+            f"[get_indexes] WARNING: {_unknown} codec repr(s) in the results "
+            f"were not found in the config-space CSV and were labelled -1.  "
+            f"Are the .npy and config_space CSV from the SAME evaluate_combos "
+            f"run (and the same numcodecs version)?",
+            err=True,
+        )
+    return np.asarray(id_ls, dtype=int)
 
 
 def slice_array(arr: pd.array, indices_ls: list) -> np.ndarray:
@@ -1261,27 +2183,35 @@ class Timer:
         return self
 
     def __exit__(self, *args):
-        duration = time.perf_counter() - self.start
         with _TIMINGS_LOCK:
-            _TIMINGS[self.label].append(duration)
+            _TIMINGS[self.label].append(time.perf_counter() - self.start)
 
 
 @atexit.register
 def print_profile_summary():
     if not _TIMINGS:
         return
-
-    comm = MPI.COMM_WORLD
-    rank = comm.Get_rank()
-    if rank != 0:
+    if MPI.COMM_WORLD.Get_rank() != 0:
         return
 
-    print("\n=== Timing Summary ===")
+    print("\n=== Timing Summary (rank 0; ranks balanced via deterministic shuffle) ===")
+    print("Sum of Total = thread-seconds inside the eval pipeline (excludes bcast,")
+    print("file I/O, dask graph setup, and result-write overhead).")
+    print()
     label_width = max(len(label) for label in _TIMINGS.keys())
-    header = f"{'Label':<{label_width}} | {'Calls':>5} | {'Avg (s)':>10} | {'Total (s)':>10}"
+    # Per-label totals; grand total is the sum across all labels and is the
+    # denominator for the % column ("how much of the eval pipeline did this
+    # phase consume?").  Edge case: if no time was recorded, show 0% to
+    # avoid a ZeroDivisionError.
+    totals = {label: sum(durations) for label, durations in _TIMINGS.items()}
+    grand_total = sum(totals.values()) or 1.0
+    header = (f"{'Label':<{label_width}} | {'Calls':>5} | {'Avg (s)':>10} | "
+              f"{'Total (s)':>12} | {'% total':>7}")
     print(header)
     print("-" * len(header))
     for label, durations in sorted(_TIMINGS.items()):
-        total = sum(durations); count = len(durations); avg = total / count
-        print(f"{label:<{label_width}} | {count:>5} | {avg:>10.6f} | {total:>10.6f}")
+        total = totals[label]; count = len(durations); avg = total / count
+        pct = 100.0 * total / grand_total
+        print(f"{label:<{label_width}} | {count:>5} | {avg:>10.6f} | "
+              f"{total:>12.6f} | {pct:>6.2f}%")
     print("=" * len(header))

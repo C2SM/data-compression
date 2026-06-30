@@ -33,24 +33,6 @@ dependencies = [
     "plotly",
     "cfgrib",
     "psutil",
-    "numcodecs_wasm",
-    "numcodecs_combinators",
-    "numcodecs_observers",
-    "numcodecs_wasm_asinh",
-    "numcodecs_wasm_bit_round",
-    "numcodecs_wasm_fixed_offset_scale",
-    "numcodecs_wasm_identity",
-    "numcodecs_wasm_linear_quantize",
-    "numcodecs_wasm_log",
-    "numcodecs_wasm_round",
-    "numcodecs_wasm_swizzle_reshape",
-    "numcodecs_wasm_uniform_noise",
-    "numcodecs_wasm_zlib",
-    "numcodecs_wasm_zstd",
-    "numcodecs_wasm_pco",
-    "numcodecs_wasm_sperr",
-    "numcodecs_wasm_sz3",
-    "numcodecs_wasm_zfp",
 ]
 description = 'Data compression tool for Weather and Climate data'
 name = 'dc_toolkit'
@@ -60,7 +42,6 @@ version = '0.0'
 
 [project.scripts]
 dc_toolkit = 'dc_toolkit.cli:cli'
-model_eval_cscs_exclaim = 'model_eval_cscs_exclaim.cli:cli'
 
 [tool.setuptools]
 package-dir = {"" = "src"}
