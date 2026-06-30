@@ -43,7 +43,6 @@ rm -rf venv
 python -m venv venv
 source venv/bin/activate
 bash install_dc_toolkit.sh
-source venv/bin/activate
 ```
 
 ## Usage
