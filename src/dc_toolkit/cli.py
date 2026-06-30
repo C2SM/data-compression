@@ -1768,7 +1768,6 @@ def evaluate_combos(dataset_file,
                         f"{manifest_path}: {manifest_err}"
                     )
 
-
 @cli.command("compress_with_optimal")
 @click.argument("dataset_file", type=click.Path(exists=True, dir_okay=True, file_okay=True))
 @click.argument("where_to_write", type=click.Path(dir_okay=True, file_okay=False, exists=False))
@@ -2761,7 +2760,6 @@ def compress_fields_from_results(dataset_file, where_to_write, vars_filter,
         f"[batch] will compress {len(candidates)} field(s): "
         f"{', '.join(c['var'] for c in candidates)}"
     )
-
     # Open dataset ONCE; pass the same da to each iteration.
     ds = utils.open_dataset(dataset_file, field_to_compress=None, rank=rank)
 
@@ -3234,7 +3232,6 @@ def compress_fields_from_results(dataset_file, where_to_write, vars_filter,
 
     if any_error and not continue_on_error:
         sys.exit(1)
-
 
 @cli.command("merge_compressed_fields")
 @click.argument("dataset_file", type=click.Path(exists=True, dir_okay=True, file_okay=True))

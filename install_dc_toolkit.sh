@@ -7,6 +7,7 @@ pip install --upgrade pip
 pip install -e .
 CC=$(which mpicc) pip install --no-binary=mpi4py mpi4py
 
+
 # Thread-pinning is no longer baked into the venv.  Export the codec-internal
 # thread caps manually (e.g. in your sbatch script):
 #

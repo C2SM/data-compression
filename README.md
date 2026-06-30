@@ -73,6 +73,7 @@ The typical pipeline is three commands:
 2. **`compress_with_optimal`** (one field at a time) or **`compress_fields_from_results`** (batch: all fields at once, dataset opened once) — persist the field(s) into a shared `.zarr` store using the winning combo from step 1, at production chunk/shard sizes.
 3. **`merge_compressed_fields`** — consolidate metadata on the shared store so downstream readers can open it quickly without scanning every array.
 
+
 > **Important:** pass the **same `--eval-data-size-limit`** to step 2 as you used in step 1. The `(comp_idx, filt_idx, ser_idx)` tuple from the sweep indexes into a codec space whose dtype-dependent parameters (e.g. the BitRound/Quantize grids) are derived from the sample — change the sample size and the tuple can resolve to a slightly different codec object. Symptom: worse compression ratio at persist time than the sweep reported, no error.
 
 ### Output files

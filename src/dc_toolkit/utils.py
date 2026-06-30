@@ -498,7 +498,6 @@ def build_representative_sample(
 
     return sampled
 
-
 def _balanced_group_plan(dims_info, budget) -> dict:
     """
     Legacy log-space split of `budget` slices across the dims in `dims_info`
@@ -1008,7 +1007,6 @@ class ZFPYFlat(zarrcodecs_nc.ZFPY, codec_name="zfpy"):
         out = await asyncio.to_thread(self._codec.encode, arr)
         return chunk_spec.prototype.buffer.from_bytes(out)
 
-
 def serializer_space(da, with_lossy=True, serializer_class="all"):
     """
     Array->bytes serializer space.  PCodec is always present.  ZFPY is added
@@ -1244,7 +1242,6 @@ def inclusive_range(start, end, step=1):
             values.append(end)
     return values
 
-
 # =============================================================================
 # CODEC PIPELINE ASSEMBLY
 # =============================================================================
@@ -1275,7 +1272,6 @@ def _codec_kwargs(filters, compressors, serializer):
         kwargs["serializer"] = serializer
     return kwargs
 
-
 # =============================================================================
 # CODEC PIPELINE - EVALUATION (no persistence, thread-safe)
 # =============================================================================
@@ -1305,6 +1301,7 @@ def _iter_chunk_slices(shape, chunk_shape):
             slice(st, min(st + c, s))
             for st, c, s in zip(start, chunk_shape, shape)
         )
+
 
 
 # =============================================================================
@@ -1591,7 +1588,6 @@ def evaluate_codec_pipeline(
                 f"error accumulators are non-finite even after masking "
                 f"(l1_err={l1_err}, l2_err_sq={l2_err_sq}, linf_err={linf_err})"
             )
-
     l2_err = math.sqrt(l2_err_sq)
     l2_ori = math.sqrt(l2_ori_sq)
 
@@ -1830,7 +1826,6 @@ def compute_errors_distances(da_compressed, da, q99_abs=None):
     o  = dask.array.where(valid, da, 0)
     dc = dask.array.where(valid, da_compressed, 0)
     da_error = dc - o
-
     norm_L1_error    = np.abs(da_error).sum()
     norm_L2_error    = np.sqrt((da_error ** 2).sum())
     norm_Linf_error  = np.abs(da_error).max()
