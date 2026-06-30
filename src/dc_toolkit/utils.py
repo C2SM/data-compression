@@ -242,7 +242,7 @@ def _is_time_like_coord(da: xr.DataArray, dim_name: str) -> bool:
         # Merge attrs and encoding; encoding wins on conflicts because
         # decoded time vars store the original units/calendar in
         # encoding rather than attrs.
-        merged = {**dict(coord.attrs), **dict(coord.encoding)
+        merged = {**dict(coord.attrs), **dict(coord.encoding)}
 
         units = merged.get('units')
         if isinstance(units, str) and _CF_TIME_UNITS_RE.match(units):
