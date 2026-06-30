@@ -64,14 +64,7 @@
 set -uo pipefail   # NOT -e: continue past per-file failures
 
 export PYTHONUNBUFFERED=1
-#source venv/bin/activate
-
-#srun -n 1 -A cwp03 dc_toolkit evaluate_combos /capstor/store1/cscs/userlab/cwp03/zemanc/Data_Dyamond_PostProcessed_R02B06/out_1_1/remap_qv_20230121T000000Z.nc ./out --field-to-compress qv --override-existing-l1-error 0.002 --without-lossy --without-numcodecs-wasm --without-ebcc
-
-# Outer parallelism (MPI ranks x ThreadPoolExecutor) is explicit in
-# dc_toolkit, so codec-internal threadpools must be pinned to 1 to avoid
-# nested-parallelism oversubscription.
-export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 BLOSC_NTHREADS=1 NUMBA_NUM_THREADS=1
+source venv/bin/activate
 
 # Codec-internal threadpools pinned to 1.  The bypass machinery already
 # parallelises codec dispatch across the 32 user threads; OpenMP/blosc
