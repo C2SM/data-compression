@@ -50,7 +50,7 @@ Run with N nodes, one MPI rank per node:
 SBATCH --nodes=8 --ntasks-per-node=1 --cpus-per-task=32
 ```
 
-The 13,000 combos get split across the 8 ranks deterministically (rank 0 takes every 8th combo starting at 0, rank 1 takes every 8th starting at 1, etc). Each rank works on its slice independently — no coordination during the sweep, just a final result-gather at the end.
+The 13,000 combos are shuffled with a fixed seed (so every rank gets a representative mix of cheap and expensive codecs, and `--resume` sees the same order) and then split across the 8 ranks deterministically (rank 0 takes every 8th combo starting at 0, rank 1 takes every 8th starting at 1, etc). Each rank works on its slice independently — no coordination during the sweep, just a final result-gather at the end.
 
 Adding more nodes gives a clean linear speedup at this layer. Two nodes process combos roughly 2× faster than one; eight nodes process them 8× faster than one.
 
@@ -206,7 +206,7 @@ To keep the parallelism behaving correctly, the toolkit enforces some invariants
 
 - `santis.run` — the production driver script, with an inline comment block summarizing the experiments on Santis that informed the topology choices.
 - `src/dc_toolkit/cli.py` — the actual implementation of every command.
-- `src/dc_toolkit/utils.py` — the bypass machinery (`_AsyncBypass`, `_get_or_create_shared_executor`, `_get_thread_event_loop`) and the various safety checks (`check_thread_oversubscription`, `_check_thread_product`, the memory-headroom checks).
+- `src/dc_toolkit/utils.py` — the bypass machinery (`AsyncBypass`, `_get_or_create_shared_executor`, `_get_thread_event_loop`, section 5) and `check_thread_oversubscription`; the memory guards (`_check_memory_headroom`, `_check_node_memory_headroom`, `_check_thread_product`) live in section 2 of `cli.py`.
 
 ---
 
