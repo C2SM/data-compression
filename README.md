@@ -105,7 +105,7 @@ srun --unbuffered dc_toolkit evaluate_combos input.nc \
     --threads-per-rank 32
 ```
 
-This topology was selected over multi-rank-per-node (32 ranks × 1 thread, the original design) to avoid OOM on large fields — the latter duplicates the sample buffer once per rank.  See `santis.run` for the validated production driver and the inline comment block summarising the experiments behind the choice.
+This topology was selected over multi-rank-per-node (32 ranks × 1 thread, the original design) to avoid OOM on large fields — the latter duplicates the sample buffer once per rank.  See `santis.run` for the validated production driver and the inline comment block summarising the experiments behind the choice.  The script reads the input location from the environment: `DYAMOND_DATA_ROOT=/path/to/parent sbatch santis.run`, where the parent directory holds the `Data_Dyamond_PostProcessed*` trees.
 
 Codec-internal thread pools must be pinned to 1 to avoid nested oversubscription (the tool checks this at startup and aborts by default; `--no-oversubscription-check` disables the guard):
 

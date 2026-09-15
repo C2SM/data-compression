@@ -166,7 +166,7 @@ sup.fn{font-size:.7em; color:var(--b06); font-weight:700}
 
 <!-- ============================ BEGINNING ============================ -->
 <h2 id="s0"><span class="n">00</span> The problem, in one minute</h2>
-<p class="lead first">This study concerns the <b>DYAMOND</b> simulation output currently held in temporary storage at <code>/capstor/store1/cscs/userlab/cwp03/zemanc/Data_Dyamond*</code>. The question we set out to answer is operational: <span class="hl">where and how should this archive ultimately be stored</span> — on <b>capstor</b> or on <b>VAST</b>, and <b>compressed</b> or <b>uncompressed</b>?</p>
+<p class="lead first">This study concerns the <b>DYAMOND</b> simulation output currently held in temporary project storage on Alps (capstor). The question we set out to answer is operational: <span class="hl">where and how should this archive ultimately be stored</span> — on <b>capstor</b> or on <b>VAST</b>, and <b>compressed</b> or <b>uncompressed</b>?</p>
 <p>The archive holds <b>872,951 files</b> totalling <b>6.61&nbsp;PiB</b>. Storing and moving data at this scale is expensive, so the underlying goal is concrete: make the archive substantially smaller without discarding anything a scientist would actually need. This report works through the evidence end to end — how the data was sampled, how a compression recipe was chosen and proven safe, how it behaves across resolutions, and how it compares with the simpler VAST route — so the storage decision can rest on measurements rather than intuition.</p>
 <p>The archive spans three model resolutions — <b>R02B06</b>, <b>R02B08</b>, and <b>R02B10</b> — and the finest, R02B10, dominates it almost entirely:</p>
 

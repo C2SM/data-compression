@@ -80,14 +80,18 @@ export OMP_NUM_THREADS=1 \
 # ---------------------------------------------------------------------------
 # Tunables
 # ---------------------------------------------------------------------------
-ROOT_R02B10=/capstor/store1/cscs/userlab/cwp03/zemanc/Data_Dyamond_PostProcessed
-ROOT_R02B08=/capstor/store1/cscs/userlab/cwp03/zemanc/Data_Dyamond_PostProcessed_R02B08
-ROOT_R02B06=/capstor/store1/cscs/userlab/cwp03/zemanc/Data_Dyamond_PostProcessed_R02B06
+# Site-specific: parent directory holding the Data_Dyamond_PostProcessed* trees.
+# Launch with:  DYAMOND_DATA_ROOT=/path/to/parent sbatch santis.run
+: "${DYAMOND_DATA_ROOT:?export DYAMOND_DATA_ROOT=<parent dir of the Data_Dyamond_PostProcessed* trees>}"
+ROOT_R02B10="$DYAMOND_DATA_ROOT/Data_Dyamond_PostProcessed"
+ROOT_R02B08="$DYAMOND_DATA_ROOT/Data_Dyamond_PostProcessed_R02B08"
+ROOT_R02B06="$DYAMOND_DATA_ROOT/Data_Dyamond_PostProcessed_R02B06"
 
 RESULTS_BASE="${RESULTS_BASE:-./res_folder_dyamond_${SLURM_JOB_ID:-$$}}"
 mkdir -p "$RESULTS_BASE"
 
 echo "[santis.run] topology: 1 rank/node x 32 threads/rank x ${SLURM_JOB_NUM_NODES:-?} nodes"
+echo "[santis.run] data root: $DYAMOND_DATA_ROOT"
 
 EVAL_FLAGS=(
     --eval-data-size-limit         5GB
