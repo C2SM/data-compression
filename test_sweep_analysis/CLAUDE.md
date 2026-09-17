@@ -9,9 +9,10 @@ fixed), but **it has never run at production scale**. This folder is that run: a
 (`santis_test.run`) that sweeps and compresses a few DYAMOND fields and exercises every changed
 path. A checker (`check_outputs.py`) then validates the outputs against the invariants below.
 
-Your job: set up, submit, monitor, read `test_report.md`, triage every failure and warning down to
-a root cause with evidence, and report back to Christos. Do not apply non-trivial code fixes
-without him.
+Your job: carry out the runbook in section 3 end to end: a worktree of the branch, a venv with EBCC,
+the submission and the monitoring. Then triage every failure and warning in `test_report.md` down
+to a root cause with evidence, and report back to Christos (section 9). Do not apply non-trivial
+code fixes without him. Sections 1 and 2 are context; the work starts in section 3.
 
 ## 1. What changed (branch vs `main` @ `c94b83b`)
 
@@ -155,43 +156,164 @@ codec config. **Not exercised before Santis:** real `srun` geometry and CPU bind
 `SRUN_CPUS_PER_TASK`, SIGTERM forwarding by `srun`, `squeue`-based walltime guards, cgroup memory
 limits, the uenv, and anything at DYAMOND scale.
 
-## 3. Setup and submission
+## 3. Runbook: do these steps in order
+
+Christos points you at this file and expects you to do everything below yourself, **with EBCC on**.
+Two facts shape the steps:
+- Shell state does not persist between your tool calls, so every setting lives in
+  `$SCRATCH/dc_toolkit_santis_test.env`, which each step sources.
+- `uenv start` opens an interactive shell you cannot drive, so the install goes through `uenv run`.
+  The job loads the uenv (`#SBATCH --uenv`) and the venv itself, so you submit from your plain shell.
+
+**Inputs.** You need `DYAMOND_DATA_ROOT` (the parent directory of `Data_Dyamond_PostProcessed`,
+`..._R02B06` and `..._R02B08`) and a Slurm account. Take them from Christos's message or your
+environment. For the account, `sacctmgr -nP show assoc user=$USER format=account | sort -u` is
+enough when it prints exactly one. Otherwise ask Christos, once, for whatever is missing. Do not
+crawl the filesystem for the data, and never write its path into a tracked file.
+
+### Step 1: settings
+
+`SRC` is Christos's existing dc_toolkit clone: the directory you were started in, or the one holding
+this file.
 
 ```bash
-uenv image pull prgenv-gnu/26.3:v1                  # once
-uenv start --view=default prgenv-gnu/26.3:v1
-git clone git@github.com:C2SM/data-compression.git dc_toolkit_test && cd dc_toolkit_test
-git checkout santis-production-test
-python -m venv venv && source venv/bin/activate
-bash install_dc_toolkit.sh                          # WITH_EBCC=1 bash install_dc_toolkit.sh for phase 4
+cat > "$SCRATCH/dc_toolkit_santis_test.env" <<EOF
+export SRC=<path of the existing dc_toolkit clone>
+export REPO=$SCRATCH/dc_toolkit_santis_test
+export DYAMOND_DATA_ROOT=<parent dir of the Data_Dyamond_PostProcessed* trees>
+export ACCOUNT=<slurm account>
+EOF
 ```
 
-Use a **fresh checkout and venv**. The v3 sweep ran from a locally patched checkout: its
-`--mask-abs-above` flag was never in the repo. The `preflight` step aborts the job when `dc_toolkit`
-is not imported from the submitting checkout.
+### Step 2: a clean worktree of the branch
+
+Never modify `$SRC`. It may carry local changes: the v3 sweep ran from a checkout with an unpushed
+patch (`--mask-abs-above`). The test runs in a separate worktree at `$REPO`, and the `preflight` step
+aborts the job when `dc_toolkit` is not imported from there.
 
 ```bash
-export DYAMOND_DATA_ROOT=<parent of Data_Dyamond_PostProcessed, ..._R02B06, ..._R02B08>   # ask Christos
-sbatch --account=<account> test_sweep_analysis/santis_test.run                            # full test
-
-# quicker variants
-HEAVY=0 sbatch --account=<account> --time=01:15:00 test_sweep_analysis/santis_test.run   # skip phase 5
-SWEEP_EXTRA_FLAGS="--max-evals 300" HEAVY=0 KILL_AFTER=40 \
-    sbatch --account=<account> --time=00:40:00 test_sweep_analysis/santis_test.run       # plumbing only
+source "$SCRATCH/dc_toolkit_santis_test.env"
+git -C "$SRC" fetch origin +refs/heads/santis-production-test:refs/remotes/origin/santis-production-test
+if [ -d "$REPO" ]; then
+    test -z "$(git -C "$REPO" status --porcelain --untracked-files=no)" || { echo "STOP: $REPO has local changes"; exit 1; }
+    git -C "$REPO" checkout --detach origin/santis-production-test
+else
+    git -C "$SRC" worktree add --detach "$REPO" origin/santis-production-test
+fi
+git -C "$REPO" log --oneline -3
 ```
 
-sbatch exports the submitting environment, so the knobs travel with the job. Knobs: `RESULTS_BASE`
-(default `$SCRATCH/dc_toolkit_test_sweep_analysis/<jobid>`), `VENV`, `HEAVY`,
-`WITH_EBCC=auto|0|1`, `SWEEP_EXTRA_FLAGS`, `KILL_AFTER` (default 100 s), `RESUME_KEY`, `KILL_KEY`,
-and `FIELDS_FILE` (one `CLASS|RES|STREAM|FILE|VAR|L1|SAMPLE|THREADS|GATE FLAGS` line per entry;
-CLASS is `light`, `ebcc` or `heavy`). Re-run a subset with `FIELDS_FILE` rather than editing the
-default list. Do not reuse a `RESULTS_BASE`: the phase 1 directories would resume and the phase 2
-copies would be stale.
+Continue only if the log's top commit is `Add a Santis production test in test_sweep_analysis`, or a
+newer one on this branch. On `STOP`, ask Christos.
 
-Monitor with `squeue --me`, `tail -f out-dc_test-<jobid>.out` in the submit directory, and the
-per-step logs. To re-run only the checker (it needs the venv, and srun because reading an EBCC store
-imports mpi4py):
-`srun -A <account> --uenv=prgenv-gnu/26.3:v1 --view=default -p debug -N1 -n1 python test_sweep_analysis/check_outputs.py $RESULTS_BASE`.
+### Step 3: venv with dc_toolkit and EBCC (10 to 15 min)
+
+Run it in the background and poll the log. The EBCC build compiles OpenJPEG and an HDF5 filter.
+
+```bash
+source "$SCRATCH/dc_toolkit_santis_test.env"
+uenv image pull prgenv-gnu/26.3:v1          # quick when the image is already there
+cd "$REPO" && rm -rf venv                    # this worktree's venv only
+uenv run --view=default prgenv-gnu/26.3:v1 -- bash -c '
+    set -euo pipefail
+    python --version
+    python -m venv venv
+    source venv/bin/activate
+    WITH_EBCC=1 bash install_dc_toolkit.sh
+    python -c "import ebcc.zarr_filter; print(\"EBCC OK\")"
+' > "$SCRATCH/dc_toolkit_santis_test_install.log" 2>&1
+tail -n 5 "$SCRATCH/dc_toolkit_santis_test_install.log"
+```
+
+The install is done when the log ends with `EBCC OK`. Do not continue without it. If it fails:
+- **Python older than 3.11, or cmake / HDF5 headers not found:** the command did not run inside the
+  uenv view.
+- **The mpi4py build fails:** `mpicc` is missing from the view.
+- **`uenv run` rejects the syntax:** check `uenv run --help`.
+
+### Step 4: check the inputs before queueing
+
+```bash
+source "$SCRATCH/dc_toolkit_santis_test.env"
+cd "$REPO"
+test -x venv/bin/dc_toolkit && echo "venv OK"
+grep -E '^ +"(light|ebcc|heavy)\|' test_sweep_analysis/santis_test.run | tr -d ' "' |
+while IFS='|' read -r class res stream file var rest; do
+    case $res in R02B06) tree=Data_Dyamond_PostProcessed_R02B06 ;; R02B10) tree=Data_Dyamond_PostProcessed ;; esac
+    f="$DYAMOND_DATA_ROOT/$tree/$stream/$file"
+    [ -f "$f" ] && echo "ok       $res $stream $file" || echo "MISSING  $f"
+done
+```
+
+All 8 inputs must be `ok`. If one is missing, check that stream's directory for the name the file
+actually has, then report it. Do not edit the default list: pass a corrected list with `FIELDS_FILE`
+(see Knobs below) and tell Christos.
+
+### Step 5: submit, EBCC on
+
+Submit from your plain shell, with no uenv and no venv active.
+
+```bash
+source "$SCRATCH/dc_toolkit_santis_test.env"
+cd "$REPO"
+JOBID=$(WITH_EBCC=1 sbatch --parsable --account="$ACCOUNT" test_sweep_analysis/santis_test.run) && JOBID=${JOBID%%;*}
+echo "JOBID=$JOBID"
+cat >> "$SCRATCH/dc_toolkit_santis_test.env" <<EOF
+export JOBID=$JOBID
+export RESULTS=$SCRATCH/dc_toolkit_test_sweep_analysis/$JOBID
+EOF
+```
+
+`WITH_EBCC=1` makes the EBCC phase mandatory: if the package is missing, phase 4 fails instead of
+being skipped. sbatch exports your environment, so `WITH_EBCC` and `DYAMOND_DATA_ROOT` reach the job.
+
+### Step 6: monitor (about 3 h once running)
+
+```bash
+source "$SCRATCH/dc_toolkit_santis_test.env"
+squeue -j "$JOBID" -o "%.10i %.9T %.10M %.10L %R"
+cut -f1,2,7,8 "$RESULTS/steps.tsv" 2>/dev/null
+tail -n 20 "$REPO/out-dc_test-$JOBID.out" 2>/dev/null
+```
+
+- **While the job is pending:** check every 15 to 30 minutes.
+- **In the first 10 minutes of running:** watch closely and confirm:
+  - `preflight`, `nodes` and `cli_help` have rc 0.
+  - `$RESULTS/environment.log` has no `MISSING` line.
+  - `$RESULTS/preflight.log` shows dc_toolkit under `$REPO` and an `ebcc` version.
+  - `$RESULTS/nodes.log` lists 8 nodes with `nproc=32`.
+  - The first `fields/*/sweep.log` shows `8 node(s) x 1 rank(s)/node x 32 thread(s)/rank`.
+- **After that:** check every 15 to 20 minutes until the job leaves the queue.
+
+**Budget:** a full run costs about 24 node-hours.
+- If an environment problem shows up early (inputs, venv, account, CPUs per task), you may `scancel`,
+  fix it, and resubmit once. A new job id gets a fresh results directory.
+- Ask Christos before any code change, any further resubmission, or a reduced run.
+
+### Step 7: read, triage, report
+
+```bash
+source "$SCRATCH/dc_toolkit_santis_test.env"
+sacct -j "$JOBID" --format=JobID,State,Elapsed,ExitCode
+cat "$RESULTS/test_report.md"
+```
+
+If the `check` step never ran (walltime or cancel), run the checker yourself (section 4). Then take
+every failure and warning to a root cause (sections 5 to 7) and report as section 9 asks.
+
+### Knobs (only when Christos asks for a variant)
+
+The job reads these from the environment:
+- `RESULTS_BASE` (default `$SCRATCH/dc_toolkit_test_sweep_analysis/<jobid>`). Never reuse one: the
+  phase 1 directories would resume and the phase 2 copies would be stale.
+- `VENV` (default `<checkout>/venv`).
+- `HEAVY=0` skips phase 5; submit with `--time=01:15:00`.
+- `WITH_EBCC=auto|0|1`.
+- `SWEEP_EXTRA_FLAGS`, e.g. `"--max-evals 300"` with `HEAVY=0 KILL_AFTER=40 --time=00:40:00` for a
+  plumbing-only run. The 7 EBCC combos still run, because `--max-evals` never cuts them.
+- `KILL_AFTER` (default 100 s), `RESUME_KEY`, `KILL_KEY`.
+- `FIELDS_FILE`: one `CLASS|RES|STREAM|FILE|VAR|L1|SAMPLE|THREADS|GATE FLAGS` line per entry, with
+  CLASS `light`, `ebcc` or `heavy`.
 
 ## 4. Outputs
 
@@ -210,6 +332,15 @@ $RESULTS_BASE/
 
 `steps.tsv` columns: `step key dir input var l1 rc seconds`. `rc` is an exit status, or
 `missing-input`, `skipped-walltime` or `no-pipeline`.
+
+The job log is `$REPO/out-dc_test-<jobid>.out`. To re-run only the checker, use srun: reading an
+EBCC store imports mpi4py.
+
+```bash
+source "$SCRATCH/dc_toolkit_santis_test.env"
+srun -A "$ACCOUNT" --uenv=prgenv-gnu/26.3:v1 --view=default -p debug -N1 -n1 \
+    "$REPO/venv/bin/python" "$REPO/test_sweep_analysis/check_outputs.py" "$RESULTS"
+```
 
 ## 5. What `check_outputs.py` asserts
 
@@ -289,7 +420,7 @@ Warnings do not fail the run: CR drift above 25 %, failed combos, rows with `n_c
 - Christos wants compact, navigable code with few comments ("why", not narration), no test
   infrastructure in the repo (this folder is the exception for this run), and stable CLI options and
   output formats.
-- Never push to `main`. Work on this branch or a branch off it. Christos is the commit author: no
+- Never modify Christos's existing clone (`$SRC`); work in the `$REPO` worktree. Never push to `main`. Work on this branch or a branch off it. Christos is the commit author: no
   Claude co-author trailer.
 - Results are gitignored (`*.csv`, `*.parquet`, `*manifest*.json`, `*.zarr*`, `out-*`); keep them out
   of commits. Never commit the DYAMOND data path or user names: use `DYAMOND_DATA_ROOT`.
