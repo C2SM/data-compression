@@ -1,0 +1,344 @@
+#!/bin/bash
+#
+# Production test of dc_toolkit on Santis: evaluate_combos + compress on a few
+# DYAMOND fields, then the resume, kill/resume, --pipeline and EBCC paths, and
+# finally check_outputs.py, which validates every output and writes
+# $RESULTS_BASE/test_report.md.  Read CLAUDE.md in this folder first.
+#
+#   cd <dc_toolkit checkout of the branch under test>     # with its own ./venv
+#   DYAMOND_DATA_ROOT=/path/to/parent sbatch --account=<account> test_sweep_analysis/santis_test.run
+#
+# Environment knobs:
+#   DYAMOND_DATA_ROOT   parent dir of the Data_Dyamond_PostProcessed* trees (required)
+#   RESULTS_BASE        output root (default $SCRATCH/dc_toolkit_test_sweep_analysis/<job id>)
+#   VENV                virtualenv to activate (default <checkout>/venv)
+#   HEAVY=0             skip the two R02B10 fields above the sample budget (~1 h less)
+#   WITH_EBCC=auto|0|1  EBCC phase; auto runs it when the ebcc package imports
+#   SWEEP_EXTRA_FLAGS   appended to every evaluate_combos, e.g. "--max-evals 300" for a dry run
+#   KILL_AFTER          seconds before the kill/resume sweep is interrupted (default 100)
+#   FIELDS_FILE         replaces the field list below (same format, one entry per line)
+#
+# Topology as in santis.run: 1 MPI rank per node x --threads-per-rank threads,
+# --bypass-zarr-sync on (the default).  compress runs as a single task.
+#
+#SBATCH --job-name=dc_test
+#SBATCH --account=YOUR_ACCOUNT_HERE
+#SBATCH --uenv=prgenv-gnu/26.3:v1
+#SBATCH --view=default
+#SBATCH --partition=normal
+#SBATCH --nodes=8
+#SBATCH --ntasks-per-node=1
+#SBATCH --cpus-per-task=32
+#SBATCH --time=04:00:00
+#SBATCH --output=out-dc_test-%j.out
+#SBATCH --error=out-dc_test-%j.out
+
+set -uo pipefail   # not -e: a failed step is recorded and the test goes on
+
+export PYTHONUNBUFFERED=1
+export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 BLOSC_NTHREADS=1 \
+       NUMBA_NUM_THREADS=1 VECLIB_MAXIMUM_THREADS=1 OMP_THREAD_LIMIT=1
+# srun steps do not reliably inherit --cpus-per-task from sbatch, and a rank that
+# sees one core makes the thread check abort (santis.run lacks this line).
+export SRUN_CPUS_PER_TASK=${SLURM_CPUS_PER_TASK:-32}
+
+REPO_ROOT=${REPO_ROOT:-${SLURM_SUBMIT_DIR:-$PWD}}
+[[ -f "$REPO_ROOT/src/dc_toolkit/cli.py" ]] || REPO_ROOT=$(cd "$REPO_ROOT/.." && pwd)
+TEST_DIR="$REPO_ROOT/test_sweep_analysis"
+if [[ ! -f "$REPO_ROOT/src/dc_toolkit/utils_cli.py" || ! -f "$TEST_DIR/check_outputs.py" ]]; then
+    echo "FATAL: submit from the dc_toolkit checkout of the branch under test (or set REPO_ROOT)."
+    exit 1
+fi
+source "${VENV:-$REPO_ROOT/venv}/bin/activate" || { echo "FATAL: cannot activate ${VENV:-$REPO_ROOT/venv}"; exit 1; }
+: "${DYAMOND_DATA_ROOT:?export DYAMOND_DATA_ROOT=<parent dir of the Data_Dyamond_PostProcessed* trees>}"
+
+RESULTS_BASE=${RESULTS_BASE:-${SCRATCH:-$TEST_DIR}/dc_toolkit_test_sweep_analysis/${SLURM_JOB_ID:-local$$}}
+HEAVY=${HEAVY:-1}
+WITH_EBCC=${WITH_EBCC:-auto}
+SWEEP_EXTRA_FLAGS=${SWEEP_EXTRA_FLAGS:-}
+KILL_AFTER=${KILL_AFTER:-100}
+RESUME_KEY=${RESUME_KEY:-R02B06_out_7_clct}    # resume, re-compress and --pipeline checks
+KILL_KEY=${KILL_KEY:-R02B06_out_2_tot_prec}    # kill/resume check
+SRUN_OPTS=""
+mkdir -p "$RESULTS_BASE"
+STEPS="$RESULTS_BASE/steps.tsv"
+printf 'step\tkey\tdir\tinput\tvar\tl1\trc\tseconds\n' > "$STEPS"
+
+# ---------------------------------------------------------------------------
+# Fields: CLASS|RES|STREAM|FILE|VAR|L1|SAMPLE|THREADS|GATE FLAGS
+# L1 budgets (relative), sample sizes, threads and gate flags are those of the
+# v3 production sweep (mixed_threshold_table.csv, generate_sweep_v3.py).
+# ---------------------------------------------------------------------------
+LIST=(
+    # R02B06, whole fields under the sample budget, one kind of gate each
+    "light|R02B06|out_7|remap_clct_20220225T000000Z.nc|clct|0.00235199|2GiB|32|--phys-min 0 --phys-max 100"
+    "light|R02B06|out_3|t_2m_20220225T000000Z.nc|t_2m|0.00028651|2GiB|32|--gradient-gate --gradient-threshold 0.1 --gradient-shortcircuit --phys-min 0"
+    "light|R02B06|out_2|tot_prec_20220225T000000Z.nc|tot_prec|0.01|2GiB|32|--extremes-sensitive --phys-min 0"
+    "light|R02B06|out_1_2|remap_qc_20220225T000000Z.nc|qc|0.01|2GiB|32|--extremes-sensitive --phys-min 0"
+    # All-zero field: v3 kept 0 of its 8580 combos; relative errors are now 0/0 = 0
+    "light|R02B10|out_8|remap_cape_20220225T000000Z.nc|cape|0.01|2GiB|32|--extremes-sensitive --phys-min 0"
+    # EBCC mixed into the full sweep on float32 (lat, lon) frames
+    "ebcc|R02B06|out_7|remap_t_2m_20220225T000000Z.nc|t_2m|0.00037475|2GiB|32|--gradient-gate --gradient-threshold 0.1 --gradient-shortcircuit --phys-min 0 --with-ebcc"
+    # R02B10 above the sample budget: cascade sampling, multi-GiB Bcast, large writes
+    "heavy|R02B10|out_1_2|remap_qc_20220225T000000Z.nc|qc|0.01|1GiB|16|--extremes-sensitive --phys-min 0"
+    "heavy|R02B10|out_3|t_2m_20220225T000000Z.nc|t_2m|0.00030177|1GiB|16|--gradient-gate --gradient-threshold 0.1 --gradient-shortcircuit --phys-min 0"
+)
+if [[ -n "${FIELDS_FILE:-}" ]]; then
+    LIST=()
+    while IFS= read -r line; do LIST+=("$line"); done < <(grep -Ev '^[[:space:]]*(#|$)' "$FIELDS_FILE")
+fi
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+log () { echo "[santis_test $(date '+%F %T')] $*"; }
+
+resolve_root () {
+    case "$1" in
+        R02B06) echo "$DYAMOND_DATA_ROOT/Data_Dyamond_PostProcessed_R02B06" ;;
+        R02B08) echo "$DYAMOND_DATA_ROOT/Data_Dyamond_PostProcessed_R02B08" ;;
+        R02B10) echo "$DYAMOND_DATA_ROOT/Data_Dyamond_PostProcessed" ;;
+        *)      echo "$DYAMOND_DATA_ROOT/unknown_resolution_$1" ;;
+    esac
+}
+
+# parse ENTRY: sets CLASS RES STREAM FNAME VAR L1 SAMPLE THREADS GATES KEY INPUT
+parse () {
+    IFS='|' read -r CLASS RES STREAM FNAME VAR L1 SAMPLE THREADS GATES <<<"$1"
+    KEY="${RES}_${STREAM}_${VAR}"
+    INPUT="$(resolve_root "$RES")/$STREAM/$FNAME"
+}
+
+find_entry () {
+    local e
+    for e in "${LIST[@]}"; do parse "$e"; [[ "$KEY" == "$1" ]] && return 0; done
+    return 1
+}
+
+# sweep_cmd DIR [FLAGS...] / compress_cmd DIR [FLAGS...]: the command for the parsed entry, in CMD
+sweep_cmd () {
+    local dir=$1; shift
+    CMD=(srun --unbuffered $SRUN_OPTS dc_toolkit evaluate_combos "$INPUT" --where-to-write "$dir"
+         --field-to-compress "$VAR" --l1-threshold "$L1" --eval-data-size-limit "$SAMPLE"
+         --threads-per-rank "$THREADS" $GATES $SWEEP_EXTRA_FLAGS "$@")
+}
+compress_cmd () {
+    local dir=$1; shift
+    CMD=(srun --unbuffered --nodes=1 --ntasks=1 dc_toolkit compress "$INPUT" "$dir" --vars "$VAR" "$@")
+}
+
+record () { printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$1" "$KEY" "$2" "$INPUT" "$VAR" "$L1" "$3" "$4" >> "$STEPS"; }
+
+# run_step STEP DIR: run CMD, tee its output to DIR/STEP.log, record the exit status in steps.tsv
+run_step () {
+    local step=$1 dir=$2 t0=$SECONDS rc
+    mkdir -p "$dir"
+    log "START $step $KEY: ${CMD[*]}"
+    "${CMD[@]}" 2>&1 | tee "$dir/$step.log"
+    rc=${PIPESTATUS[0]}
+    record "$step" "$dir" "$rc" $((SECONDS - t0))
+    log "END   $step $KEY rc=$rc ($((SECONDS - t0)) s)"
+    return "$rc"
+}
+
+minutes_left () {
+    local left
+    left=$(squeue -h -j "${SLURM_JOB_ID:-none}" -o %L 2>/dev/null) || return 1
+    [[ "$left" =~ ^(([0-9]+)-)?(([0-9]+):)?([0-9]+):([0-9]+)$ ]] || return 1
+    echo $(( 10#${BASH_REMATCH[2]:-0} * 1440 + 10#${BASH_REMATCH[4]:-0} * 60 + 10#${BASH_REMATCH[5]} ))
+}
+
+# time_for MINUTES STEP DIR: true when that much walltime is left, else record STEP as skipped
+time_for () {
+    local left
+    left=$(minutes_left) || return 0
+    (( left >= $1 )) && return 0
+    log "SKIP $2 $KEY: $left min of walltime left, needs $1"
+    record "$2" "$3" skipped-walltime 0
+    return 1
+}
+
+# sweep_and_compress DIR MINUTES: sweep the parsed entry into DIR, then compress it there
+sweep_and_compress () {
+    local dir=$1
+    if [[ ! -f "$INPUT" ]]; then
+        log "SKIP $KEY: missing input $INPUT"
+        record sweep "$dir" missing-input 0
+        return 1
+    fi
+    time_for "$2" sweep "$dir" || return 1
+    sweep_cmd "$dir"
+    run_step sweep "$dir" || return 1
+    time_for 15 compress "$dir" || return 0
+    compress_cmd "$dir"
+    run_step compress "$dir"
+    return 0
+}
+
+# pick_pipeline PARQUET OUT KIND: write the best kept pipeline of KIND (lossless | ebcc) to OUT
+pick_pipeline () {
+    python - "$@" <<'EOF'
+import json, sys
+import pandas as pd
+parquet, out, kind = sys.argv[1:]
+df = pd.read_parquet(parquet)
+df = df[df["keep"].astype(str).str.lower().isin(("true", "1"))]
+if kind == "lossless":
+    df = df[df["filter"].str.startswith("delta(") & df["serializer"].str.startswith("pcodec(")]
+else:
+    df = df[df["serializer"].str.startswith("EBCC")]
+if df.empty:
+    sys.exit(f"no kept {kind} pipeline in {parquet}")
+row = df.sort_values(["ratio", "l1_rel", "pipeline"], ascending=[False, True, True]).iloc[0]
+with open(out, "w") as fh:
+    json.dump(json.loads(row["pipeline"]), fh, indent=1)
+print(f"{kind} pipeline, ratio {row['ratio']:.3f}: {row['name']}")
+EOF
+}
+
+# pipeline_step KIND SRC_DIR DIR: compress the parsed entry into DIR with the best KIND pipeline of SRC_DIR
+pipeline_step () {
+    local kind=$1 src=$2 dir=$3
+    mkdir -p "$dir"
+    if pick_pipeline "$src/results_$VAR.parquet" "$dir/pipeline.json" "$kind" > "$dir/pick.log" 2>&1; then
+        cat "$dir/pick.log"
+        compress_cmd "$dir" --pipeline "@$dir/pipeline.json" --l1-threshold "$L1"
+        run_step pipeline_compress "$dir"
+    else
+        cat "$dir/pick.log"
+        record pipeline_compress "$dir" no-pipeline 0
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# 0. Preflight: the checkout, the environment and every input
+# ---------------------------------------------------------------------------
+KEY=preflight; INPUT=""; VAR=""; L1=""
+log "results: $RESULTS_BASE"
+{
+    echo "repo     : $REPO_ROOT"
+    echo "git      : $(git -C "$REPO_ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null) @ $(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null)"
+    echo "modified : $(git -C "$REPO_ROOT" status --porcelain --untracked-files=no 2>/dev/null | wc -l | tr -d ' ') tracked file(s)"
+    echo "job      : ${SLURM_JOB_ID:-} on ${SLURM_JOB_NUM_NODES:-?} node(s): ${SLURM_JOB_NODELIST:-}"
+    echo "knobs    : HEAVY=$HEAVY WITH_EBCC=$WITH_EBCC KILL_AFTER=$KILL_AFTER SWEEP_EXTRA_FLAGS='$SWEEP_EXTRA_FLAGS'"
+    (uenv status 2>/dev/null || true) | head -5
+    for e in "${LIST[@]}"; do
+        parse "$e"
+        [[ -f "$INPUT" ]] && echo "input ok : $INPUT" || echo "MISSING  : $INPUT"
+    done
+} 2>&1 | tee "$RESULTS_BASE/environment.log"
+KEY=preflight; INPUT=""; VAR=""; L1=""
+
+CMD=(python - "$REPO_ROOT")
+run_step preflight "$RESULTS_BASE" <<'EOF' || { log "FATAL: dc_toolkit does not come from this checkout"; exit 1; }
+import importlib.metadata as md, importlib.util, os, sys
+import dc_toolkit
+repo, path = os.path.realpath(sys.argv[1]), os.path.realpath(list(dc_toolkit.__path__)[0])
+print("python    :", sys.version.split()[0], sys.executable)
+print("dc_toolkit:", path)
+for p in ("zarr", "numcodecs", "numpy", "dask", "xarray", "pandas", "pyarrow", "pcodec", "zfpy", "mpi4py", "ebcc"):
+    try:
+        print(f"{p:10s}:", md.version(p))
+    except md.PackageNotFoundError:
+        print(f"{p:10s}: not installed")
+sys.exit(0 if path.startswith(repo + os.sep) and importlib.util.find_spec("dc_toolkit.utils_cli") else 1)
+EOF
+
+CMD=(srun --unbuffered --ntasks-per-node=1 bash -c 'echo "$(hostname): nproc=$(nproc) cgroup memory.max=$(cat /sys/fs/cgroup/memory.max 2>/dev/null || echo n/a)"')
+run_step nodes "$RESULTS_BASE"
+CMD=(srun --unbuffered --nodes=1 --ntasks=1 dc_toolkit --help)
+run_step cli_help "$RESULTS_BASE" || { log "FATAL: dc_toolkit does not start under srun"; exit 1; }
+
+if [[ "$WITH_EBCC" == auto ]]; then
+    if python -c "import ebcc.zarr_filter" 2>/dev/null; then WITH_EBCC=1; else WITH_EBCC=0; fi
+    log "WITH_EBCC=auto -> $WITH_EBCC"
+fi
+
+# ---------------------------------------------------------------------------
+# 1. Light fields: sweep + compress
+# ---------------------------------------------------------------------------
+for e in "${LIST[@]}"; do
+    parse "$e"
+    [[ "$CLASS" == light ]] && sweep_and_compress "$RESULTS_BASE/fields/$KEY" 10
+done
+
+# ---------------------------------------------------------------------------
+# 2. Resume, re-compress and --pipeline on RESUME_KEY
+#    resume_identical: same flags on a copy of the recorded rows -> nothing re-evaluated
+#    resume_gradient:  gradient gate added -> only rows lacking grad_rel re-evaluated
+# ---------------------------------------------------------------------------
+if find_entry "$RESUME_KEY" && [[ -f "$RESULTS_BASE/fields/$KEY/manifest_$VAR.json" ]]; then
+    src="$RESULTS_BASE/fields/$KEY"
+    for mode in identical gradient; do
+        dir="$RESULTS_BASE/resume_$mode/$KEY"
+        mkdir -p "$dir"
+        cp "$src/config_space_$VAR.csv" "$src"/config_space_"$VAR"_rank[0-9]*.csv "$src/sweep_state_$VAR.json" "$dir"/
+        extra=""
+        [[ "$mode" == gradient ]] && extra="--gradient-gate --gradient-threshold 0.1 --gradient-shortcircuit"
+        sweep_cmd "$dir" $extra
+        run_step "resume_$mode" "$dir"
+    done
+    if [[ -f "$src/batch_manifest.json" ]]; then
+        cp "$src/batch_manifest.json" "$src/batch_manifest.first.json"
+        compress_cmd "$src"
+        run_step compress_rerun "$src"
+    fi
+    pipeline_step lossless "$src" "$RESULTS_BASE/pipeline_override/$KEY"
+else
+    log "SKIP resume checks: no finished sweep for $RESUME_KEY"
+fi
+
+# ---------------------------------------------------------------------------
+# 3. Kill/resume on KILL_KEY: SIGTERM mid-sweep, resume on half the nodes
+# ---------------------------------------------------------------------------
+if find_entry "$KILL_KEY" && [[ -f "$INPUT" ]] && time_for 20 kill_run "$RESULTS_BASE/kill_resume/$KEY"; then
+    dir="$RESULTS_BASE/kill_resume/$KEY"
+    sweep_cmd "$dir"
+    CMD=(timeout -k 60 -s TERM "$KILL_AFTER" "${CMD[@]}")
+    run_step kill_run "$dir"
+    sleep 20   # let SLURM tear the killed step down
+    half=$(( ${SLURM_JOB_NUM_NODES:-2} / 2 ))
+    (( half < 1 )) && half=1
+    SRUN_OPTS="--nodes=$half --ntasks=$half"
+    sweep_cmd "$dir"
+    SRUN_OPTS=""
+    run_step kill_resume "$dir"
+fi
+
+# ---------------------------------------------------------------------------
+# 4. EBCC: mixed sweep + compress, then the best kept EBCC pipeline via --pipeline
+# ---------------------------------------------------------------------------
+if [[ "$WITH_EBCC" == 1 ]]; then
+    for e in "${LIST[@]}"; do
+        parse "$e"
+        [[ "$CLASS" == ebcc ]] || continue
+        dir="$RESULTS_BASE/ebcc/$KEY"
+        sweep_and_compress "$dir" 15 && pipeline_step ebcc "$dir" "$dir/pipeline_ebcc"
+    done
+else
+    log "SKIP EBCC phase (WITH_EBCC=$WITH_EBCC)"
+fi
+
+# ---------------------------------------------------------------------------
+# 5. Heavy fields: sweep + compress while the walltime allows
+# ---------------------------------------------------------------------------
+if [[ "$HEAVY" != 0 ]]; then
+    for e in "${LIST[@]}"; do
+        parse "$e"
+        [[ "$CLASS" == heavy ]] && sweep_and_compress "$RESULTS_BASE/fields/$KEY" 75
+    done
+else
+    log "SKIP heavy fields (HEAVY=0)"
+fi
+
+# ---------------------------------------------------------------------------
+# 6. Validate every output
+# ---------------------------------------------------------------------------
+KEY=check; INPUT=""; VAR=""; L1=""
+CMD=(srun --unbuffered --nodes=1 --ntasks=1 python "$TEST_DIR/check_outputs.py" "$RESULTS_BASE")
+run_step check "$RESULTS_BASE"
+rc=$?
+log "steps:"
+cat "$STEPS"
+log "report: $RESULTS_BASE/test_report.md (checker exit status $rc)"
+exit "$rc"
