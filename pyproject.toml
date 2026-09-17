@@ -13,14 +13,15 @@ dependencies = [
     "xarray",
     "humanize",
     "streamlit",
-    "tslearn",
+    "scikit-learn",
+    "pandas",
+    "pyarrow",
     "scipy",
     "PyWavelets",
     "dask[complete]",
     "h5py >=3.11",
     "zarr >=3.1.1",
     "numcodecs",
-    "zarr-any-numcodecs >=0.1.3",
     "json5",
     "rich",
     "zfpy",
@@ -39,8 +40,16 @@ readme = {file = 'README.md', content-type = 'text/markdown'}
 requires-python = '>=3.11'
 version = '0.0'
 
+[project.optional-dependencies]
+# EBCC needs cmake, a C/C++ toolchain and HDF5 headers at build time.
+ebcc = ["ebcc[zarr] @ git+https://github.com/spcl/EBCC.git"]
+
 [project.scripts]
 dc_toolkit = 'dc_toolkit.cli:cli'
+
+[project.entry-points."zarr.codecs"]
+# Lets any zarr client with dc_toolkit + ebcc installed decode EBCC-compressed arrays.
+"numcodecs.ebcc_filter" = "dc_toolkit.utils:EBCC"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

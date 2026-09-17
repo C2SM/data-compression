@@ -7,6 +7,14 @@ pip install --upgrade pip
 pip install -e .
 CC=$(which mpicc) pip install --no-binary=mpi4py mpi4py
 
+# Optional: EBCC (Error Bounded Climate Compressor), enabled in dc_toolkit with
+# --with-ebcc.  Builds OpenJPEG + an HDF5 filter: needs cmake and HDF5 headers.
+#   WITH_EBCC=1 bash install_dc_toolkit.sh
+if [[ "${WITH_EBCC:-0}" == "1" ]]; then
+  echo "[install] Installing EBCC (optional serializer)..."
+  pip install "ebcc[zarr] @ git+https://github.com/spcl/EBCC.git"
+fi
+
 # Thread-pinning is no longer baked into the venv.  Export the codec-internal
 # thread caps manually (e.g. in your sbatch script):
 #

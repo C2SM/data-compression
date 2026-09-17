@@ -34,18 +34,20 @@
 #
 #   Alt C: multi-rank-per-node (32 ranks x 1 thread).
 #     Faster per combo, but each rank duplicates the sample buffer in
-#     memory.  At 5 GB samples that is 32 x 5 GB = 160 GB per node,
-#     which OOMs on R02B08 and R02B10.  Bypass 1x32 keeps memory at
-#     1 sample per node and tolerates the modest throughput loss vs
-#     pure MPI in exchange for not OOMing.
+#     memory, on top of the per-combo working set (~2x the sample:
+#     decoded copy + encoded store) that every evaluating thread or
+#     rank needs either way.  At 5 GB samples the duplicated inputs add
+#     32 x 5 GB = 160 GB per node, which OOMs on R02B08 and R02B10.
+#     Bypass 1x32 keeps ONE input sample per node (the tool prints the
+#     full model as [memory] and shrinks the sample if needed) and
+#     tolerates the modest throughput loss vs pure MPI.
 #
 # Verdict:  current setup is correct.  Do NOT bump --cpus-per-task,
 #          do NOT enable --codec-threads, do NOT switch topology
 #          without a fresh A/B test against this baseline.
 #
-# Codec space: the lossy family is covered via numcodecs.zarr3.ZFPY +
-# BitRound + Quantize, plus the lossless compressors.  (EBCC and
-# numcodecs-wasm have been removed from the toolkit.)
+# Codec space: the lossy family is covered via ZFPY + BitRound + Quantize +
+# FixedScaleOffset, plus the lossless compressors (see utils.py section 4).
 #
 # See docs/PARALLELIZATION.md for a thorough walkthrough of the
 # parallelism architecture used by every dc_toolkit command.
@@ -109,8 +111,10 @@ fi
 # File list
 # ---------------------------------------------------------------------------
 # Format:  <resolution>|<stream>|<filename>|<variable>|<l1_threshold>
-# L1 thresholds are in the variable's native units; rule of thumb ~0.5%
-# of typical std(field), aligned with Klöwer et al. (2021).
+# L1 thresholds are RELATIVE errors (sum|err| / sum|orig|), e.g. 5e-3 = 0.5 %;
+# the L2/Linf/bias gates default to 2x/10x/0.5x of it.  CHECK the values below:
+# they predate the switch to relative thresholds and read like native units
+# (1.0 for geopot/cape/sob_s would allow 100 % relative error).
 LIST=(
     # R02B06 backbone
     "R02B06|out_1_1|remap_qv_20230121T000000Z.nc|qv|5e-6"          # 3D water vapor (remap)

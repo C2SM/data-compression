@@ -1,10 +1,3 @@
-# ICON4Py - ICON inspired code in Python and GT4Py
-#
-# Copyright (c) 2022-2024, ETH Zurich and MeteoSwiss
-# All rights reserved.
-#
-# Please, refer to the LICENSE file in the root directory.
-# SPDX-License-Identifier: BSD-3-Clause
 """
 Library behind the ``dc_toolkit`` CLI.
 
@@ -12,18 +5,22 @@ Sections
   1. Sizes & dataset I/O
   2. Representative sampling      (which slices of a big field to score)
   3. Chunk & shard sizing         (zarr geometry, shared by eval and persist)
-  4. Codec spaces                 (compressor x filter x serializer grids)
+  4. Codec spaces & pipelines     (compressor x filter x serializer grids; EBCC optional;
+                                   a pipeline's JSON form is its identity in results and manifests)
   5. Zarr sync bypass             (per-thread event loops for the sweep)
   6. In-memory evaluation         (encode -> decode -> error metrics)
   7. Persistence                  (dask -> zarr LocalStore, optional verify)
   8. MPI, threads & topology
-  9. Result helpers, progress, timing
+  9. Progress & timing
 """
 import asyncio
 import atexit
+import importlib
+import json
 import math
 import os
 import re
+import struct
 import sys
 import threading
 import time
@@ -39,13 +36,23 @@ import dask
 import dask.array
 import humanize
 import numpy as np
-import pandas as pd
 import xarray as xr
 import zarr
 import zfpy
 from mpi4py import MPI
 from zarr.api.asynchronous import create_array as _zarr_async_create_array
 from zarr.codecs import numcodecs as zarrcodecs_nc
+from zarr.codecs.numcodecs._codecs import _NumcodecsArrayBytesCodec
+from zarr.registry import get_codec_class, register_codec
+
+# EBCC (Error Bounded Climate Compressor) is optional: pip install -e ".[ebcc]".
+os.environ.setdefault("EBCC_LOG_LEVEL", "4")  # the C library logs to stderr; 4 = errors only
+try:
+    importlib.import_module("ebcc.zarr_filter")  # registers "ebcc_filter" with numcodecs
+    from ebcc.filter_wrapper import EBCC_Filter
+    EBCC_AVAILABLE = True
+except ImportError:
+    EBCC_AVAILABLE = False
 
 
 class CombinationProducedNonFiniteError(Exception):
@@ -70,6 +77,13 @@ THREAD_ENV_VARS = (
     "OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS",
     "BLOSC_NTHREADS", "NUMBA_NUM_THREADS",
     "VECLIB_MAXIMUM_THREADS", "OMP_THREAD_LIMIT",
+)
+# Environment variables the EBCC C library reads at encode time; they change
+# the bytes it produces, so the sweep manifest records them.
+EBCC_ENV_VARS = (
+    "EBCC_INIT_BASE_ERROR_QUANTILE", "EBCC_ERROR_BOUND_SLACK", "EBCC_DISABLE_MEAN_ADJUSTMENT",
+    "EBCC_DISABLE_PURE_BASE_COMPRESSION_FALLBACK",
+    "EBCC_DISABLE_PURE_BASE_COMPRESSION_FALLBACK_CONSISTENCY", "EBCC_ERROR_BOUND_STRICT_MODE",
 )
 
 
@@ -103,14 +117,17 @@ def parse_size(size_str) -> int:
     return int(float(s))
 
 
-def open_zarr_memstore():
-    return zarr.storage.MemoryStore()
+def hsize(nbytes) -> str:
+    """Bytes -> '1.2 GiB'."""
+    return humanize.naturalsize(nbytes, binary=True)
 
 
 def open_zarr_localstore(path: str, read_only: bool = True):
-    """Open a zarr v3 LocalStore; returns (group, store).  Keep both alive."""
+    """Open a zarr v3 LocalStore; returns (group, store).  Keep both alive.
+    Reads the arrays' own metadata, so a store whose consolidated metadata is
+    stale (arrays added since) is listed correctly."""
     store = zarr.storage.LocalStore(path, read_only=read_only)
-    return zarr.open_group(store, mode="r" if read_only else "a"), store
+    return zarr.open_group(store, mode="r" if read_only else "a", use_consolidated=False), store
 
 
 def open_dataset(dataset_file: str, field_to_compress: Optional[str] = None, rank: int = 0):
@@ -135,10 +152,9 @@ def open_dataset(dataset_file: str, field_to_compress: Optional[str] = None, ran
         abort(1)
 
     if rank == 0:
-        click.echo(f"dataset.nbytes = {humanize.naturalsize(ds.nbytes, binary=True)}")
+        click.echo(f"dataset.nbytes = {hsize(ds.nbytes)}")
         if field_to_compress is not None:
-            click.echo(f"{field_to_compress}.nbytes = "
-                       f"{humanize.naturalsize(ds[field_to_compress].nbytes, binary=True)}")
+            click.echo(f"{field_to_compress}.nbytes = {hsize(ds[field_to_compress].nbytes)}")
     return ds
 
 
@@ -188,7 +204,7 @@ def _is_time_like_coord(da: xr.DataArray, dim: str) -> bool:
     units, std = m.get("units"), m.get("standard_name")
     if isinstance(units, str) and _CF_TIME_UNITS_RE.match(units):
         return True
-    if std in _CF_TIME_STANDARD_NAMES or m.get("axis") == "T" or "calendar" in m:
+    if (isinstance(std, str) and std in _CF_TIME_STANDARD_NAMES) or m.get("axis") == "T" or "calendar" in m:
         return True
     return bool(_TIME_LIKE_DIM_RE.match(dim))
 
@@ -231,15 +247,16 @@ def build_representative_sample(da: xr.DataArray, size_limit_bytes: int, rank: i
                                 vertical_floor: int | None = None) -> xr.DataArray:
     """
     Subset of `da` with nbytes <= size_limit_bytes, deterministic and
-    reproducible (evenly spaced indices along time/vertical dims).
+    reproducible (evenly spaced indices along time/vertical dims).  A field
+    without time/vertical dims is returned whole, with a warning, even above
+    the budget.
 
     policy="cascade": spend the budget on time steps first, keeping a
     budget-aware minimum of vertical levels.  policy="balanced": equal
     log-space split across all stride dims.  Raises SampleTooLargeError when
     a single horizontal slab does not fit.
     """
-    nbytes = int(da.dtype.itemsize) * int(np.prod(da.shape))
-    hsize = lambda b: humanize.naturalsize(b, binary=True)  # noqa: E731
+    nbytes = int(da.nbytes)
     if nbytes <= size_limit_bytes:
         if rank == 0:
             click.echo(f"[sample] field fits under limit ({hsize(nbytes)} <= "
@@ -385,12 +402,17 @@ def compute_chunk_shape_for_eval(shape, dtype, target_mib: int = 16, dims=None,
 
 
 def compute_chunk_and_shard_shape(shape, dtype, inner_mib: int = 16, shard_mib: int = 512,
-                                  dims=None, allow_spatial_split: bool = True):
-    """(inner_chunk_shape, shard_shape).  shard_shape is None when one inner
-    chunk already reaches the shard target (a shard would hold <= 1 chunk)."""
+                                  dims=None, allow_spatial_split: bool = True, inner_chunks=None):
+    """(inner_chunk_shape, shard_shape).  shard_shape is None when a shard
+    would hold fewer than two inner chunks: the chunk is at least half the
+    shard target, or the leading axis has fewer than two chunks.
+    `inner_chunks` forces the inner chunk shape (codecs with a fixed frame)."""
     itemsize = int(np.dtype(dtype).itemsize)
-    inner = _compute_inner_chunk_shape(shape, dtype, dims, int(inner_mib) * 2**20,
-                                       allow_spatial_split=allow_spatial_split)
+    if inner_chunks is not None:
+        inner = tuple(int(x) for x in inner_chunks)
+    else:
+        inner = _compute_inner_chunk_shape(shape, dtype, dims, int(inner_mib) * 2**20,
+                                           allow_spatial_split=allow_spatial_split)
     inner_bytes = itemsize * int(np.prod(inner))
     shard_target = int(shard_mib) * 2**20
     if inner_bytes == 0 or inner_bytes >= shard_target:
@@ -405,11 +427,12 @@ def compute_chunk_and_shard_shape(shape, dtype, inner_mib: int = 16, shard_mib: 
 
 
 # =============================================================================
-# 4. CODEC SPACES
+# 4. CODEC SPACES & PIPELINES
 # =============================================================================
-# Each space is a list of (index, codec-or-None).  Indices are what the sweep
-# records and what compress_with_optimal resolves, so the grids below and the
-# dtype-dependent parts must be rebuilt identically in both commands.
+# The sweep builds three lists of codec objects from the grids below (some
+# parameters depend on the field's dtype and value range).  A combination is
+# identified everywhere by its pipeline dict, the zarr JSON form of its three
+# codecs (see pipeline_to_dict), never by its position in these lists.
 
 # Compressors (bytes -> bytes)
 _BLOSC_CNAMES = ("lz4", "lz4hc", "zstd")
@@ -454,10 +477,12 @@ def _select_classes(classes, requested: str, kind: str):
 
 
 def compressor_space(da, with_lossy=True, compressor_class="all"):
-    """Lossless bytes->bytes compressors.  `da`/`with_lossy` are accepted for
-    signature symmetry only.  Byte shuffling is only available through Blosc's
+    """Lossless bytes->bytes compressors (`with_lossy` is accepted for
+    signature symmetry only).  Byte shuffling is only available through Blosc's
     own `shuffle` parameter (a standalone Shuffle codec breaks after a
-    compressing serializer)."""
+    compressing serializer); Blosc gets the field's item size as `typesize`
+    because zarr hands these codecs raw bytes, and shuffling single bytes is a
+    no-op."""
     classes, include_none = _select_classes(
         [zarrcodecs_nc.Blosc, zarrcodecs_nc.LZ4, zarrcodecs_nc.Zstd,
          zarrcodecs_nc.Zlib, zarrcodecs_nc.BZ2, zarrcodecs_nc.LZMA],
@@ -465,7 +490,7 @@ def compressor_space(da, with_lossy=True, compressor_class="all"):
     space = [None] if include_none else []
     for cls in classes:
         if cls is zarrcodecs_nc.Blosc:
-            space += [cls(cname=c, clevel=l, shuffle=s)
+            space += [cls(cname=c, clevel=l, shuffle=s, typesize=int(da.dtype.itemsize))
                       for c in _BLOSC_CNAMES for l in _BLOSC_CLEVELS for s in _BLOSC_SHUFFLES]
         elif cls is zarrcodecs_nc.LZ4:
             space += [cls(acceleration=a) for a in _LZ4_ACCELERATIONS]
@@ -477,7 +502,7 @@ def compressor_space(da, with_lossy=True, compressor_class="all"):
             space += [cls(level=l) for l in _BZ2_LEVELS]
         elif cls is zarrcodecs_nc.LZMA:
             space += [cls(preset=p) for p in _LZMA_PRESETS]
-    return list(enumerate(space))
+    return space
 
 
 def filter_space(da, with_lossy=True, filter_class="all", data_range=None):
@@ -489,10 +514,11 @@ def filter_space(da, with_lossy=True, filter_class="all", data_range=None):
         classes += [zarrcodecs_nc.BitRound, zarrcodecs_nc.Quantize, zarrcodecs_nc.FixedScaleOffset]
         if np.issubdtype(da.dtype, np.floating) and da.dtype.itemsize > 4:
             classes.append(zarrcodecs_nc.AsType)  # f64 -> f32 down-cast
-    if da.dtype.kind == "i":
+    if da.dtype.kind in "iu":
         if filter_class.lower() not in ("all", "delta", "none"):
-            click.echo(f"[filter_space] integer dtype {da.dtype}: only Delta is available; "
-                       f"ignoring --filter-class={filter_class}.", err=True)
+            if MPI.COMM_WORLD.Get_rank() == 0:
+                click.echo(f"[filter_space] integer dtype {da.dtype}: only Delta is available; "
+                           f"ignoring --filter-class={filter_class}.", err=True)
             filter_class = "all"
         classes = [zarrcodecs_nc.Delta]
     classes, include_none = _select_classes(classes, filter_class, "filter")
@@ -510,7 +536,7 @@ def filter_space(da, with_lossy=True, filter_class="all", data_range=None):
             space += [cls(**cfg) for cfg in fixed_scale_offset_configs(da, data_range=data_range)]
         elif cls is zarrcodecs_nc.AsType:
             space.append(cls(encode_dtype="float32", decode_dtype=str(da.dtype)))
-    return list(enumerate(space))
+    return space
 
 
 class ZFPYFlat(zarrcodecs_nc.ZFPY, codec_name="zfpy"):
@@ -525,10 +551,147 @@ class ZFPYFlat(zarrcodecs_nc.ZFPY, codec_name="zfpy"):
         return chunk_spec.prototype.buffer.from_bytes(out)
 
 
-def serializer_space(da, with_lossy=True, serializer_class="all"):
-    """Array->bytes serializers: PCodec always, ZFPY when lossy is allowed
-    (fixed-rate mode only for integer dtypes)."""
-    classes = [zarrcodecs_nc.PCodec] + ([zarrcodecs_nc.ZFPY] if with_lossy else [])
+# ---- EBCC (optional): JPEG 2000 base layer + error-bounded residual ----------
+# Compresses float32 (lat, lon) frames; each chunk must be exactly one tile of
+# the frame.  NaN/Inf or a tile that does not divide the frame make the C
+# library EXIT THE PROCESS, so callers validate before encoding (ebcc_tile,
+# ebcc_sweep_entries for the sweep, utils_cli.validate_pipeline for persist
+# and plots).
+# Maximum absolute error targets as fractions of the FULL field's value range
+# (the paper's 0.1 %..10 % band plus one decade below); EBCC's own floor is
+# range/65535 (uint16 base layer).
+_EBCC_ERROR_FRACTIONS = (1e-1, 3e-2, 1e-2, 3e-3, 1e-3, 3e-4, 1e-4)
+# Start of both EBCC rate-control searches (OpenJPEG rate = base_cr/2).  The
+# bisection bracket depends on it, so it shifts the achieved ratio by ~10 %; it
+# is part of the arglist, hence of the pipeline's identity.
+_EBCC_BASE_CR = 2.0
+# EBCC_MIN/MAX_INTERNAL_IMAGE_DIM in ebcc_codec.h: the C filter exits outside them.
+_EBCC_TILE_MIN, _EBCC_TILE_MAX = 32, 2047
+
+
+def _f32(bits) -> float:
+    """The float32 EBCC packs into a uint32 arglist entry."""
+    return struct.unpack("f", struct.pack("I", int(bits)))[0]
+
+
+class EBCC(_NumcodecsArrayBytesCodec, codec_name="ebcc_filter"):
+    """zarr v3 wrapper of ebcc.zarr_filter.EBCCZarrFilter; stored in zarr.json
+    as "numcodecs.ebcc_filter" with EBCC's integer arglist
+    [height, width, f32bits(base_cr), mode, f32bits(target)] where mode is
+    0 none / 1 max_error_target / 2 relative_error_target."""
+
+    def __init__(self, **codec_config):
+        if not EBCC_AVAILABLE:
+            raise ImportError("the EBCC serializer needs the ebcc package: pip install -e '.[ebcc]'")
+        arglist = list(codec_config.get("arglist") or [])
+        try:  # anything else makes the C library exit the process
+            mode = int(arglist[3])
+            ok = (mode in (0, 1, 2) and len(arglist) == (4 if mode == 0 else 5)
+                  and all(_EBCC_TILE_MIN <= int(v) <= _EBCC_TILE_MAX for v in arglist[:2])
+                  and all(math.isfinite(_f32(v)) and _f32(v) > 0 for v in arglist[2:3] + arglist[4:5]))
+        except (IndexError, TypeError, ValueError, struct.error):
+            ok = False
+        if not ok:
+            raise ValueError(f"EBCC arglist must be [height, width, base_cr bits, mode 0/1/2, target bits (modes 1, 2)] "
+                             f"with the tile sides in [{_EBCC_TILE_MIN}, {_EBCC_TILE_MAX}] and positive base_cr and "
+                             f"target; got {arglist}")
+        super().__init__(**codec_config)
+
+    @classmethod
+    def from_params(cls, height: int, width: int, target: float, mode: str = "max_error_target",
+                    base_cr: float = _EBCC_BASE_CR):
+        opts = EBCC_Filter(base_cr=base_cr, height=height, width=width,
+                           residual_opt=(mode, target)).hdf_filter_opts
+        return cls(arglist=[int(v) for v in opts])
+
+    @property
+    def arglist(self) -> list:
+        return [int(v) for v in self.codec_config["arglist"]]
+
+    @property
+    def height(self) -> int:
+        return self.arglist[0]
+
+    @property
+    def width(self) -> int:
+        return self.arglist[1]
+
+    def __repr__(self) -> str:
+        a = self.arglist
+        mode = {0: "none", 1: "max_error_target", 2: "relative_error_target"}.get(a[3], a[3])
+        target = f", {mode}={_f32(a[4]):g}" if len(a) > 4 else ""
+        return f"EBCC(height={a[0]}, width={a[1]}, base_cr={_f32(a[2]):g}{target})"
+
+
+register_codec("numcodecs.ebcc_filter", EBCC)
+
+
+def _ebcc_tile_size(n: int):
+    """Largest divisor of n within [32, 2047], or None."""
+    if n < _EBCC_TILE_MIN:
+        return None
+    if n <= _EBCC_TILE_MAX:
+        return n
+    return next((d for d in range(_EBCC_TILE_MAX, _EBCC_TILE_MIN - 1, -1) if n % d == 0), None)
+
+
+def ebcc_tile(da):
+    """((height, width), "") of the EBCC tile for `da`, or (None, reason).
+    The last two dims must be a horizontal (lat, lon) frame of a float field."""
+    if not EBCC_AVAILABLE:
+        return None, "the ebcc package is not installed"
+    if da.ndim < 2 or da.dtype.kind != "f":
+        return None, "needs a float field with at least 2 dims"
+    spatial = {name for _, name in _classify_sample_dims(da)[2]}
+    frame = tuple(da.dims[-2:])
+    if not all(d in spatial for d in frame):
+        return None, f"last two dims {frame} are not a (lat, lon) frame"
+    sizes = tuple(int(da.sizes[d]) for d in frame)
+    tile = (_ebcc_tile_size(sizes[0]), _ebcc_tile_size(sizes[1]))
+    if None in tile:
+        return None, f"no tile in [{_EBCC_TILE_MIN}, {_EBCC_TILE_MAX}] divides the frame {sizes}"
+    return tile, ""
+
+
+def ebcc_chunks(codec: EBCC, shape) -> Tuple[int, ...]:
+    """One EBCC tile per chunk: (1, ..., 1, height, width)."""
+    return (1,) * (len(shape) - 2) + (codec.height, codec.width)
+
+
+def ebcc_sweep_entries(filters, serializers, sample_np):
+    """Standalone (None, filter, EBCC) sweep triples for every EBCC serializer;
+    the filter is None for float32 and the AsType cast to float32 otherwise
+    (EBCC's own requirement, so it is added even when --filter-class left
+    AsType out of `filters`).  Returns (triples, reason) with triples empty
+    when EBCC cannot run on this sample."""
+    ebccs = [s for s in serializers if isinstance(s, EBCC)]
+    if not ebccs:
+        return [], ""
+    if not np.isfinite(sample_np).all():
+        return [], "the sample contains NaN/Inf, which EBCC cannot encode"
+    filt = None
+    if sample_np.dtype != np.float32:
+        astype = [f for f in filters if isinstance(f, zarrcodecs_nc.AsType)]
+        filt = astype[0] if astype else zarrcodecs_nc.AsType(encode_dtype="float32",
+                                                             decode_dtype=str(sample_np.dtype))
+    return [(None, filt, s) for s in ebccs], ""
+
+
+def serializer_space(da, with_lossy=True, serializer_class="all", with_ebcc=False, data_range=None):
+    """Array->bytes serializers: PCodec (plain bytes for 8-bit fields, which
+    pco refuses), ZFPY when lossy is allowed (floats; int32/int64 in fixed-rate
+    mode only; zfp takes no other integer dtype), EBCC when requested AND lossy is
+    allowed, for float (lat, lon) frame stacks.  `data_range` (full-field
+    min, max) scales the EBCC error targets; without it EBCC falls back to
+    targets relative to each tile's own range."""
+    if serializer_class.lower() == "ebcc":
+        with_ebcc = True
+    zfp_ok = da.dtype.kind == "f" or (da.dtype.kind == "i" and da.dtype.itemsize >= 4)
+    classes = [zarrcodecs_nc.PCodec] + ([zarrcodecs_nc.ZFPY] if with_lossy and zfp_ok else [])
+    if with_ebcc and with_lossy:
+        if not EBCC_AVAILABLE:
+            raise ValueError("--with-ebcc needs the ebcc package: pip install -e '.[ebcc]'")
+        classes.append(EBCC)
     classes, include_none = _select_classes(classes, serializer_class, "serializer")
     space = [None] if include_none else []
     for cls in classes:
@@ -545,7 +708,16 @@ def serializer_space(da, with_lossy=True, serializer_class="all"):
                 modes = modes[2:]
             space += [ZFPYFlat(mode=mode, **{param: fn(k)})
                       for mode, param, fn in modes for k in _ZFPY_K_GRID]
-    return list(enumerate(space))
+        elif cls is EBCC:
+            tile, _ = ebcc_tile(da)
+            if tile is not None:
+                span = float(data_range[1] - data_range[0]) if data_range else None
+                space += [EBCC.from_params(*tile, r * span) if span else
+                          EBCC.from_params(*tile, r, mode="relative_error_target")
+                          for r in _EBCC_ERROR_FRACTIONS]
+    if da.dtype.itemsize == 1:
+        space = [None] + [s for s in space if s is not None and not isinstance(s, zarrcodecs_nc.PCodec)]
+    return space
 
 
 def valid_keepbits_for_bitround(da):
@@ -613,9 +785,13 @@ def fixed_scale_offset_configs(da, data_range=None):
     return configs
 
 
-def combo_is_valid(filt, serializer) -> bool:
+def combo_is_valid(filt, serializer, compressor=None) -> bool:
     """Reject pairings that crash inside the codecs: FixedScaleOffset emits
-    unsigned ints, which ZFPY (non-fixed-rate modes) and 8-bit PCodec refuse."""
+    unsigned ints, which ZFPY (every mode) and 8-bit PCodec refuse.  EBCC runs
+    alone: a filter before it breaks its error bound (AsType's float32
+    down-cast excepted) and a compressor after it gains nothing."""
+    if isinstance(serializer, EBCC):
+        return compressor is None and (filt is None or isinstance(filt, zarrcodecs_nc.AsType))
     if isinstance(filt, zarrcodecs_nc.FixedScaleOffset):
         if isinstance(serializer, zarrcodecs_nc.ZFPY):
             return False
@@ -629,15 +805,59 @@ def combo_is_valid(filt, serializer) -> bool:
 
 def codec_pipeline_kwargs(compressor, filt, serializer) -> dict:
     """zarr.create_array kwargs for one (compressor, filter, serializer) triple.
-    A None component is omitted so zarr's own default applies (note: for the
-    compressor this means zarr's default Zstd, not "no compression")."""
-    kwargs = {}
-    if filt is not None:
-        kwargs["filters"] = [filt]
-    if compressor is not None:
-        kwargs["compressors"] = [compressor]
-    kwargs["serializer"] = "auto" if serializer is None else serializer
-    return kwargs
+    None means none: no filter, no compressor (zarr would otherwise default to
+    Zstd), and the plain bytes serializer."""
+    return {"filters": [filt] if filt is not None else None,
+            "compressors": [compressor] if compressor is not None else None,
+            "serializer": "auto" if serializer is None else serializer}
+
+
+# Our classes, used when a pipeline is rebuilt from its dict: ZFPYFlat must
+# replace zarr's stock ZFPY (same codec name in zarr.json); EBCC has no stock class.
+_CODEC_CLASSES = {"numcodecs.zfpy": ZFPYFlat, "numcodecs.ebcc_filter": EBCC}
+
+
+def codec_from_dict(d):
+    if d is None:
+        return None
+    cls = _CODEC_CLASSES.get(d["name"]) or get_codec_class(d["name"])
+    return cls.from_dict(d)
+
+
+def pipeline_to_dict(compressor, filt, serializer) -> dict:
+    """The identity of a combination: the zarr JSON form of its codecs."""
+    return {"compressor": None if compressor is None else compressor.to_dict(),
+            "filter": None if filt is None else filt.to_dict(),
+            "serializer": None if serializer is None else serializer.to_dict()}
+
+
+def pipeline_from_dict(d: dict):
+    """(compressor, filt, serializer) codec objects from pipeline_to_dict's output."""
+    missing = [k for k in ("compressor", "filter", "serializer") if k not in d]
+    if missing:
+        raise ValueError(f"pipeline dict lacks {missing}; expected keys compressor, filter, serializer")
+    return codec_from_dict(d["compressor"]), codec_from_dict(d["filter"]), codec_from_dict(d["serializer"])
+
+
+def pipeline_json(compressor, filt, serializer) -> str:
+    """Canonical one-line JSON of a pipeline (the key used by --resume)."""
+    return json.dumps(pipeline_to_dict(compressor, filt, serializer), sort_keys=True, separators=(",", ":"))
+
+
+def codec_label(codec) -> str:
+    """Short human-readable form: 'blosc(clevel=1, cname=lz4, shuffle=0)' (keys
+    sorted, so the label does not depend on where the codec came from); '-' for None."""
+    if codec is None:
+        return "-"
+    if isinstance(codec, EBCC):
+        return repr(codec)
+    d = codec.to_dict()
+    name = d["name"].removeprefix("numcodecs.")
+    return f"{name}({', '.join(f'{k}={v}' for k, v in sorted(d['configuration'].items()))})"
+
+
+def pipeline_name(compressor, filt, serializer) -> str:
+    return " | ".join(codec_label(c) for c in (compressor, filt, serializer))
 
 
 # =============================================================================
@@ -652,14 +872,26 @@ def codec_pipeline_kwargs(compressor, filt, serializer) -> dict:
 _thread_local_loops = threading.local()
 _shared_executor = None
 _shared_executor_lock = threading.Lock()
+_thread_loops = []  # every per-thread loop, so that AsyncBypass.close_loops can release them
+
+
+class _SharedExecutor(ThreadPoolExecutor):
+    """The default executor of every per-thread loop.  Closing a loop (which
+    happens when a finished worker thread's loop is garbage-collected) shuts
+    its default executor down; on the shared pool that would fail every combo
+    of the following variables, so shutdown requests are ignored.  The
+    interpreter's exit hook still stops the workers."""
+
+    def shutdown(self, wait=True, *, cancel_futures=False):
+        pass
 
 
 def _get_or_create_shared_executor(max_workers: int) -> ThreadPoolExecutor:
     global _shared_executor
     with _shared_executor_lock:
         if _shared_executor is None:
-            _shared_executor = ThreadPoolExecutor(max_workers=max(1, int(max_workers)),
-                                                  thread_name_prefix="bypass_codec")
+            _shared_executor = _SharedExecutor(max_workers=max(1, int(max_workers)),
+                                               thread_name_prefix="bypass_codec")
     return _shared_executor
 
 
@@ -671,6 +903,8 @@ def _get_thread_event_loop() -> asyncio.AbstractEventLoop:
         if _shared_executor is not None:
             loop.set_default_executor(_shared_executor)
         _thread_local_loops.loop = loop
+        with _shared_executor_lock:
+            _thread_loops.append(loop)
     return loop
 
 
@@ -684,6 +918,16 @@ class AsyncBypass:
         cls.enabled = True
         cls.threads_per_rank = max(1, int(threads_per_rank))
         _get_or_create_shared_executor(cls.threads_per_rank)
+
+    @classmethod
+    def close_loops(cls) -> None:
+        """Close the loops of worker threads that are gone (a selector and a
+        socket pair each); call after a thread pool has been shut down."""
+        with _shared_executor_lock:
+            loops, _thread_loops[:] = list(_thread_loops), []
+        for loop in loops:
+            if not loop.is_running():
+                loop.close()
 
     @classmethod
     def run(cls, coro):
@@ -713,11 +957,32 @@ def _iter_chunk_slices(shape, chunk_shape):
         yield tuple(slice(st, min(st + c, s)) for st, c, s in zip(start, chunk_shape, shape))
 
 
+def within_limit(value, limit) -> bool:
+    """Gate predicate: a None value or a None/+inf limit passes."""
+    if value is None or limit is None or not math.isfinite(limit):
+        return True
+    return float(value) <= float(limit)
+
+
+# (metric key, threshold key) of the cheap gates that the gradient precheck
+# and utils_cli.evaluate_gates share.
+CHEAP_GATES = (("Relative_Error_L1", "l1"), ("Relative_Error_L2", "l2"),
+               ("Relative_Error_Linf", "linf"), ("Bias_Rel", "bias"))
+
+
+def _rel(err, ori) -> float:
+    """Relative error; 0/0 is 0 (a zero field reproduced exactly), x/0 is inf."""
+    if ori == 0:
+        return 0.0 if err == 0 else float("inf")
+    return float(err) / float(ori)
+
+
 # FixedScaleOffset casts NaN fill cells to int and numpy warns; fill cells are
 # masked out of every norm, so the warning is noise.  (A real FSO overflow is
 # silent and guarded by full_field_data_range + the verify gate instead.)
-_IGNORE_CAST_WARNING = dict(action="ignore", message="invalid value encountered in cast",
-                            category=RuntimeWarning)
+# Installed once: warnings.catch_warnings() is not thread-safe, and the sweep
+# encodes from many threads.
+warnings.filterwarnings("ignore", message="invalid value encountered in cast", category=RuntimeWarning)
 
 
 async def _zarr_roundtrip(sample_np, dims, codec_kwargs, chunks):
@@ -727,14 +992,53 @@ async def _zarr_roundtrip(sample_np, dims, codec_kwargs, chunks):
             store=zarr.storage.MemoryStore(), name="_tmp_eval",
             shape=sample_np.shape, dtype=sample_np.dtype, chunks=chunks,
             zarr_format=3, dimension_names=tuple(dims), **codec_kwargs)
-    with Timer("eval.encode"), warnings.catch_warnings():
-        warnings.filterwarnings(**_IGNORE_CAST_WARNING)
+    with Timer("eval.encode"):
         await z.setitem(Ellipsis, sample_np)
     with Timer("eval.info_complete"):
         count_bytes, count_bytes_stored = _info_bytes(await z.info_complete())
     with Timer("eval.decode"):
         decoded = await z.getitem(Ellipsis)
+    await z.store.clear()  # free the encoded bytes now; the array object can outlive this call in a GC cycle
     return decoded, count_bytes / count_bytes_stored
+
+
+def _error_sums(sample_np, decoded, chunks, q99_abs):
+    """Chunk-wise accumulators behind evaluate_codec_pipeline's norms, over the
+    cells finite in both arrays: (l1_err, l2_err_sq, linf_err, signed_err,
+    l1_ori, l2_ori_sq, linf_ori, q99_err, q99_ori, n_valid, n_corrupt,
+    decoded_min, decoded_max).  `q99_abs` None skips the tail sums."""
+    l1_err = l2_err_sq = linf_err = signed_err = 0.0
+    l1_ori = l2_ori_sq = linf_ori = 0.0
+    q99_err = q99_ori = 0.0
+    n_valid = n_corrupt = 0
+    decoded_min, decoded_max = math.inf, -math.inf
+    with np.errstate(invalid="ignore"):
+        for sl in _iter_chunk_slices(sample_np.shape, chunks):
+            orig, dec = sample_np[sl], decoded[sl]
+            finite_orig, finite_dec = np.isfinite(orig), np.isfinite(dec)
+            n_corrupt += int(np.count_nonzero(finite_orig & ~finite_dec))
+            valid = finite_orig & finite_dec
+            nv = int(np.count_nonzero(valid))
+            if nv == 0:
+                continue
+            n_valid += nv
+            # Two float64 temporaries per chunk (the boolean index already copied):
+            # e = decoded - orig, then |e| and |orig| in place.
+            o_abs = orig[valid].astype(np.float64, copy=False)
+            e_abs = dec[valid].astype(np.float64, copy=False)
+            decoded_min, decoded_max = min(decoded_min, float(e_abs.min())), max(decoded_max, float(e_abs.max()))
+            e_abs -= o_abs
+            signed_err += float(e_abs.sum()); l2_err_sq += float(np.dot(e_abs, e_abs))
+            np.abs(e_abs, out=e_abs); np.abs(o_abs, out=o_abs)
+            l1_err += float(e_abs.sum()); linf_err = max(linf_err, float(e_abs.max(initial=0.0)))
+            l1_ori += float(o_abs.sum()); l2_ori_sq += float(np.dot(o_abs, o_abs))
+            linf_ori = max(linf_ori, float(o_abs.max(initial=0.0)))
+            if q99_abs is not None:
+                ext = o_abs >= q99_abs
+                if ext.any():
+                    q99_err += float(e_abs[ext].sum()); q99_ori += float(o_abs[ext].sum())
+    return (l1_err, l2_err_sq, linf_err, signed_err, l1_ori, l2_ori_sq, linf_ori, q99_err, q99_ori,
+            n_valid, n_corrupt, decoded_min, decoded_max)
 
 
 def evaluate_codec_pipeline(sample_np: np.ndarray, dims, codec_kwargs: dict, chunks,
@@ -748,95 +1052,63 @@ def evaluate_codec_pipeline(sample_np: np.ndarray, dims, codec_kwargs: dict, chu
     norm.  Cells finite in the original but non-finite after decode are
     corruption: excluded from the norms and counted in N_Corrupt.
 
-    The gradient metric needs a second decode, so with `precheck_thresholds`
-    it is skipped for combos that already fail a cheap gate (L1/L2/Linf/bias).
+    The gradient metric is one more pass over the sample, so with
+    `precheck_thresholds` it is skipped for combos that already fail a cheap
+    gate (L1/L2/Linf/bias).  The decoded buffer is freed right after.
     """
     decoded, ratio = AsyncBypass.run(_zarr_roundtrip(sample_np, dims, codec_kwargs, chunks))
-
+    want_q99 = q99_abs is not None and math.isfinite(q99_abs)
     with Timer("eval.metrics"):
-        l1_err = l2_err_sq = linf_err = signed_err = 0.0
-        l1_ori = l2_ori_sq = linf_ori = 0.0
-        q99_err = q99_ori = 0.0
-        n_valid = n_corrupt = 0
-        decoded_min, decoded_max = math.inf, -math.inf
-        want_q99 = q99_abs is not None and math.isfinite(q99_abs)
-
-        with np.errstate(invalid="ignore"):
-            for sl in _iter_chunk_slices(sample_np.shape, chunks):
-                orig, dec = sample_np[sl], decoded[sl]
-                finite_orig, finite_dec = np.isfinite(orig), np.isfinite(dec)
-                n_corrupt += int(np.count_nonzero(finite_orig & ~finite_dec))
-                valid = finite_orig & finite_dec
-                nv = int(np.count_nonzero(valid))
-                if nv == 0:
-                    continue
-                n_valid += nv
-                o = orig[valid].astype(np.float64, copy=False)
-                d = dec[valid].astype(np.float64, copy=False)
-                e = d - o
-                e_abs, o_abs = np.abs(e), np.abs(o)
-                l1_err += float(e_abs.sum()); l2_err_sq += float((e * e).sum())
-                linf_err = max(linf_err, float(e_abs.max(initial=0.0)))
-                signed_err += float(e.sum())
-                l1_ori += float(o_abs.sum()); l2_ori_sq += float((o_abs * o_abs).sum())
-                linf_ori = max(linf_ori, float(o_abs.max(initial=0.0)))
-                decoded_min, decoded_max = min(decoded_min, float(d.min())), max(decoded_max, float(d.max()))
-                if want_q99:
-                    ext = o_abs >= q99_abs
-                    if ext.any():
-                        q99_err += float(e_abs[ext].sum()); q99_ori += float(o_abs[ext].sum())
-        del decoded
-        if not all(map(math.isfinite, (l1_err, l2_err_sq, linf_err))):
-            raise CombinationProducedNonFiniteError(
-                f"non-finite error accumulators after masking "
-                f"(l1_err={l1_err}, l2_err_sq={l2_err_sq}, linf_err={linf_err})")
+        (l1_err, l2_err_sq, linf_err, signed_err, l1_ori, l2_ori_sq, linf_ori, q99_err, q99_ori,
+         n_valid, n_corrupt, decoded_min, decoded_max) = _error_sums(sample_np, decoded, chunks,
+                                                                     q99_abs if want_q99 else None)
+    if not all(map(math.isfinite, (l1_err, l2_err_sq, linf_err))):
+        raise CombinationProducedNonFiniteError(
+            f"non-finite error accumulators after masking "
+            f"(l1_err={l1_err}, l2_err_sq={l2_err_sq}, linf_err={linf_err})")
 
     l2_err, l2_ori = math.sqrt(l2_err_sq), math.sqrt(l2_ori_sq)
-    rel = lambda a, b: float(a) / float(b) if b != 0 else float("inf")  # noqa: E731
     errors = {
-        "Relative_Error_L1": rel(l1_err, l1_ori),
-        "Relative_Error_L2": rel(l2_err, l2_ori),
-        "Relative_Error_Linf": rel(linf_err, linf_ori),
-        "Bias_Rel": rel(abs(signed_err), l1_ori),
+        "Relative_Error_L1": _rel(l1_err, l1_ori),
+        "Relative_Error_L2": _rel(l2_err, l2_ori),
+        "Relative_Error_Linf": _rel(linf_err, linf_ori),
+        "Bias_Rel": _rel(abs(signed_err), l1_ori),
         "Decoded_Min": decoded_min if n_valid else float("nan"),
         "Decoded_Max": decoded_max if n_valid else float("nan"),
         "N_Corrupt": int(n_corrupt),
         "N_Valid": int(n_valid),
-        "Q99_Rel": rel(q99_err, q99_ori) if want_q99 else None,
+        "Q99_Rel": _rel(q99_err, q99_ori) if want_q99 else None,
     }
 
     do_grad = compute_gradient
     if compute_gradient and precheck_thresholds is not None:
-        def passes(val, lim):
-            return True if (val is None or lim is None or not math.isfinite(lim)) else float(val) <= float(lim)
-        do_grad = (passes(errors["Relative_Error_L1"], precheck_thresholds.get("l1"))
-                   and passes(errors["Relative_Error_L2"], precheck_thresholds.get("l2"))
-                   and passes(errors["Relative_Error_Linf"], precheck_thresholds.get("linf"))
-                   and passes(errors["Bias_Rel"], precheck_thresholds.get("bias")))
-    if do_grad:
-        decoded2, _ = AsyncBypass.run(_zarr_roundtrip(sample_np, dims, codec_kwargs, chunks))
-        errors["Grad_Rel"] = _gradient_rel_l1(sample_np, decoded2, axes=gradient_axes)
-        del decoded2
-    else:
-        errors["Grad_Rel"] = None
+        do_grad = all(within_limit(errors[m], precheck_thresholds.get(t)) for m, t in CHEAP_GATES)
+    errors["Grad_Rel"] = _gradient_rel_l1(sample_np, decoded, axes=gradient_axes) if do_grad else None
     return ratio, errors, l2_err
 
 
 def _gradient_rel_l1(orig: np.ndarray, decoded: np.ndarray, axes=None) -> float:
     """Sum|d(decoded) - d(orig)| / Sum|d(orig)| over finite differences along
-    `axes` (default: every axis but the leading one)."""
+    `axes` (default: every axis but the leading one).  Differences that do not
+    run along the leading axis are taken over blocks of leading indices (about
+    32 MiB of float64 each), so the temporaries do not grow with the sample."""
     if axes is None:
         axes = tuple(range(1, orig.ndim)) if orig.ndim > 1 else (0,)
+    axes = tuple(ax % orig.ndim for ax in axes)
+    n = orig.shape[0]
+    step = max(1, n) if 0 in axes else max(1, (32 << 20) // (8 * max(1, int(np.prod(orig.shape[1:])))))
     err_sum = ori_sum = 0.0
     with np.errstate(invalid="ignore"):
-        for ax in axes:
-            do = np.diff(orig.astype(np.float64, copy=False), axis=ax)
-            dd = np.diff(decoded.astype(np.float64, copy=False), axis=ax)
-            m = np.isfinite(do) & np.isfinite(dd)
-            if m.any():
-                err_sum += float(np.abs(dd[m] - do[m]).sum())
-                ori_sum += float(np.abs(do[m]).sum())
-            del do, dd, m
+        for start in range(0, n, step):
+            o = orig[start:start + step].astype(np.float64, copy=False)
+            d = decoded[start:start + step].astype(np.float64, copy=False)
+            for ax in axes:
+                do, dd = np.diff(o, axis=ax), np.diff(d, axis=ax)
+                m = np.isfinite(do) & np.isfinite(dd)
+                if m.any():
+                    err_sum += float(np.abs(dd[m] - do[m]).sum())
+                    ori_sum += float(np.abs(do[m]).sum())
+                del do, dd, m
     if ori_sum == 0:
         return 0.0 if err_sum == 0 else float("inf")
     return err_sum / ori_sum
@@ -847,8 +1119,7 @@ def _gradient_rel_l1(orig: np.ndarray, decoded: np.ndarray, axes=None) -> float:
 # =============================================================================
 
 def persist_with_codec_pipeline(da, store, component: str, codec_kwargs: dict,
-                                inner_chunks=None, shards=None, verify: bool = True,
-                                verbose: bool = True, rank: int = 0, q99_abs=None):
+                                inner_chunks=None, shards=None, verify: bool = True, q99_abs=None):
     """
     Write dask-backed `da` into `store` at `component` via dask.array.to_zarr.
     Returns (compression_ratio, errors, euclidean_distance); the last two are
@@ -866,66 +1137,58 @@ def persist_with_codec_pipeline(da, store, component: str, codec_kwargs: dict,
     if shards is not None:
         zarr_kwargs["shards"] = shards
 
-    with Timer("dask.array.to_zarr"), warnings.catch_warnings():
-        warnings.filterwarnings(**_IGNORE_CAST_WARNING)
+    with Timer("dask.array.to_zarr"):
         dask.array.to_zarr(da.data.rechunk(write_unit), store, component=component,
                            overwrite=True, compute=True, **zarr_kwargs)
 
-    z = zarr.open_group(store, mode="r")[component]
-    info = z.info_complete()
-    count_bytes, count_bytes_stored = _info_bytes(info)
+    # use_consolidated=False: a store consolidated by an earlier run does not list this array yet.
+    z = zarr.open_group(store, mode="r", use_consolidated=False)[component]
+    count_bytes, count_bytes_stored = _info_bytes(z.info_complete())
     ratio = count_bytes / count_bytes_stored
-    if verbose and rank == 0:
-        click.echo("-" * 80); click.echo(info)
 
     errors = euclidean_distance = None
     if verify:
         with Timer("compute_errors_distances"):
-            report, errors, euclidean_distance, _ = compute_errors_distances(
+            errors, euclidean_distance = compute_errors_distances(
                 dask.array.from_zarr(z, chunks=write_unit), da.data, q99_abs=q99_abs)
-        if verbose and rank == 0:
-            click.echo("-" * 80); click.echo(report)
-            click.echo("-" * 80); click.echo(f"Euclidean Distance: {euclidean_distance}")
-            click.echo("-" * 80)
     return ratio, errors, euclidean_distance
 
 
 def compute_errors_distances(da_compressed, da, q99_abs=None):
-    """Dask-lazy error norms between two arrays, masked like
-    evaluate_codec_pipeline.  Returns (report_str, errors, l2_error, rel_l2)."""
+    """Error norms between two dask arrays (one dask.compute), masked like
+    evaluate_codec_pipeline and with the same keys except N_Valid and Grad_Rel.
+    Returns (errors, l2_error)."""
+    da, da_compressed = da.astype(np.float64), da_compressed.astype(np.float64)  # integer squares would wrap
     finite_orig, finite_dec = np.isfinite(da), np.isfinite(da_compressed)
     valid = finite_orig & finite_dec
     o = dask.array.where(valid, da, 0)
+    dec = dask.array.where(valid, da_compressed, np.nan)  # NaN outside the valid cells
     err = dask.array.where(valid, da_compressed, 0) - o
     reductions = [
         np.abs(err).sum(), np.abs(o).sum(),
         np.sqrt((err ** 2).sum()), np.sqrt((o ** 2).sum()),
         np.abs(err).max(), np.abs(o).max(),
         err.sum(), (finite_orig & ~finite_dec).sum(),
+        dask.array.nanmin(dec), dask.array.nanmax(dec),
     ]
     if q99_abs is not None:
         tail = np.abs(o) >= float(q99_abs)
         reductions += [dask.array.where(tail, np.abs(err), 0.0).sum(),
                        dask.array.where(tail, np.abs(o), 0.0).sum()]
-    computed = dask.compute(*reductions)
-    l1e, l1o, l2e, l2o, linfe, linfo, signed, ncorrupt = computed[:8]
-
-    def rel(e, o):
-        if o == 0:
-            return 0.0 if e == 0 else float("inf")
-        return float(e) / float(o)
-
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message="All-NaN slice encountered")
+        computed = dask.compute(*reductions)
+    l1e, l1o, l2e, l2o, linfe, linfo, signed, ncorrupt, dmin, dmax = computed[:10]
     errors = {
-        "Relative_Error_L1": rel(l1e, l1o),
-        "Relative_Error_L2": rel(l2e, l2o),
-        "Relative_Error_Linf": rel(linfe, linfo),
-        "Bias_Rel": rel(abs(float(signed)), l1o),
+        "Relative_Error_L1": _rel(l1e, l1o),
+        "Relative_Error_L2": _rel(l2e, l2o),
+        "Relative_Error_Linf": _rel(linfe, linfo),
+        "Bias_Rel": _rel(abs(float(signed)), l1o),
+        "Decoded_Min": float(dmin), "Decoded_Max": float(dmax),
         "N_Corrupt": int(ncorrupt),
-        "Q99_Rel": rel(computed[8], computed[9]) if q99_abs is not None else None,
+        "Q99_Rel": _rel(computed[10], computed[11]) if q99_abs is not None else None,
     }
-    report = "\n".join(f"{k:20s}: {v:.3e}" if isinstance(v, float) else f"{k:20s}: {v}"
-                       for k, v in errors.items())
-    return report, errors, l2e, errors["Relative_Error_L2"]
+    return errors, l2e
 
 
 # =============================================================================
@@ -1004,42 +1267,17 @@ def check_thread_oversubscription(abort_if_unsafe: bool = True, rank: int = 0, c
             comm.Abort(1)
     if not AsyncBypass.enabled:
         try:
-            if detect_node_topology(comm)[1] > 1:
+            node_comm, ranks_on_node, _ = detect_node_topology(comm)
+            node_comm.Free()
+            if ranks_on_node > 1:
                 zarr.config.set({"threading.max_workers": 1})
         except Exception:
             pass
 
 
 # =============================================================================
-# 9. RESULT HELPERS, PROGRESS, TIMING
+# 9. PROGRESS & TIMING
 # =============================================================================
-
-def get_indexes(arr, indices) -> np.ndarray:
-    """Map codec repr strings back to their integer index using a
-    config_space_{var}.csv column ("(idx, repr)" strings); -1 for "None" or
-    unknown reprs (warned).  Used for plot hover labels."""
-    codec_id = {}
-    for ind in indices:
-        idx_str, codec_repr = str(ind)[1:-1].split(", ", 1)
-        codec_id[codec_repr] = int(idx_str)
-    ids, unknown = [], 0
-    for item in arr:
-        if item == "None":
-            ids.append(-1)
-        elif item in codec_id:
-            ids.append(codec_id[item])
-        else:
-            ids.append(-1); unknown += 1
-    if unknown:
-        click.echo(f"[get_indexes] WARNING: {unknown} codec repr(s) not found in the config-space "
-                   f"CSV (labelled -1).  Are the .npy and CSV from the same evaluate_combos run?",
-                   err=True)
-    return np.asarray(ids, dtype=int)
-
-
-def slice_array(arr: pd.array, indices_ls: list) -> np.ndarray:
-    return np.hstack(tuple(arr[[ind]] for ind in indices_ls))
-
 
 _PROGRESS_LOCK = threading.Lock()
 _PROGRESS_COUNTERS = defaultdict(int)
