@@ -88,13 +88,51 @@ So 32 is the right number for this hardware and workload. It's also coincidental
 
 The codec libraries themselves can use multiple threads inside a single encode call (Blosc has built-in support; zfp uses OpenMP). The `--codec-threads N` flag exposes this. We tested it; it doesn't help on production-size files for the same memory-bandwidth reason. Leave at the default (1) unless you have a specific reason and can A/B-test the change.
 
+### Memory: what the threads actually save over ranks
+
+The sample is genuinely shared. Rank 0 builds it, broadcasts it, and every rank then holds exactly **one** `sample_np` buffer (`sweep_build_sample`). That buffer is captured once by the closure in `sweep_evaluators` and handed unchanged to every combo, so all 32 threads read the same memory. Nothing copies it along the way:
+
+- `z.setitem(Ellipsis, sample_np)` — zarr reads chunk-shaped *views* out of it.
+- `_error_sums` slices it with `sample_np[sl]` — basic slicing, views again.
+- `_gradient_rel_l1` walks it in slabs with `astype(..., copy=False)`.
+
+It is read-only for the whole sweep, so sharing it costs nothing and needs no lock.
+
+What is *not* shared is the working set of the combo each thread has in flight:
+
+| Per-thread allocation | Size | Lives until |
+|---|---|---|
+| its own `MemoryStore` holding the encoded bytes | sample / ratio | `store.clear()`, right after the decode |
+| **the decoded array** from `z.getitem(Ellipsis)` | **1 × sample, full size** | the end of the combo |
+| float64 temporaries from the boolean-indexed metric loop | ~2 × inner chunk | per chunk |
+
+So the shape of it is *one shared read-only input, plus a private full-size decoded buffer per in-flight thread* — not "shared memory, each thread taking a chunk". Only the metric loop and the codec calls work chunk-wise; `getitem(Ellipsis)` materializes the whole sample. Measured, the per-thread working set comes to about twice the sample (`PER_THREAD_WORKING_FACTOR = 2.0`).
+
+That makes the comparison against the alternative — 32 single-threaded ranks on the same node — arithmetic. Both under the same model (`per_rank_steady_estimate_bytes`), with S the sample and 16 MiB inner chunks:
+
+```
+32 threads, 1 rank:     S + 32 × 2 × S + 32 × 32 MiB  =  65 × S + 1 GiB
+32 ranks, 1 thread:    32 × (S + 2 × S + 32 MiB)      =  96 × S + 1 GiB
+```
+
+For a 5 GB sample that is **~325 GB against ~480 GB**: a saving of about **1.5×, a third of the footprint — not 32×**. Read the other way round, for a fixed cgroup budget the thread model fits a sample roughly 1.5× larger before `sweep_sample_limit` starts shrinking it.
+
+The gain is this modest because the decoded buffer is irreducible. *Any* scheme that evaluates 32 combos at once on one node pays 32 full-size decoded copies; threading removes one of the three copies per worker, not 31 of 32. Sharing the sample is a real saving, but it was never the dominant term.
+
+Two more entries belong in the same ledger, and both favour threads by more than the memory does:
+
+- **Interconnect.** One sample `Bcast` per rank per variable. 32 ranks/node means 32× the traffic into each node, for bytes that are byte-identical within it.
+- **Wall-clock.** 32 threads on stock zarr were ~5× *slower* than 32 ranks (see Layer 2 above). The bypass is what makes the memory saving free instead of paid for in run time.
+
+For the record, the OOM that motivated all this was worse than the 96 × S above, and only partly about ranks: the first MPI version had no sampling at all. Every rank opened the file itself, materialized the **whole field** into `zarr.create_array(data=...)`, then called `z[:]` twice (once for the error norms, once for the DWT distance) — roughly 3–4× the full field per rank, times the number of ranks. Sampling and a single decode removed most of that; sharing the sample across threads is the remaining third.
+
 ### Summary for `evaluate_combos`
 
 ```
 8 nodes × 32 threads × 1 codec-thread/encode = 256 cores of effective parallelism
 ```
 
-Memory: each node holds one copy of the input sample (the bypass is what made this possible — the alternative of 32 ranks per node would duplicate it 32 times), plus a working set per thread of about twice the sample: the decoded copy and the encoded in-memory store of the combo it is evaluating. The tool prints this model as `[memory]` at startup (`sample × (1 + 2 × threads) + threads × 2 × inner-chunk`, about 325 GB for a 5 GB sample and 32 threads) and shrinks the sample when it does not fit `--memory-threshold ×` the node or cgroup budget.
+Memory: each node holds one copy of the input sample, shared read-only by the 32 threads (the bypass is what made this possible), plus a working set per thread of about twice the sample: the decoded copy and the encoded in-memory store of the combo it is evaluating. The tool prints this model as `[memory]` at startup (`sample × (1 + 2 × threads) + threads × 2 × inner-chunk`, about 325 GB for a 5 GB sample and 32 threads) and shrinks the sample when it does not fit `--memory-threshold ×` the node or cgroup budget. Against 32 ranks per node that model comes out about 1.5× smaller, not 32× smaller — see the memory section above for the arithmetic.
 
 ---
 
@@ -179,7 +217,7 @@ These commands are intentionally simple. They run on a login node or a small int
 
 To keep the parallelism behaving correctly, the toolkit enforces some invariants at startup. Most of the time you don't need to think about them, but they're worth being aware of:
 
-- **One MPI rank per node** is the default for `evaluate_combos`. Multi-rank-per-node would duplicate the sample buffer once per rank and OOM on large fields.
+- **One MPI rank per node** is the default for `evaluate_combos`. Multi-rank-per-node duplicates the sample buffer once per rank: at 32 ranks the node model is 96 × sample against 65 × sample for 32 threads, so the sweep has to shrink the sample by the same ~1.5× to stay inside the budget. `--allow-multi-rank-per-node` lifts the guard and prints a note that each rank holds its own copy.
 - **Codec env vars must be pinned to 1**:
   ```bash
   export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 \
