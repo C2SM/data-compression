@@ -244,8 +244,10 @@ for p in ("zarr", "numcodecs", "numpy", "dask", "xarray", "pandas", "pyarrow", "
 sys.exit(0 if path.startswith(repo + os.sep) and importlib.util.find_spec("dc_toolkit.utils_cli") else 1)
 EOF
 
-CMD=(srun --unbuffered --nodes="${SLURM_JOB_NUM_NODES:-1}" --ntasks="${SLURM_JOB_NUM_NODES:-1}" \
-     --cpus-per-task="$SRUN_CPUS_PER_TASK" bash -c 'echo "$(hostname): nproc=$(nproc) cgroup memory.max=$(cat /sys/fs/cgroup/memory.max 2>/dev/null || cat /sys/fs/cgroup/memory/memory.limit_in_bytes 2>/dev/null || echo n/a)"')
+# nproc honours OMP_NUM_THREADS, which is pinned to 1 above, and the task's own
+# memory.max reads "max"; the real limit sits on the job-level cgroup.
+CMD=(srun --unbuffered --ntasks-per-node=1 bash -c 'cg=$(cut -d: -f3 /proc/self/cgroup | head -1)
+     echo "$(hostname): nproc=$(env -u OMP_NUM_THREADS -u OMP_THREAD_LIMIT nproc) cgroup memory.max=$(cat /sys/fs/cgroup${cg%%/step_*}/memory.max 2>/dev/null || echo n/a)"')
 run_step nodes "$RESULTS_BASE"
 CMD=(srun --unbuffered --nodes=1 --ntasks=1 dc_toolkit --help)
 run_step cli_help "$RESULTS_BASE" || { log "FATAL: dc_toolkit does not start under srun"; exit 1; }
