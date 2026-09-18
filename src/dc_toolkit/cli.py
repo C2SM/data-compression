@@ -214,7 +214,8 @@ _VERIFY_THRESHOLD_OPTIONS = [
                    "or results_{var}.parquet in WHERE_TO_WRITE).")
 @click.option("--pipeline", default=None,
               help="Write the --vars fields with this pipeline instead of the sweep's best: a JSON object "
-                   "with compressor, filter and serializer (as in manifest_{var}.json), or @file.")
+                   "with compressor, filter and serializer, or the path of a file holding one; a "
+                   "manifest_{var}.json works directly.")
 @utils_cli.add_options(_PERSIST_OPTIONS)
 @utils_cli.add_options(_VERIFY_OPTIONS)
 @utils_cli.add_options(_VERIFY_THRESHOLD_OPTIONS)
@@ -453,7 +454,8 @@ def analyze_clustering(parquet_file: str):
 @click.argument("where_to_write", type=click.Path(dir_okay=True, file_okay=False, exists=False))
 @click.argument("field_to_compress")
 @click.option("--pipeline", default=None,
-              help="Pipeline to plot: a JSON object with compressor, filter and serializer, or @file "
+              help="Pipeline to plot: a JSON object with compressor, filter and serializer, or the path "
+                   "of a file holding one, incl. a manifest_{field}.json "
                    "(default: the best of manifest_{field}.json in --manifest-dir).")
 @click.option("--manifest-dir", default=None,
               help="Directory holding manifest_{field}.json from evaluate_combos (default: WHERE_TO_WRITE).")

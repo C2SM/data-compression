@@ -524,14 +524,24 @@ def codec_spaces(sample_da, space_args: dict, fso_range):
 
 
 def parse_pipeline_arg(text: str) -> dict:
-    """--pipeline value: a JSON object, or @path to a file holding one."""
+    """--pipeline value: a JSON object, a file holding one (`@path` or a bare
+    path), or a manifest_{var}.json, of which best.pipeline is taken."""
     try:
-        raw = Path(text[1:]).read_text() if text.startswith("@") else text
+        if text.startswith("@"):
+            raw = Path(text[1:]).read_text()
+        else:                                    # only JSON starts with a brace
+            raw = text if text.lstrip().startswith("{") else Path(text).read_text()
         d = json.loads(raw)
     except Exception as e:
-        raise click.ClickException(f"--pipeline must be a JSON object or @file: {e}")
+        raise click.ClickException(f"--pipeline must be a JSON object or the path of a file holding one: {e}")
     if not isinstance(d, dict):
         raise click.ClickException("--pipeline must be a JSON object with compressor, filter and serializer")
+    if not any(k in d for k in ("compressor", "filter", "serializer")):
+        best = (d.get("best") or {}).get("pipeline")   # a manifest: take its winner
+        if not isinstance(best, dict):
+            raise click.ClickException("--pipeline needs a JSON object with compressor, filter and "
+                                       "serializer, or a manifest_{var}.json holding best.pipeline")
+        return best
     return d
 
 
