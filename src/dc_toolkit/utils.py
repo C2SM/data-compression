@@ -541,6 +541,27 @@ def filter_space(da, with_lossy=True, filter_class="all", data_range=None):
     return space
 
 
+# ---- ZFPY: two encoders, because neither rank wins --------------------------
+# zfp compresses 4^d blocks and earns its ratio from the correlation inside each
+# block, so the rank a chunk is encoded at decides what it can exploit.  Its
+# header budget also caps every axis (2**24 at 2-D, 2**16 at 3-D, 2**12 at 4-D),
+# which an ICON cell axis overflows, so some reshape is unavoidable.
+#
+# Encoding at the chunk's own rank keeps neighbours along every axis inside one
+# block, which preserves cross-axis gradients and pays wherever those axes are
+# correlated -- a temperature field over consecutive timesteps, say.  Flattening
+# gives that up, and wins where the slower axes carry little signal: zfp spends
+# no bits decorrelating noise, and the flatter output leaves more redundancy for
+# the compressor that runs after it.  Fixed-rate mode fixes zfp's own byte count
+# either way, so the choice lands in the error at that size and, through that
+# compressor, in the final ratio.  Neither dominates, so the sweep carries both
+# and the gates choose per field.
+#
+# The two must keep distinct codec names: a pipeline's identity is its codecs'
+# zarr JSON, which is the resume key, the parquet's unique-pipeline column and
+# the manifest's best.  One class with a flag collides all three silently.
+
+
 class ZFPYRank(zarrcodecs_nc.ZFPY, codec_name="zfpy"):
     """ZFPY that encodes each chunk at the lowest rank zfp accepts: size-1 axes
     dropped, then the slowest pair folded until the shape fits zfp's per-axis
