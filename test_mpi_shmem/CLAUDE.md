@@ -88,11 +88,32 @@ Set up exactly as `test_sweep_analysis/CLAUDE.md` sections 3.1 to 3.4: an env fi
 a venv. EBCC is **not** needed here - use `bash install_dc_toolkit.sh` without `WITH_EBCC=1` and save
 10 minutes. Reuse that runbook's `DYAMOND_DATA_ROOT` and `ACCOUNT` discovery.
 
+**Shortcut if the production test already ran on this machine.** `install_dc_toolkit.sh` does
+`pip install -e .`, and the commits that added this folder touch no file under `src/`. So an existing
+worktree and venv from `test_sweep_analysis` are still valid: fetch, `git checkout --detach
+origin/santis-production-test`, and skip the uenv and venv build entirely. Confirm with
+`dc_toolkit --help` and `git -C "$REPO" log --oneline -1` before relying on it.
+
+**There is no submit script in this folder** - only this file. Phase A is two srun calls inside one
+allocation; compose them from A.2 either in an interactive `salloc --nodes=1 --time=01:00:00` (the
+simplest for a one-hour, two-command test) or in a small sbatch script you keep in `$SCRATCH`. Do not
+add a `.run` file to the repo unless Christos asks.
+
 ### A.1 Pick the field and sample size
 
 One node, a **pinned** sample of `--eval-data-size-limit 1GB`, and a field big enough to actually
 reach it: R02B10 `out_1_2/remap_qc` (3D, 4.6 GiB), the field phase 5 of the other runbook uses at
-this sample size. Take its `--l1-threshold` from the v3 list.
+this sample size. Its settings, from the `heavy|` line of `test_sweep_analysis/santis_test.run`:
+
+```
+FILE=$DYAMOND_DATA_ROOT/Data_Dyamond_PostProcessed/out_1_2/remap_qc_20220225T000000Z.nc
+VAR=qc   L1=0.01   GATES="--extremes-sensitive --phys-min 0"
+```
+
+Pass `$GATES` in **both** arms: the q99 metric is an extra pass over the sample and belongs in a
+bandwidth comparison. Note that the production list runs this field at 16 threads, not 32 - here you
+deliberately use 32 in the T1 arm, because the question is 32-wide threads against 32-wide ranks.
+Do not "correct" it to 16.
 
 **Do not use a small R02B06 field for this.** A field whose whole sample fits in cache does not
 reproduce the memory-bandwidth regime that decides this question, and the toolkit has already been
@@ -123,14 +144,14 @@ Arm T1:
 ```
 srun --nodes=1 --ntasks-per-node=1 --cpus-per-task=32 --cpu-bind=verbose \
     dc_toolkit evaluate_combos "$FILE" --where-to-write "$OUT/t1" --field-to-compress "$VAR" \
-    --l1-threshold "$L1" --eval-data-size-limit 1GB --max-evals 2000 --no-resume
+    --l1-threshold "$L1" $GATES --eval-data-size-limit 1GB --max-evals 2000 --no-resume
 ```
 
 Arm T2:
 ```
 srun --nodes=1 --ntasks-per-node=32 --cpus-per-task=1 --cpu-bind=verbose \
     dc_toolkit evaluate_combos "$FILE" --where-to-write "$OUT/t2" --field-to-compress "$VAR" \
-    --l1-threshold "$L1" --eval-data-size-limit 1GB --max-evals 2000 --no-resume \
+    --l1-threshold "$L1" $GATES --eval-data-size-limit 1GB --max-evals 2000 --no-resume \
     --allow-multi-rank-per-node --no-bypass-zarr-sync
 ```
 
