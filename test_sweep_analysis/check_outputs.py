@@ -369,7 +369,9 @@ def main(base):
 
 
 def fmt(x, spec=".3g"):
-    return "-" if x is None or (isinstance(x, float) and not math.isfinite(x)) else format(x, spec)
+    if x is None or (isinstance(x, float) and not math.isfinite(x)):
+        return "-"
+    return format(int(x), "d") if spec == "d" else format(x, spec)
 
 
 def write_report(rep, base, steps):
@@ -387,8 +389,8 @@ def write_report(rep, base, steps):
         sw, co = f["sweep"] or {}, f["compress"] or {}
         best = sw.get("best") or {}
         name = best.get("name") or f.get("name") or "-"
-        lines.append(f"| {f['where']} | {fmt(sw.get('n'))} | {fmt(sw.get('passed'))} | {fmt(sw.get('failed'))} "
-                     f"| {fmt(sw.get('kept_ebcc')) if sw.get('n_ebcc') else '-'} | `{name}` | {fmt(best.get('ratio'), '.2f')} "
+        lines.append(f"| {f['where']} | {fmt(sw.get('n'), 'd')} | {fmt(sw.get('passed'), 'd')} | {fmt(sw.get('failed'), 'd')} "
+                     f"| {fmt(sw.get('kept_ebcc'), 'd') if sw.get('n_ebcc') else '-'} | `{name}` | {fmt(best.get('ratio'), '.2f')} "
                      f"| {fmt(best.get('l1_rel'))} | {fmt(sw.get('seconds'), '.0f')} | {fmt(co.get('ratio'), '.2f')} "
                      f"| {fmt(co.get('drift'), '+.1%')} | {co.get('verify', '-')} | {fmt(co.get('slab_l1'))} "
                      f"| {fmt(co.get('store_mib'), '.1f')} | {fmt(co.get('source_mib'), '.1f')} |")

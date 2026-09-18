@@ -73,8 +73,14 @@ are 3810 lines, down from 8029 at `870943c`.
   compressors were duplicates. **Blosc ratios therefore differ from every earlier sweep.** Error
   metrics do not change.
 - ZFPY runs only on floats, and on int32/int64 in fixed-rate mode. `ZFPYFlat` (registered as
-  `numcodecs.zfpy`) flattens chunks to 1-D, because zfp's per-axis limit (2^24 in 2-D, 2^16 in 3-D)
-  overflows on the R02B10 cell axis (83.9 M cells).
+  `numcodecs.zfpy`) reshapes each chunk to the lowest rank zfp accepts, because zfp's per-axis limit
+  (2^24 in 2-D, 2^16 in 3-D) overflows on the R02B10 cell axis (83.9 M cells). Size-1 axes are
+  dropped and the slowest pair folded until the shape fits, so a `(t, 1, cells)` chunk stays 2-D and
+  only a genuinely 1-D chunk flattens. **Unlike Blosc, this changes ZFPY's error metrics, not its
+  ratios:** fixed-rate mode fixes the byte count, while encoding a multi-axis chunk as 1-D raises
+  the gradient error by one to two orders of magnitude. Job 870261 flattened unconditionally and
+  lost every ZFPY row on the gradient-gated fields to `pass_grad` alone (231 on R02B06 `out_3/t_2m`,
+  264 on `out_7/remap_t_2m`), at identical ratios.
 - BitRound and Quantize take floats only (`dtype.kind in "iu"` guards). Integer fields get Delta.
 - Relative errors: 0/0 = 0 and x/0 = inf. **All-zero fields now pass the gates.** v3 kept 0 of 8580
   combos on R02B10 `out_8/cape`, which is all zeros.
@@ -408,6 +414,11 @@ Warnings do not fail the run: CR drift above 25 %, failed combos, rows with `n_c
 
 - Blosc ratios, and so some best pipelines, differ from v3 results. Heavy fields use 1 GiB samples
   here, so their numbers are not directly comparable with v3.
+- BitRound -> ZFPY decodes finite cells to NaN or ~-2.5e38 on fields whose values reach zero (clct,
+  tot_prec, both qc; never t_2m or the all-zero cape). 594 of 8844 combos on every such field, all
+  33 compressors x 18 BitRound/ZFPY variants. The finite gate rejects every one, so nothing corrupt
+  is written; it costs ~6.7 % of a sweep. It is data-dependent, so `combo_is_valid` cannot prefilter
+  it.
 - The repo-root `santis.run` is the old production driver. Its L1 values read like native units
   (1.0 would allow 100 % relative error) and it lacks `SRUN_CPUS_PER_TASK`. Do not reuse its list.
 - `--mask-abs-above` does not exist. Fields with undeclared fill sentinels (`runoff_s`, `lhfl_s`,

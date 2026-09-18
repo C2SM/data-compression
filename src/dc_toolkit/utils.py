@@ -540,14 +540,30 @@ def filter_space(da, with_lossy=True, filter_class="all", data_range=None):
 
 
 class ZFPYFlat(zarrcodecs_nc.ZFPY, codec_name="zfpy"):
-    """ZFPY that flattens each chunk to 1-D before zfp.  zfp's per-axis header
-    budget shrinks with rank (2**24 at 2-D, 2**16 at 3-D) and the DYAMOND cell
-    axis overflows it; 1-D never does.  The store keeps the natural shape and
-    the plain "zfpy" codec name, so stock readers decode it."""
+    """ZFPY that encodes each chunk at the lowest rank zfp accepts.  zfp's
+    per-axis header budget shrinks with rank (2**24 at 2-D, 2**16 at 3-D) and
+    the DYAMOND cell axis overflows it, so size-1 axes are dropped and the
+    slowest pair folded until the shape fits.  Only a chunk that is genuinely
+    one long run ends up 1-D; a (t, 1, cells) chunk stays 2-D, where zfp's
+    blocks still span both axes.  Flattening such a chunk costs no bytes in
+    fixed-rate mode but raises the gradient error by one to two orders of
+    magnitude, and the gradient gate then rejects it.  The store keeps the
+    natural shape and the plain "zfpy" codec name, so stock readers decode it."""
+
+    _ZFP_MAX_PER_AXIS = {1: 2**48, 2: 2**24, 3: 2**16, 4: 2**12}
+
+    @classmethod
+    def encode_shape(cls, shape) -> tuple:
+        dims = tuple(d for d in shape if d > 1) or (1,)
+        max_rank = max(cls._ZFP_MAX_PER_AXIS)          # zfp stops at 4-D
+        while len(dims) > 1 and (len(dims) > max_rank
+                                 or any(d > cls._ZFP_MAX_PER_AXIS[len(dims)] for d in dims)):
+            dims = (dims[0] * dims[1],) + dims[2:]     # C-order keeps the fold contiguous
+        return dims
 
     async def _encode_single(self, chunk_data, chunk_spec):
-        arr = np.ascontiguousarray(chunk_data.as_ndarray_like()).reshape(-1)
-        out = await asyncio.to_thread(self._codec.encode, arr)
+        arr = np.ascontiguousarray(chunk_data.as_ndarray_like())
+        out = await asyncio.to_thread(self._codec.encode, arr.reshape(self.encode_shape(arr.shape)))
         return chunk_spec.prototype.buffer.from_bytes(out)
 
 

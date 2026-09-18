@@ -184,7 +184,7 @@ parquet, out, kind = sys.argv[1:]
 df = pd.read_parquet(parquet)
 df = df[df["keep"].astype(str).str.lower().isin(("true", "1"))]
 if kind == "lossless":
-    df = df[df["filter"].str.startswith("delta(") & df["serializer"].str.startswith("pcodec(")]
+    df = df[df["l1_rel"] == 0]     # any exactly-lossless row; Delta on floats drifts past phys bounds
 else:
     df = df[df["serializer"].str.startswith("EBCC")]
 if df.empty:
@@ -244,7 +244,8 @@ for p in ("zarr", "numcodecs", "numpy", "dask", "xarray", "pandas", "pyarrow", "
 sys.exit(0 if path.startswith(repo + os.sep) and importlib.util.find_spec("dc_toolkit.utils_cli") else 1)
 EOF
 
-CMD=(srun --unbuffered --ntasks-per-node=1 bash -c 'echo "$(hostname): nproc=$(nproc) cgroup memory.max=$(cat /sys/fs/cgroup/memory.max 2>/dev/null || echo n/a)"')
+CMD=(srun --unbuffered --nodes="${SLURM_JOB_NUM_NODES:-1}" --ntasks="${SLURM_JOB_NUM_NODES:-1}" \
+     --cpus-per-task="$SRUN_CPUS_PER_TASK" bash -c 'echo "$(hostname): nproc=$(nproc) cgroup memory.max=$(cat /sys/fs/cgroup/memory.max 2>/dev/null || cat /sys/fs/cgroup/memory/memory.limit_in_bytes 2>/dev/null || echo n/a)"')
 run_step nodes "$RESULTS_BASE"
 CMD=(srun --unbuffered --nodes=1 --ntasks=1 dc_toolkit --help)
 run_step cli_help "$RESULTS_BASE" || { log "FATAL: dc_toolkit does not start under srun"; exit 1; }
