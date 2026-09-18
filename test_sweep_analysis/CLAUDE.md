@@ -72,15 +72,23 @@ are 3810 lines, down from 8029 at `870943c`.
 - **Blosc gets `typesize` = item size.** Through zarr's wrapper, shuffle was a no-op and 9 of the 33
   compressors were duplicates. **Blosc ratios therefore differ from every earlier sweep.** Error
   metrics do not change.
-- ZFPY runs only on floats, and on int32/int64 in fixed-rate mode. `ZFPYFlat` (registered as
-  `numcodecs.zfpy`) reshapes each chunk to the lowest rank zfp accepts, because zfp's per-axis limit
-  (2^24 in 2-D, 2^16 in 3-D) overflows on the R02B10 cell axis (83.9 M cells). Size-1 axes are
-  dropped and the slowest pair folded until the shape fits, so a `(t, 1, cells)` chunk stays 2-D and
-  only a genuinely 1-D chunk flattens. **Unlike Blosc, this changes ZFPY's error metrics, not its
-  ratios:** fixed-rate mode fixes the byte count, while encoding a multi-axis chunk as 1-D raises
-  the gradient error by one to two orders of magnitude. Job 870261 flattened unconditionally and
-  lost every ZFPY row on the gradient-gated fields to `pass_grad` alone (231 on R02B06 `out_3/t_2m`,
-  264 on `out_7/remap_t_2m`), at identical ratios.
+- ZFPY runs only on floats, and on int32/int64 in fixed-rate mode, and the sweep carries **two**
+  encoders, because zfp's per-axis limit (2^24 in 2-D, 2^16 in 3-D, 2^12 in 4-D) overflows on the
+  R02B10 cell axis (83.9 M cells) and the way round it is a real trade-off:
+  - `ZFPYRank` (`numcodecs.zfpy`) drops size-1 axes and folds the slowest pair until the shape fits,
+    so a `(t, 1, cells)` chunk encodes as 2-D and zfp's blocks span the chunk's real axes.
+  - `ZFPYFlat` (`numcodecs.zfpy_flat`) flattens to 1-D, as every sweep before 872001 did.
+  **Unlike Blosc, the choice changes ZFPY's error metrics, not zfp's own byte count** (fixed-rate
+  mode fixes that). Folding in an axis pays when that axis is correlated and costs when it is not,
+  and neither wins everywhere: measured on 872001, rank beat flat by **+35.9 %** of best ratio on
+  R02B06 `out_3/t_2m` (6.079 -> 8.259, temperature correlates across timesteps) while flat beat rank
+  by **4.7 %** on `out_7/clct` (4.847 -> 4.620, cloud cover does not, and a downstream LZMA feeds on
+  the flat encoding's redundancy). So the gates decide per field. A chunk that is already one run
+  encodes identically either way, and only one entry is planned for it - R02B10 `out_3/t_2m`, whose
+  chunks are `(1, 1, 4194304)`, is unaffected and its sweep does not grow.
+  The serializer grid is therefore 32 wide, not 20, and sweeps on multi-axis chunks take ~60 % longer.
+  A `zfpy_flat` store decodes with stock zfp but needs dc_toolkit's `zarr.codecs` entry point for the
+  name; `numcodecs.zfpy` stays readable by a bare zarr client.
 - BitRound and Quantize take floats only (`dtype.kind in "iu"` guards). Integer fields get Delta.
 - Relative errors: 0/0 = 0 and x/0 = inf. **All-zero fields now pass the gates.** v3 kept 0 of 8580
   combos on R02B10 `out_8/cape`, which is all zeros.
@@ -415,10 +423,11 @@ Warnings do not fail the run: CR drift above 25 %, failed combos, rows with `n_c
 - Blosc ratios, and so some best pipelines, differ from v3 results. Heavy fields use 1 GiB samples
   here, so their numbers are not directly comparable with v3.
 - BitRound -> ZFPY decodes finite cells to NaN or ~-2.5e38 on fields whose values reach zero (clct,
-  tot_prec, both qc; never t_2m or the all-zero cape). 594 of 8844 combos on every such field, all
-  33 compressors x 18 BitRound/ZFPY variants. The finite gate rejects every one, so nothing corrupt
-  is written; it costs ~6.7 % of a sweep. It is data-dependent, so `combo_is_valid` cannot prefilter
-  it.
+  tot_prec, both qc; never t_2m or the all-zero cape). The count depends on the encoder and the
+  field: 594 per field when every chunk was flattened (870261), 957 / 924 / 660 with the rank-aware
+  encoder (872001), and both families contribute once the sweep carries both. The finite gate
+  rejects every one, so nothing corrupt is written; it is data-dependent, so `combo_is_valid`
+  cannot prefilter it.
 - The repo-root `santis.run` is the old production driver. Its L1 values read like native units
   (1.0 would allow 100 % relative error) and it lacks `SRUN_CPUS_PER_TASK`. Do not reuse its list.
 - `--mask-abs-above` does not exist. Fields with undeclared fill sentinels (`runoff_s`, `lhfl_s`,

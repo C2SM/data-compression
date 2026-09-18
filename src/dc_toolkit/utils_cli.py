@@ -309,16 +309,36 @@ def max_sample_bytes_for_threads(budget_bytes: int, threads_per_rank: int, inner
     return 0 if available <= 0 else int(available / (1.0 + threads * PER_THREAD_WORKING_FACTOR))
 
 
+def _cgroup_v2_memory_paths():
+    """The namespaced root first, then the cgroup named in /proc/self/cgroup and
+    its ancestors: under SLURM the root is absent and the task's own cgroup reads
+    "max", while the limit sits on the job's."""
+    yield "/sys/fs/cgroup/memory.max"
+    try:
+        with open("/proc/self/cgroup") as fh:
+            rel = next((line.split(":", 2)[2].strip() for line in fh if line.startswith("0::")), "")
+    except OSError:
+        return
+    parts = [p for p in rel.split("/") if p]
+    while parts:
+        yield "/sys/fs/cgroup/" + "/".join(parts) + "/memory.max"
+        parts.pop()
+
+
 def detect_node_memory_budget() -> tuple[int, str]:
     """(bytes, source): cgroup v2 limit, else cgroup v1, else host RAM.  The
     cgroup is what actually OOM-kills a SLURM task; psutil cannot see it."""
-    try:
-        with open("/sys/fs/cgroup/memory.max") as fh:
-            val = fh.read().strip()
-        if val and val != "max":
-            return int(val), "cgroup v2 memory.max"
-    except (OSError, ValueError):
-        pass
+    for path in _cgroup_v2_memory_paths():
+        try:
+            with open(path) as fh:
+                val = fh.read().strip()
+        except OSError:
+            continue
+        try:
+            if val and val != "max":
+                return int(val), f"cgroup v2 ({path})"
+        except ValueError:
+            continue
     try:
         host_total = os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
     except (OSError, ValueError):
@@ -509,16 +529,18 @@ def space_args(opts) -> dict:
     return {k: getattr(opts, k) for k in SPACE_KEYS}
 
 
-def codec_spaces(sample_da, space_args: dict, fso_range):
+def codec_spaces(sample_da, space_args: dict, fso_range, chunk_shape=None):
     """(compressors, filters, serializers) built from the sample.  `fso_range`
     is the FULL field's (min, max): FixedScaleOffset and EBCC must not be
-    parameterised from a sample that may miss the extremes."""
+    parameterised from a sample that may miss the extremes.  `chunk_shape` is
+    the evaluation chunk, which decides whether the two ZFPY ranks differ."""
     try:
         return (utils.compressor_space(sample_da, space_args["with_lossy"], space_args["compressor_class"]),
                 utils.filter_space(sample_da, space_args["with_lossy"], space_args["filter_class"],
                                    data_range=fso_range),
                 utils.serializer_space(sample_da, space_args["with_lossy"], space_args["serializer_class"],
-                                       with_ebcc=space_args["with_ebcc"], data_range=fso_range))
+                                       with_ebcc=space_args["with_ebcc"], data_range=fso_range,
+                                       chunk_shape=chunk_shape))
     except (ValueError, TypeError) as e:  # unknown class name, or a dtype a codec does not take
         raise click.ClickException(str(e))
 
@@ -1153,7 +1175,10 @@ def sweep_variable(da, var: str, opts, sweep: SweepContext, n_vars: int) -> None
     if opts.extremes_sensitive and rank == 0:
         click.echo(f"[gates] {var}: q99(|value|)={q99_abs} (extreme-tail cut for the q99 gate)")
     try:
-        spaces = codec_spaces(sample_da, space_args(opts), fso_range)
+        eval_chunks = utils.compute_chunk_shape_for_eval(
+            sample_np.shape, sample_np.dtype, target_mib=opts.inner_chunk_mib,
+            dims=sample_da.dims, allow_spatial_split=opts.spatial_split)
+        spaces = codec_spaces(sample_da, space_args(opts), fso_range, chunk_shape=eval_chunks)
     except click.ClickException as e:  # a class this field's dtype does not support; identical on every rank
         if opts.field_to_compress is not None:
             raise

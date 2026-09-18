@@ -38,6 +38,8 @@ import humanize
 import numpy as np
 import xarray as xr
 import zarr
+import numcodecs
+import numcodecs.zfpy
 import zfpy
 from mpi4py import MPI
 from zarr.api.asynchronous import create_array as _zarr_async_create_array
@@ -539,16 +541,14 @@ def filter_space(da, with_lossy=True, filter_class="all", data_range=None):
     return space
 
 
-class ZFPYFlat(zarrcodecs_nc.ZFPY, codec_name="zfpy"):
-    """ZFPY that encodes each chunk at the lowest rank zfp accepts.  zfp's
-    per-axis header budget shrinks with rank (2**24 at 2-D, 2**16 at 3-D) and
-    the DYAMOND cell axis overflows it, so size-1 axes are dropped and the
-    slowest pair folded until the shape fits.  Only a chunk that is genuinely
-    one long run ends up 1-D; a (t, 1, cells) chunk stays 2-D, where zfp's
-    blocks still span both axes.  Flattening such a chunk costs no bytes in
-    fixed-rate mode but raises the gradient error by one to two orders of
-    magnitude, and the gradient gate then rejects it.  The store keeps the
-    natural shape and the plain "zfpy" codec name, so stock readers decode it."""
+class ZFPYRank(zarrcodecs_nc.ZFPY, codec_name="zfpy"):
+    """ZFPY that encodes each chunk at the lowest rank zfp accepts: size-1 axes
+    dropped, then the slowest pair folded until the shape fits zfp's per-axis
+    header budget (2**24 at 2-D, 2**16 at 3-D, 2**12 at 4-D), which the DYAMOND
+    cell axis overflows.  zfp's blocks then span the chunk's real axes, so
+    cross-axis gradients survive; that wins when those axes are correlated and
+    loses to ZFPYFlat when they are not, so the sweep carries both.  Stored
+    under the plain "zfpy" name, which stock readers decode."""
 
     _ZFP_MAX_PER_AXIS = {1: 2**48, 2: 2**24, 3: 2**16, 4: 2**12}
 
@@ -565,6 +565,30 @@ class ZFPYFlat(zarrcodecs_nc.ZFPY, codec_name="zfpy"):
         arr = np.ascontiguousarray(chunk_data.as_ndarray_like())
         out = await asyncio.to_thread(self._codec.encode, arr.reshape(self.encode_shape(arr.shape)))
         return chunk_spec.prototype.buffer.from_bytes(out)
+
+
+class _ZFPYFlatCodec(numcodecs.zfpy.ZFPY):
+    """The numcodecs side of ZFPYFlat: zfpy under a second id, so the zarr layer
+    can tell the two encoders apart.  zarr's numcodecs wrapper resolves
+    codec_name against the numcodecs registry, which has no "zfpy_flat"."""
+
+    codec_id = "zfpy_flat"
+
+
+numcodecs.register_codec(_ZFPYFlatCodec)
+
+
+class ZFPYFlat(ZFPYRank, codec_name="zfpy_flat"):
+    """ZFPY that flattens every chunk to 1-D.  Costs no bytes in fixed-rate mode
+    but gives up every cross-axis relationship, which wins when the slower axes
+    carry little correlation (zfp would spend bits decorrelating noise) and
+    loses heavily when they do.  Decoding is stock zfp -- the stream carries its
+    own shape -- but the "zfpy_flat" name needs dc_toolkit's zarr.codecs entry
+    point, so a store using it is not readable by a bare zarr client."""
+
+    @classmethod
+    def encode_shape(cls, shape) -> tuple:
+        return (max(1, int(np.prod(shape))),)
 
 
 # ---- EBCC (optional): JPEG 2000 base layer + error-bounded residual ----------
@@ -693,7 +717,8 @@ def ebcc_sweep_entries(filters, serializers, sample_np):
     return [(None, filt, s) for s in ebccs], ""
 
 
-def serializer_space(da, with_lossy=True, serializer_class="all", with_ebcc=False, data_range=None):
+def serializer_space(da, with_lossy=True, serializer_class="all", with_ebcc=False, data_range=None,
+                     chunk_shape=None):
     """Array->bytes serializers: PCodec (plain bytes for 8-bit fields, which
     pco refuses), ZFPY when lossy is allowed (floats; int32/int64 in fixed-rate
     mode only; zfp takes no other integer dtype), EBCC when requested AND lossy is
@@ -722,8 +747,11 @@ def serializer_space(da, with_lossy=True, serializer_class="all", with_ebcc=Fals
             ]
             if da.dtype.kind == "i":
                 modes = modes[2:]
-            space += [ZFPYFlat(mode=mode, **{param: fn(k)})
-                      for mode, param, fn in modes for k in _ZFPY_K_GRID]
+            variants = [ZFPYRank]
+            if chunk_shape is None or ZFPYFlat.encode_shape(chunk_shape) != ZFPYRank.encode_shape(chunk_shape):
+                variants.append(ZFPYFlat)      # a chunk that is already one run encodes the same either way
+            space += [v(mode=mode, **{param: fn(k)})
+                      for v in variants for mode, param, fn in modes for k in _ZFPY_K_GRID]
         elif cls is EBCC:
             tile, _ = ebcc_tile(da)
             if tile is not None:
@@ -830,7 +858,8 @@ def codec_pipeline_kwargs(compressor, filt, serializer) -> dict:
 
 # Our classes, used when a pipeline is rebuilt from its dict: ZFPYFlat must
 # replace zarr's stock ZFPY (same codec name in zarr.json); EBCC has no stock class.
-_CODEC_CLASSES = {"numcodecs.zfpy": ZFPYFlat, "numcodecs.ebcc_filter": EBCC}
+_CODEC_CLASSES = {"numcodecs.zfpy": ZFPYRank, "numcodecs.zfpy_flat": ZFPYFlat,
+                  "numcodecs.ebcc_filter": EBCC}
 
 
 def codec_from_dict(d):

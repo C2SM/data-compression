@@ -50,6 +50,8 @@ dc_toolkit = 'dc_toolkit.cli:cli'
 [project.entry-points."zarr.codecs"]
 # Lets any zarr client with dc_toolkit + ebcc installed decode EBCC-compressed arrays.
 "numcodecs.ebcc_filter" = "dc_toolkit.utils:EBCC"
+# The flattening ZFPY variant; the plain "numcodecs.zfpy" name stays stock-decodable.
+"numcodecs.zfpy_flat" = "dc_toolkit.utils:ZFPYFlat"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
