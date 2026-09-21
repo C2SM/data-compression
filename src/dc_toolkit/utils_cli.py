@@ -310,25 +310,27 @@ def max_sample_bytes_for_threads(budget_bytes: int, threads_per_rank: int, inner
 
 
 def _cgroup_v2_memory_paths():
-    """The namespaced root first, then the cgroup named in /proc/self/cgroup and
-    its ancestors: under SLURM the root is absent and the task's own cgroup reads
-    "max", while the limit sits on the job's."""
-    yield "/sys/fs/cgroup/memory.max"
+    """(path, shared): the namespaced root, then the cgroup named in
+    /proc/self/cgroup and its ancestors.  Under SLURM the root is absent and the
+    task's own cgroup reads "max"; the limit sits on an ancestor that every task
+    on the node shares."""
+    yield "/sys/fs/cgroup/memory.max", False
     try:
         with open("/proc/self/cgroup") as fh:
             rel = next((line.split(":", 2)[2].strip() for line in fh if line.startswith("0::")), "")
     except OSError:
         return
     parts = [p for p in rel.split("/") if p]
+    own = len(parts)
     while parts:
-        yield "/sys/fs/cgroup/" + "/".join(parts) + "/memory.max"
+        yield "/sys/fs/cgroup/" + "/".join(parts) + "/memory.max", len(parts) < own
         parts.pop()
 
 
 def detect_node_memory_budget() -> tuple[int, str]:
     """(bytes, source): cgroup v2 limit, else cgroup v1, else host RAM.  The
     cgroup is what actually OOM-kills a SLURM task; psutil cannot see it."""
-    for path in _cgroup_v2_memory_paths():
+    for path, shared in _cgroup_v2_memory_paths():
         try:
             with open(path) as fh:
                 val = fh.read().strip()
@@ -336,7 +338,7 @@ def detect_node_memory_budget() -> tuple[int, str]:
             continue
         try:
             if val and val != "max":
-                return int(val), f"cgroup v2 ({path})"
+                return int(val), f"cgroup v2 {'node' if shared else 'task'} ({path})"
         except ValueError:
             continue
     try:
@@ -356,15 +358,21 @@ def detect_node_memory_budget() -> tuple[int, str]:
     return psutil.virtual_memory().total, "psutil host total"
 
 
+def budget_is_per_task(source: str) -> bool:
+    """Only the task's own cgroup binds one rank; every other budget is shared by
+    the ranks on the node."""
+    return source.startswith("cgroup v2 task")
+
+
 def check_node_memory_headroom(per_rank_steady_bytes: int, ranks_on_node: int, rank: int,
                                label: str, threshold: float = 0.80) -> None:
-    """Abort if the sweep's steady-state footprint exceeds the node budget.  A
-    cgroup limit is per task; host RAM is shared by all ranks on the node."""
+    """Abort if the sweep's steady-state footprint exceeds the memory budget: one
+    rank's when the limit is the task's own cgroup, all ranks' otherwise."""
     if rank != 0:
         return
     available, source = detect_node_memory_budget()
-    if source.startswith("cgroup"):
-        required, scope = per_rank_steady_bytes, "per-rank (cgroup is per-task under SLURM)"
+    if budget_is_per_task(source):
+        required, scope = per_rank_steady_bytes, "per-rank (the task's own cgroup)"
     else:
         required, scope = max(1, ranks_on_node) * per_rank_steady_bytes, f"per-node ({ranks_on_node} rank(s) x per-rank)"
     if required > threshold * available:
@@ -552,18 +560,21 @@ def codec_spaces(sample_da, space_args: dict, fso_range, chunk_shape=None):
 def parse_pipeline_arg(text: str) -> dict:
     """--pipeline value: a JSON object, a file holding one (`@path` or a bare
     path), or a manifest_{var}.json, of which best.pipeline is taken."""
+    if not text.strip():
+        raise click.ClickException("--pipeline is empty: give a JSON object or the path of a file holding one")
     try:
         if text.startswith("@"):
             raw = Path(text[1:]).read_text()
-        else:                                    # only JSON starts with a brace
-            raw = text if text.lstrip().startswith("{") else Path(text).read_text()
+        else:                                    # JSON starts with a bracket, a path does not
+            raw = text if text.lstrip()[:1] in "{[" else Path(text).read_text()
         d = json.loads(raw)
     except Exception as e:
         raise click.ClickException(f"--pipeline must be a JSON object or the path of a file holding one: {e}")
     if not isinstance(d, dict):
         raise click.ClickException("--pipeline must be a JSON object with compressor, filter and serializer")
     if not any(k in d for k in ("compressor", "filter", "serializer")):
-        best = (d.get("best") or {}).get("pipeline")   # a manifest: take its winner
+        best = d.get("best")                            # a manifest: take its winner
+        best = best.get("pipeline") if isinstance(best, dict) else None
         if not isinstance(best, dict):
             raise click.ClickException("--pipeline needs a JSON object with compressor, filter and "
                                        "serializer, or a manifest_{var}.json holding best.pipeline")
@@ -768,7 +779,7 @@ def sweep_sample_limit(var: str, field_bytes: int, opts, sweep: SweepContext) ->
     memory budget, then run the memory guards.  Returns the effective limit."""
     threads, chunk_mib = opts.threads_per_rank, opts.inner_chunk_mib
     node_budget, source = detect_node_memory_budget()
-    effective_budget = node_budget if source.startswith("cgroup") else node_budget // max(1, sweep.ranks_on_node)
+    effective_budget = node_budget if budget_is_per_task(source) else node_budget // max(1, sweep.ranks_on_node)
     max_safe = max_sample_bytes_for_threads(int(effective_budget * opts.memory_threshold), threads, chunk_mib)
     # Rank 0 sizes the sample for everyone, so every rank adopts the smallest node's limit.
     limit = sweep.comm.allreduce(min(int(opts.eval_data_size_limit), max_safe), op=MPI.MIN)
@@ -1181,6 +1192,8 @@ def sweep_variable(da, var: str, opts, sweep: SweepContext, n_vars: int) -> None
     sample_np, sample_da, fso_range = sweep_build_sample(da, limit, opts, sweep)
     span = float(fso_range[1] - fso_range[0]) if fso_range else 0.0
     opts.phys_slack = float(getattr(opts, "phys_tolerance", 0.0) or 0.0) * span   # absolute; the manifest carries it
+    if opts.phys_slack and rank == 0:
+        click.echo(f"[gates] {var}: bounds slack {opts.phys_slack:g} ({opts.phys_tolerance:g} of the range {span:g})")
     q99_abs = q99_cut(sample_np) if opts.extremes_sensitive else None
     if opts.extremes_sensitive and rank == 0:
         click.echo(f"[gates] {var}: q99(|value|)={q99_abs} (extreme-tail cut for the q99 gate)")

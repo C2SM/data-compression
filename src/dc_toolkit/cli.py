@@ -103,6 +103,13 @@ _PERSIST_OPTIONS = _CHUNK_OVERRIDE_OPTIONS + [
                  help="Dask workers for the write (default: visible cores).  Peak memory ~ threads x "
                       "(max(source block, shard) + 3 x shard); the memory guard refuses what does not fit."),
 ] + _CODEC_THREAD_OPTIONS + [_MEMORY_OPTION]
+def _finite(ctx, param, value):
+    """A NaN or infinite bound would fail every combo without a word."""
+    if value is not None and (value != value or abs(value) == float("inf")):
+        raise click.BadParameter("must be finite")
+    return value
+
+
 _VERIFY_OPTIONS = [
     click.option("--verify/--no-verify", default=True, show_default=True,
                  help="Re-read the store after writing and recompute the error norms "
@@ -147,9 +154,9 @@ _VERIFY_OPTIONS = [
 @click.option("--bias-gate/--no-bias-gate", default=True, show_default=True, help="Enable the bias gate.")
 @click.option("--extremes-sensitive/--no-extremes-sensitive", default=False, show_default=True,
               help="Enable the q99 extreme-tail gate (precip, gusts, CAPE, radiation peaks).")
-@click.option("--phys-min", type=float, default=None, help="Reject combos whose decoded sample dips below this.")
-@click.option("--phys-max", type=float, default=None, help="Reject combos whose decoded sample exceeds this.")
-@click.option("--phys-tolerance", type=click.FloatRange(0.0, 1.0), default=0.0, show_default=True,
+@click.option("--phys-min", type=float, default=None, callback=_finite, help="Reject combos whose decoded sample dips below this.")
+@click.option("--phys-max", type=float, default=None, callback=_finite, help="Reject combos whose decoded sample exceeds this.")
+@click.option("--phys-tolerance", type=click.FloatRange(0.0, 1.0), default=0.0, show_default=True, callback=_finite,
               help="Slack for --phys-min/--phys-max as a fraction of the field's value range: a lossy codec "
                    "rings past a bound the field sits on by a hair. Stored in the manifest as an absolute "
                    "value, so compress and the checker apply the same slack.")

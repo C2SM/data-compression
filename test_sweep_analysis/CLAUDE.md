@@ -441,7 +441,7 @@ Warnings do not fail the run: CR drift above 25 %, failed combos, rows with `n_c
   (1.0 would allow 100 % relative error) and it lacks `SRUN_CPUS_PER_TASK`. Do not reuse its list.
 - `--mask-abs-above` does not exist. Fields with undeclared fill sentinels (`runoff_s`, `lhfl_s`,
   `qhfl_s`, `cin_ml`, `smi`) are deliberately left out.
-- The phys bounds gate has no tolerance. On a field that sits on its bounds (clct: many cells at
+- At the default `--phys-tolerance 0` the bounds gate has no slack. On a field that sits on its bounds (clct: many cells at
   exactly 0 and 100) any lossy codec with ringing breaches them by a hair while its L1 is hundreds
   of times inside budget: Delta+PCodec reaches 100.0007, every EBCC error target 100.0006 to 100.047
   (the tightest passes a `--pipeline` write with the L1 gate alone at ratio 4.9). The harness's
