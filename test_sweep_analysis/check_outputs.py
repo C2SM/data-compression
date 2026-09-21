@@ -88,10 +88,11 @@ def expected_keep(df, manifest):
         ok &= ~(num(df, "q99_rel") > thr["q99"])
     ok &= num(df, "n_corrupt").fillna(0) == 0
     dmin, dmax = num(df, "decoded_min"), num(df, "decoded_max")
+    slack = float(manifest.get("phys_slack") or 0.0)
     if manifest.get("phys_min") is not None:
-        ok &= ~(np.isfinite(dmin) & (dmin < manifest["phys_min"]))
+        ok &= ~(np.isfinite(dmin) & (dmin < manifest["phys_min"] - slack))
     if manifest.get("phys_max") is not None:
-        ok &= ~(np.isfinite(dmax) & (dmax > manifest["phys_max"]))
+        ok &= ~(np.isfinite(dmax) & (dmax > manifest["phys_max"] + slack))
     if manifest["args"].get("gradient_gate"):
         ok &= ~(num(df, "grad_rel") > float(manifest["gradient_threshold"]))
     return ok
@@ -209,7 +210,7 @@ def stored_codecs(array_meta):
     return codecs, None
 
 
-def check_compress(rep, d, var, source, where, pipeline, thr, phys=(None, None), batch_name="batch_manifest.json"):
+def check_compress(rep, d, var, source, where, pipeline, thr, phys=(None, None, 0.0), batch_name="batch_manifest.json"):
     """Invariants of one compress run into `d`; returns a summary dict or None."""
     d = Path(d)
     batch = load_json(d / batch_name)
@@ -228,10 +229,11 @@ def check_compress(rep, d, var, source, where, pipeline, thr, phys=(None, None),
         if value is not None and math.isfinite(limit):
             rep.check(value <= limit, where, f"production {metric}={value:.3e} exceeds {key}={limit:.3e}")
     rep.check(errors.get("N_Corrupt", 0) == 0, where, f"N_Corrupt={errors.get('N_Corrupt')}")
+    slack = float(phys[2] if len(phys) > 2 and phys[2] else 0.0)
     if phys[0] is not None and errors.get("Decoded_Min") is not None:
-        rep.check(errors["Decoded_Min"] >= phys[0], where, f"Decoded_Min={errors['Decoded_Min']} < phys_min={phys[0]}")
+        rep.check(errors["Decoded_Min"] >= phys[0] - slack, where, f"Decoded_Min={errors['Decoded_Min']} < phys_min={phys[0]} - slack {slack}")
     if phys[1] is not None and errors.get("Decoded_Max") is not None:
-        rep.check(errors["Decoded_Max"] <= phys[1], where, f"Decoded_Max={errors['Decoded_Max']} > phys_max={phys[1]}")
+        rep.check(errors["Decoded_Max"] <= phys[1] + slack, where, f"Decoded_Max={errors['Decoded_Max']} > phys_max={phys[1]} + slack {slack}")
     drift = entry.get("cr_drift")
     if drift is not None and abs(drift) > 0.25:
         rep.warn(where, f"compression ratio drift {drift:+.1%} (achieved {entry['ratio']:.2f} vs sweep {entry['predicted_ratio']:.2f})")
@@ -345,7 +347,7 @@ def main(base):
                 man = info["manifest"]
                 first = d / "batch_manifest.first.json"  # compress_rerun overwrites batch_manifest.json
                 out = check_compress(rep, d, s.var, s.input, where, info["best"]["pipeline"], thresholds(man),
-                                     (man.get("phys_min"), man.get("phys_max")),
+                                     (man.get("phys_min"), man.get("phys_max"), man.get("phys_slack") or 0.0),
                                      first.name if first.is_file() else "batch_manifest.json")
                 for field in rep.fields:
                     if field["where"] == str(d.relative_to(base)) and field["step"] == "sweep":

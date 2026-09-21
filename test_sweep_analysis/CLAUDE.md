@@ -445,8 +445,10 @@ Warnings do not fail the run: CR drift above 25 %, failed combos, rows with `n_c
   exactly 0 and 100) any lossy codec with ringing breaches them by a hair while its L1 is hundreds
   of times inside budget: Delta+PCodec reaches 100.0007, every EBCC error target 100.0006 to 100.047
   (the tightest passes a `--pipeline` write with the L1 gate alone at ratio 4.9). The harness's
-  `pipeline_compress` for the EBCC class therefore records `no-pipeline` on such a field. A bounds
-  tolerance flag is an open suggestion, not applied.
+  `pipeline_compress` for the EBCC class therefore records `no-pipeline` on such a field.
+  `--phys-tolerance FRACTION` (of the field's value range, default 0) gives the bounds that slack; the
+  sweep stores it as the absolute `phys_slack` in the manifest, which compress's verify gate and the
+  checker apply alike. The default field list keeps it at 0, so v3 comparisons hold.
 - Open suggestion, not applied: PCodec `delta_spec="auto"` with an explicit `delta_encoding_order`
   pins that order. A true auto entry was about 10 % smaller on a test field.
 

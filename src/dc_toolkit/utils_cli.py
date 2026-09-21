@@ -433,19 +433,21 @@ def derive_thresholds(opts) -> dict:
             "q99": pick(opts.q99_threshold, _Q99_MULT_DEFAULT, opts.extremes_sensitive)}
 
 
-def evaluate_gates(errors: dict, thr: dict, *, phys_min=None, phys_max=None,
+def evaluate_gates(errors: dict, thr: dict, *, phys_min=None, phys_max=None, phys_slack=0.0,
                    grad_threshold=None, grad_gate=False):
     """(keep, {gate: passed}) for one metrics dict.  A None metric or +inf
-    limit passes.  Shared by the sweep and the production verify gate."""
+    limit passes; `phys_slack` is the absolute excursion the bounds allow.
+    Shared by the sweep and the production verify gate."""
     reasons = {f"pass_{t}": utils.within_limit(errors.get(m), thr.get(t)) for m, t in utils.CHEAP_GATES}
     reasons["pass_q99"] = utils.within_limit(errors.get("Q99_Rel"), thr.get("q99"))
     reasons["pass_finite"] = int(errors.get("N_Corrupt") or 0) == 0
     dmin, dmax = errors.get("Decoded_Min"), errors.get("Decoded_Max")
     bounds = True
+    slack = float(phys_slack or 0.0)
     if phys_min is not None and dmin is not None and math.isfinite(dmin):
-        bounds = bounds and dmin >= phys_min
+        bounds = bounds and dmin >= phys_min - slack
     if phys_max is not None and dmax is not None and math.isfinite(dmax):
-        bounds = bounds and dmax <= phys_max
+        bounds = bounds and dmax <= phys_max + slack
     reasons["pass_bounds"] = bool(bounds)
     reasons["pass_grad"] = utils.within_limit(errors.get("Grad_Rel"), grad_threshold) if grad_gate else True
     return all(reasons.values()), reasons
@@ -484,7 +486,8 @@ def verify_against_manifest(var: str, errors: dict, manifest, overrides=None):
     if not any(math.isfinite(v) for v in thr.values()):
         return "no-thresholds", ""
     keep, reasons = evaluate_gates(errors, thr, phys_min=(manifest or {}).get("phys_min"),
-                                   phys_max=(manifest or {}).get("phys_max"))
+                                   phys_max=(manifest or {}).get("phys_max"),
+                                   phys_slack=(manifest or {}).get("phys_slack") or 0.0)
     if keep:
         return "pass", ""
     failed = ", ".join(k for k, ok in reasons.items() if not ok)
@@ -739,7 +742,8 @@ def sweep_setup(opts) -> SweepContext:
                 if opts.gradient_gate else "off")
         click.echo(f"[gates] thresholds (relative): L1={thr['l1']:.3e} L2={fmt(thr['l2'])} "
                    f"Linf={fmt(thr['linf'])} bias={fmt(thr['bias'])} q99={fmt(thr['q99'])} | "
-                   f"bounds=[{opts.phys_min}, {opts.phys_max}] | gradient={grad}")
+                   f"bounds=[{opts.phys_min}, {opts.phys_max}]"
+                   f"{f' +-{opts.phys_tolerance:g} of range' if getattr(opts, 'phys_tolerance', 0) else ''} | gradient={grad}")
     return SweepContext(comm, rank, size, ranks_on_node, cores_avail, thr)
 
 
@@ -984,6 +988,7 @@ def sweep_evaluators(var, sample_np, sample_da, q99_abs, opts, sweep: SweepConte
 
     def gate(errors):
         return evaluate_gates(errors, sweep.thresholds, phys_min=opts.phys_min, phys_max=opts.phys_max,
+                              phys_slack=getattr(opts, "phys_slack", 0.0),
                               grad_threshold=opts.gradient_threshold, grad_gate=opts.gradient_gate)
 
     return evaluate_one, gate
@@ -1136,6 +1141,7 @@ SWEEP_ARG_KEYS = (
     "spatial_split", "compressor_class", "filter_class", "serializer_class", "with_lossy", "with_ebcc",
     "sampling_policy", "vertical_floor", "l1_threshold", "l2_threshold", "linf_threshold", "bias_threshold",
     "q99_threshold", "l2_gate", "linf_gate", "bias_gate", "extremes_sensitive", "phys_min", "phys_max",
+    "phys_tolerance",
     "gradient_gate", "gradient_threshold", "resume", "max_evals",
 )
 
@@ -1150,6 +1156,7 @@ def sweep_manifest(var, opts, sweep: SweepContext, *, num_combos, n_passed, tota
         "effective_thresholds": {k: (None if not math.isfinite(v) else float(v)) for k, v in sweep.thresholds.items()},
         "gradient_threshold": float(opts.gradient_threshold) if opts.gradient_gate else None,
         "phys_min": opts.phys_min, "phys_max": opts.phys_max,
+        "phys_slack": float(getattr(opts, "phys_slack", 0.0)),
         "q99_abs": q99_abs,
         "num_combos": int(num_combos), "num_passed": int(n_passed),
         "num_failed_total": int(total_failures or 0),
@@ -1172,6 +1179,8 @@ def sweep_variable(da, var: str, opts, sweep: SweepContext, n_vars: int) -> None
                    f"relative L1 threshold={sweep.thresholds['l1']:.3e}")
     limit = sweep_sample_limit(var, int(da.nbytes), opts, sweep)
     sample_np, sample_da, fso_range = sweep_build_sample(da, limit, opts, sweep)
+    span = float(fso_range[1] - fso_range[0]) if fso_range else 0.0
+    opts.phys_slack = float(getattr(opts, "phys_tolerance", 0.0) or 0.0) * span   # absolute; the manifest carries it
     q99_abs = q99_cut(sample_np) if opts.extremes_sensitive else None
     if opts.extremes_sensitive and rank == 0:
         click.echo(f"[gates] {var}: q99(|value|)={q99_abs} (extreme-tail cut for the q99 gate)")

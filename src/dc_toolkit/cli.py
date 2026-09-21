@@ -149,6 +149,10 @@ _VERIFY_OPTIONS = [
               help="Enable the q99 extreme-tail gate (precip, gusts, CAPE, radiation peaks).")
 @click.option("--phys-min", type=float, default=None, help="Reject combos whose decoded sample dips below this.")
 @click.option("--phys-max", type=float, default=None, help="Reject combos whose decoded sample exceeds this.")
+@click.option("--phys-tolerance", type=click.FloatRange(0.0, 1.0), default=0.0, show_default=True,
+              help="Slack for --phys-min/--phys-max as a fraction of the field's value range: a lossy codec "
+                   "rings past a bound the field sits on by a hair. Stored in the manifest as an absolute "
+                   "value, so compress and the checker apply the same slack.")
 @click.option("--gradient-gate/--no-gradient-gate", default=False, show_default=True,
               help="Enable the spatial-gradient gate (one more pass over the sample per combo; "
                    "for winds, pressure).")
