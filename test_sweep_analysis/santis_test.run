@@ -39,7 +39,7 @@ export PYTHONUNBUFFERED=1
 export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 BLOSC_NTHREADS=1 \
        NUMBA_NUM_THREADS=1 VECLIB_MAXIMUM_THREADS=1 OMP_THREAD_LIMIT=1
 # srun steps do not reliably inherit --cpus-per-task from sbatch, and a rank that
-# sees one core makes the thread check abort (santis.run lacks this line).
+# sees one core makes the thread check abort.
 export SRUN_CPUS_PER_TASK=${SLURM_CPUS_PER_TASK:-32}
 
 REPO_ROOT=${REPO_ROOT:-${SLURM_SUBMIT_DIR:-$PWD}}

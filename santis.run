@@ -1,56 +1,33 @@
 #!/bin/bash
 #
-# Production codec sweep on Santis (Grace nodes, 288 cores/node).
+# Production codec sweep on Santis (Grace nodes, 288 cores/node): evaluate_combos
+# over a list of DYAMOND fields, one results directory per field, optionally
+# followed by compress.  Submit from the repository root, where venv/ lives:
 #
-# Topology: 1 MPI rank/node x 32 threads/rank, --bypass-zarr-sync.
+#   DYAMOND_DATA_ROOT=/path/to/parent sbatch --account=<account> santis.run
 #
-# This setup was selected after extensive testing on Santis.  Three
-# alternatives were considered and rejected:
+# Topology: 1 MPI rank per node x THREADS threads per rank, --bypass-zarr-sync (the default).
+#   - A combo's metrics run on the user thread, so the user threads are what
+#     scales; one rank per node keeps a single copy of the sample beside them.
+#   - Compression is memory-bandwidth-bound here, so --codec-threads stays 1 and
+#     the codec libraries are pinned to one thread: inner threads would compete
+#     with the outer ones for the same bandwidth.
+#   - A rank holds about (1 + 2 x threads) x the sample (the [memory] line).  The sweep
+#     checks that against the node's memory and shrinks the sample to fit ([memcheck]).
+#   docs/PARALLELIZATION.md has the details.
 #
-#   Alt A: codec-internal threading (--codec-threads > 1, larger chunks).
-#     Tested at --codec-threads=9 with --inner-chunk-mib=64 on a real
-#     production-size sweep (qv at R02B08, 4.6 GiB, 1000 combos).
-#     LOST by 14% vs baseline.  Cause: cache pressure and memory-
-#     bandwidth saturation; the codec-internal helper threads compete
-#     for the same memory channels as the outer parallelism.  A small
-#     in-cache file (120 MiB tot_prec) had shown a 17% gain at this
-#     setting, but the gain did not carry to production-size files.
-#     Lesson: codec-internal threading is not productive at production
-#     scales on this hardware.
-#
-#   Alt B: pure-MPI 1 rank x 1 thread, no bypass.
-#     Tested on the same qv file at 1000 combos.  Bypass 1x32 finished
-#     in 32 min; pure-MPI 1x1 was projected to 4+ hours (7.6x slower)
-#     and was canceled mid-run.  Cause: encode and decode DO parallelise
-#     in pure-MPI 1x1 — zarr's internal worker pool (32 threads) keeps
-#     32 chunk encodes in flight regardless of user-thread count, so
-#     those phases are fine.  But the metrics phase (numpy elementwise
-#     ops + L1/L2/Linf reductions) runs as plain numpy on the user
-#     thread itself, not under zarr.  With 1 user thread, only 1 core
-#     does all metrics work; with 32 user threads, 32 metrics
-#     computations run in parallel (one per user thread).  Metrics is
-#     ~39% of per-combo wall time, so this phase alone takes ~32x
-#     longer in 1x1, dominating the total slowdown.
-#
-#   Alt C: multi-rank-per-node (32 ranks x 1 thread).
-#     Faster per combo, but each rank duplicates the sample buffer in
-#     memory, on top of the per-combo working set (~2x the sample:
-#     decoded copy + encoded store) that every evaluating thread or
-#     rank needs either way.  At 5 GB samples the duplicated inputs add
-#     32 x 5 GB = 160 GB per node, which OOMs on R02B08 and R02B10.
-#     Bypass 1x32 keeps ONE input sample per node (the tool prints the
-#     full model as [memory] and shrinks the sample if needed) and
-#     tolerates the modest throughput loss vs pure MPI.
-#
-# Verdict:  current setup is correct.  Do NOT bump --cpus-per-task,
-#          do NOT enable --codec-threads, do NOT switch topology
-#          without a fresh A/B test against this baseline.
-#
-# Codec space: the lossy family is covered via ZFPY + BitRound + Quantize +
-# FixedScaleOffset, plus the lossless compressors (see utils.py section 4).
-#
-# See docs/PARALLELIZATION.md for a thorough walkthrough of the
-# parallelism architecture used by every dc_toolkit command.
+# Environment knobs:
+#   DYAMOND_DATA_ROOT        parent dir of the Data_Dyamond_PostProcessed* trees (required)
+#   RESULTS_BASE             output root (default ./res_folder_dyamond_<job id>).  Point it at an
+#                            earlier run's directory to continue it: combos recorded on the same
+#                            sample, chunking and codec build are reused and re-gated with the
+#                            current thresholds; anything else restarts the field.
+#   FIELDS_FILE              replaces the list below: one entry per line, same format
+#   MAX_EVALS=N              cap the codec space (quick test runs)
+#   WITH_EBCC=1              add the EBCC combos (float (lat, lon) fields; needs the ebcc package)
+#   COMPRESS=1               write each swept file with its winner and verify it (one task)
+#   STOCK_CODECS_ONLY=1      with COMPRESS=1: only pipelines a zarr client without dc_toolkit decodes
+#   WALLTIME_SAFEGUARD_MIN   no field starts with fewer minutes left in the job (default 15)
 
 #SBATCH --account=YOUR_ACCOUNT_HERE
 #SBATCH --uenv=prgenv-gnu/26.3:v1
@@ -63,14 +40,11 @@
 #SBATCH --output=out-%j.out
 #SBATCH --error=out-%j.out
 
-set -uo pipefail   # NOT -e: continue past per-file failures
+set -uo pipefail   # NOT -e: continue past per-field failures
 
 export PYTHONUNBUFFERED=1
 source venv/bin/activate
 
-# Codec-internal threadpools pinned to 1.  The bypass machinery already
-# parallelises codec dispatch across the 32 user threads; OpenMP/blosc
-# adding their own would oversubscribe.
 export OMP_NUM_THREADS=1 \
        MKL_NUM_THREADS=1 \
        OPENBLAS_NUM_THREADS=1 \
@@ -78,12 +52,13 @@ export OMP_NUM_THREADS=1 \
        NUMBA_NUM_THREADS=1 \
        VECLIB_MAXIMUM_THREADS=1 \
        OMP_THREAD_LIMIT=1
+# srun steps do not reliably inherit --cpus-per-task from sbatch, and a rank that
+# sees one core fails the thread check.
+export SRUN_CPUS_PER_TASK=${SLURM_CPUS_PER_TASK:-32}
 
 # ---------------------------------------------------------------------------
 # Tunables
 # ---------------------------------------------------------------------------
-# Site-specific: parent directory holding the Data_Dyamond_PostProcessed* trees.
-# Launch with:  DYAMOND_DATA_ROOT=/path/to/parent sbatch santis.run
 : "${DYAMOND_DATA_ROOT:?export DYAMOND_DATA_ROOT=<parent dir of the Data_Dyamond_PostProcessed* trees>}"
 ROOT_R02B10="$DYAMOND_DATA_ROOT/Data_Dyamond_PostProcessed"
 ROOT_R02B08="$DYAMOND_DATA_ROOT/Data_Dyamond_PostProcessed_R02B08"
@@ -92,48 +67,68 @@ ROOT_R02B06="$DYAMOND_DATA_ROOT/Data_Dyamond_PostProcessed_R02B06"
 RESULTS_BASE="${RESULTS_BASE:-./res_folder_dyamond_${SLURM_JOB_ID:-$$}}"
 mkdir -p "$RESULTS_BASE"
 
-echo "[santis.run] topology: 1 rank/node x 32 threads/rank x ${SLURM_JOB_NUM_NODES:-?} nodes"
-echo "[santis.run] data root: $DYAMOND_DATA_ROOT"
+DEFAULT_SAMPLE=2GiB     # --eval-data-size-limit of an entry that names none
+DEFAULT_THREADS=32      # --threads-per-rank of an entry that names none
 
-EVAL_FLAGS=(
-    --eval-data-size-limit         5GB
-    --threads-per-rank             32
-)
-
-# Quick-test escape hatch: cap evals (e.g. MAX_EVALS=50 sbatch santis.run)
+EXTRA_FLAGS=()
 MAX_EVALS="${MAX_EVALS:-}"
 if [[ -n "$MAX_EVALS" && "$MAX_EVALS" != "0" ]]; then
-    EVAL_FLAGS+=(--max-evals "$MAX_EVALS")
-    echo "[santis.run] --max-evals=$MAX_EVALS active (test mode)"
+    EXTRA_FLAGS+=(--max-evals "$MAX_EVALS")
 fi
+[[ "${WITH_EBCC:-0}" == 1 ]] && EXTRA_FLAGS+=(--with-ebcc)
+COMPRESS_FLAGS=()
+[[ "${STOCK_CODECS_ONLY:-0}" == 1 ]] && COMPRESS_FLAGS+=(--stock-codecs-only)
+
+SAFEGUARD_MIN=${WALLTIME_SAFEGUARD_MIN:-15}
+JOB_END=${SLURM_JOB_END_TIME:-}     # epoch seconds; empty outside a job, which disables the safeguard
+
+echo "[santis.run] topology : 1 rank/node x ${SLURM_JOB_NUM_NODES:-?} node(s)"
+echo "[santis.run] data root: $DYAMOND_DATA_ROOT"
+echo "[santis.run] knobs    : MAX_EVALS='${MAX_EVALS}' WITH_EBCC=${WITH_EBCC:-0} COMPRESS=${COMPRESS:-0} STOCK_CODECS_ONLY=${STOCK_CODECS_ONLY:-0}"
 
 # ---------------------------------------------------------------------------
-# File list
+# Field list
 # ---------------------------------------------------------------------------
-# Format:  <resolution>|<stream>|<filename>|<variable>|<l1_threshold>
-# L1 thresholds are RELATIVE errors (sum|err| / sum|orig|), e.g. 5e-3 = 0.5 %;
-# the L2/Linf/bias gates default to 2x/10x/0.5x of it.  CHECK the values below:
-# they predate the switch to relative thresholds and read like native units
-# (1.0 for geopot/cape/sob_s would allow 100 % relative error).
+# Format:  RES|STREAM|FILE|IVAR|VAR|L1|SAMPLE|THREADS|GATE FLAGS
+#   IVAR is the variable's name inside FILE (what is swept); VAR names the results
+#   directory RES_STREAM_VAR.  They differ where several products share an in-file
+#   name: SFC_lwflx_dn and TOA_lwflx_dn both hold lwflx_dn.
+#   SAMPLE (--eval-data-size-limit) and THREADS (--threads-per-rank) may be left empty.
+#
+# L1 is a RELATIVE budget (sum|err| / sum|orig|); the L2, Linf and bias gates default
+# to 2x, 10x and 0.5x of it.  The budgets below allow a mean error of 0.5 % of the
+# field's standard deviation (0.005 x std / |mean|), capped at 1 %: heavy-tailed
+# fields reach the cap and carry --extremes-sensitive.
+# GATE FLAGS are passed to evaluate_combos as they are: --phys-min/--phys-max for
+# bounded fields (with --phys-tolerance for one that sits on its bound), --gradient-gate
+# for fields whose gradients matter.
+# SAMPLE and THREADS follow the field's size: 2GiB x 32 for most, 16 threads and a
+# 1-2 GiB sample for the large R02B10 fields, which halves what the threads hold.
 LIST=(
-    # R02B06 backbone
-    "R02B06|out_1_1|remap_qv_20230121T000000Z.nc|qv|5e-6"          # 3D water vapor (remap)
-    "R02B06|out_1_2|remap_qi_20230121T000000Z.nc|qi|1e-8"          # 3D cloud ice
-    "R02B06|out_1_3|remap_temp_20230121T000000Z.nc|temp|0.05"      # 3D temperature
-    "R02B06|out_1_4|remap_w_20230121T000000Z.nc|w|5e-3"            # 3D vertical wind (remap)
-    "R02B06|out_2|tot_prec_20230121T000000Z.nc|tot_prec|1e-2"      # 2D 15-min precip
-    "R02B06|out_3|t_2m_20230121T000000Z.nc|t_2m|0.05"              # 2D 2-m temperature
-    "R02B06|out_4|w_20230121T000000Z.nc|w|5e-3"                    # 3D vertical wind (native)
-    "R02B06|out_6|sob_s_20230121T000000Z.nc|sob_s|1.0"             # 2D net SW at surface
-    "R02B06|out_8|remap_cape_20230121T000000Z.nc|cape|1.0"         # 2D CAPE
-    "R02B06|out_9|remap_t_so_20230121T000000Z.nc|t_so|0.05"        # Soil temperature
-    "R02B06|out_11|geopot_20230121T000000Z.nc|geopot|1.0"          # 3D geopot
+    # R02B06, 3-D
+    "R02B06|out_1_1|remap_qv_20220225T000000Z.nc|qv|qv|0.01|2GiB|32|--gradient-gate --gradient-threshold 0.1 --gradient-shortcircuit --extremes-sensitive --phys-min 0"
+    "R02B06|out_1_2|remap_qi_20220225T000000Z.nc|qi|qi|0.01|2GiB|32|--extremes-sensitive --phys-min 0"
+    "R02B06|out_1_3|remap_temp_20220225T000000Z.nc|temp|temp|0.00056554|2GiB|32|--gradient-gate --gradient-threshold 0.1 --gradient-shortcircuit --phys-min 0"
+    "R02B06|out_1_4|remap_w_20220225T000000Z.nc|w|w|0.00942309|2GiB|32|--gradient-gate --gradient-threshold 0.1 --gradient-shortcircuit"
+    "R02B06|out_4|w_20220225T000000Z.nc|w|w|0.01|2GiB|32|--gradient-gate --gradient-threshold 0.1 --gradient-shortcircuit --extremes-sensitive"
+    "R02B06|out_11|geopot_20220225T000000Z.nc|geopot|geopot|0.00341505|2GiB|32|--gradient-gate --gradient-threshold 0.1 --gradient-shortcircuit --phys-min 0"
 
-    # Cross-resolution spot-checks
-    "R02B08|out_1_1|remap_qv_20230121T000000Z.nc|qv|5e-6"
-    "R02B10|out_1_1|remap_qv_20230121T000000Z.nc|qv|5e-6"
-    "R02B10|out_2|tot_prec_20230121T000000Z.nc|tot_prec|1e-2"
+    # R02B06, 2-D and soil
+    "R02B06|out_2|tot_prec_20220225T000000Z.nc|tot_prec|tot_prec|0.01|2GiB|32|--extremes-sensitive --phys-min 0"
+    "R02B06|out_3|t_2m_20220225T000000Z.nc|t_2m|t_2m|0.00028651|2GiB|32|--gradient-gate --gradient-threshold 0.1 --gradient-shortcircuit --phys-min 0"
+    "R02B06|out_6|sob_s_20220225T000000Z.nc|sob_s|sob_s|0.00762046|2GiB|32|--phys-min 0"
+    "R02B06|out_8|remap_cape_20220225T000000Z.nc|cape|cape|0.01|2GiB|32|--extremes-sensitive --phys-min 0"
+    "R02B06|out_9|remap_t_so_20220225T000000Z.nc|t_so|t_so|0.00036228|2GiB|32|--phys-min 0"
+
+    # R02B10
+    "R02B10|out_1_1|remap_qv_20220225T000000Z.nc|qv|qv|0.01|2GiB|16|--gradient-gate --gradient-threshold 0.1 --gradient-shortcircuit --extremes-sensitive --phys-min 0"
+    "R02B10|out_2|tot_prec_20220225T000000Z.nc|tot_prec|tot_prec|0.01|1GiB|16|--extremes-sensitive --phys-min 0"
 )
+if [[ -n "${FIELDS_FILE:-}" ]]; then
+    [[ -r "$FIELDS_FILE" ]] || { echo "[santis.run] FIELDS_FILE is not readable: $FIELDS_FILE"; exit 1; }
+    # indentation and quotes are dropped, so the lines of a generated list work as they are
+    mapfile -t LIST < <(sed -E 's/^[[:space:]]*"?//; s/"?[[:space:]]*$//' "$FIELDS_FILE" | grep -Ev '^(#|$)')
+fi
 
 resolve_root () {
     case "$1" in
@@ -149,62 +144,84 @@ resolve_root () {
 # ---------------------------------------------------------------------------
 n_total=${#LIST[@]}
 n_ok=0; n_fail=0; n_skip=0
-declare -a FAILED_ENTRIES=()
+declare -a PROBLEMS=()
 
 echo "======================================================================="
-echo "dc_toolkit evaluate_combos sweep over ${n_total} files"
+echo "dc_toolkit evaluate_combos sweep over ${n_total} field(s)"
 echo "Results base: $RESULTS_BASE"
 echo "Started at:   $(date -Is)"
+[[ -n "$JOB_END" ]] && echo "Job ends at:  $(date -d "@$JOB_END" -Is) (safeguard ${SAFEGUARD_MIN} min)"
 echo "======================================================================="
 
 for i in "${!LIST[@]}"; do
-    entry="${LIST[$i]}"
-    IFS='|' read -r RES_TAG STREAM FNAME VAR L1_THRESHOLD <<<"$entry"
+    if [[ -n "$JOB_END" ]] && (( (JOB_END - $(date +%s)) / 60 < SAFEGUARD_MIN )); then
+        echo
+        echo "[safeguard] under ${SAFEGUARD_MIN} min left: $((n_total - i)) field(s) not started."
+        echo "            Resubmit with RESULTS_BASE=$RESULTS_BASE to continue."
+        n_skip=$((n_skip + n_total - i)); PROBLEMS+=("SKIP  $((n_total - i)) field(s) from entry $((i+1)) on  (walltime)")
+        break
+    fi
 
+    IFS='|' read -r RES_TAG STREAM FNAME IVAR VAR L1_THRESHOLD SAMPLE THREADS GATES <<<"${LIST[$i]}"
+    SAMPLE=${SAMPLE:-$DEFAULT_SAMPLE}; THREADS=${THREADS:-$DEFAULT_THREADS}
+
+    if [[ -z "$VAR" || ! "$L1_THRESHOLD" =~ ^[0-9.]+([eE][-+]?[0-9]+)?$ ]]; then
+        echo "[$((i+1))/$n_total] SKIP malformed entry (RES|STREAM|FILE|IVAR|VAR|L1|...): ${LIST[$i]}"
+        n_skip=$((n_skip+1)); PROBLEMS+=("SKIP  ${LIST[$i]}  (malformed)")
+        continue
+    fi
     ROOT=$(resolve_root "$RES_TAG") || {
         echo "[$((i+1))/$n_total] SKIP unknown resolution tag '$RES_TAG'"
-        n_skip=$((n_skip+1))
+        n_skip=$((n_skip+1)); PROBLEMS+=("SKIP  ${LIST[$i]}  (unknown resolution)")
         continue
     }
     INPUT="$ROOT/$STREAM/$FNAME"
     SUBDIR="${RES_TAG}_${STREAM}_${VAR}"
     OUTDIR="$RESULTS_BASE/$SUBDIR"
-    LOG="$OUTDIR/run.log"
 
     echo
     echo "-----------------------------------------------------------------------"
     echo "[$((i+1))/$n_total] $SUBDIR"
     echo "  input    : $INPUT"
-    echo "  field    : $VAR"
+    echo "  field    : $IVAR"
     echo "  l1 thresh: $L1_THRESHOLD"
+    echo "  sample   : $SAMPLE, $THREADS thread(s)/rank"
+    echo "  gates    : ${GATES:-(defaults)}"
     echo "  outdir   : $OUTDIR"
 
     if [[ ! -e "$INPUT" ]]; then
         echo "  STATUS: SKIP - input file not found"
-        n_skip=$((n_skip+1))
-        FAILED_ENTRIES+=("SKIP  $SUBDIR  (missing input)")
+        n_skip=$((n_skip+1)); PROBLEMS+=("SKIP  $SUBDIR  (missing input)")
         continue
     fi
-
     mkdir -p "$OUTDIR"
 
+    # $GATES is split on purpose: it holds several flags
     srun --unbuffered dc_toolkit \
          evaluate_combos \
          "$INPUT" \
          --where-to-write              "$OUTDIR" \
-         --field-to-compress           "$VAR" \
+         --field-to-compress           "$IVAR" \
          --l1-threshold                "$L1_THRESHOLD" \
-         "${EVAL_FLAGS[@]}" \
-         2>&1 | stdbuf -oL -eL tee "$LOG"
+         --eval-data-size-limit        "$SAMPLE" \
+         --threads-per-rank            "$THREADS" \
+         $GATES "${EXTRA_FLAGS[@]}" \
+         2>&1 | stdbuf -oL -eL tee "$OUTDIR/run.log"
+    rc=${PIPESTATUS[0]}; step=sweep
 
-    rc=${PIPESTATUS[0]}
+    if [[ $rc -eq 0 && "${COMPRESS:-0}" == 1 ]]; then
+        srun --unbuffered --nodes=1 --ntasks=1 dc_toolkit \
+             compress "$INPUT" "$OUTDIR" --vars "$IVAR" "${COMPRESS_FLAGS[@]}" \
+             2>&1 | stdbuf -oL -eL tee "$OUTDIR/compress.log"
+        rc=${PIPESTATUS[0]}; step=compress
+    fi
+
     if [[ $rc -eq 0 ]]; then
         echo "  STATUS: OK"
         n_ok=$((n_ok+1))
     else
-        echo "  STATUS: FAILED (exit $rc)"
-        n_fail=$((n_fail+1))
-        FAILED_ENTRIES+=("FAIL  $SUBDIR  (exit $rc)")
+        echo "  STATUS: FAILED ($step, exit $rc)"
+        n_fail=$((n_fail+1)); PROBLEMS+=("FAIL  $SUBDIR  ($step, exit $rc)")
     fi
 done
 
@@ -222,13 +239,10 @@ echo "  results    : $RESULTS_BASE"
 echo "  finished at: $(date -Is)"
 if (( n_fail + n_skip > 0 )); then
     echo "  problems:"
-    for f in "${FAILED_ENTRIES[@]}"; do
-        echo "    $f"
+    for p in "${PROBLEMS[@]}"; do
+        echo "    $p"
     done
 fi
 echo "======================================================================="
 
-if (( n_ok == 0 )); then
-    exit 1
-fi
-exit 0
+(( n_total > 0 && n_ok == n_total ))   # the exit status: 0 only when every field ran

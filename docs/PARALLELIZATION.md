@@ -232,7 +232,7 @@ To keep the parallelism behaving correctly, the toolkit enforces some invariants
 
 ## Where to read further
 
-- `santis.run` — the production driver script, with an inline comment block summarizing the experiments on Santis that informed the topology choices.
+- `santis.run` — the production driver for Santis: this topology, a per-field list of budgets and gates, and resume through `RESULTS_BASE`.
 - `src/dc_toolkit/cli.py` — the commands and their options only.
 - `src/dc_toolkit/utils_cli.py` — what each command does, step by step (sweep in section 5, compress in section 6).
 - `src/dc_toolkit/utils.py` — the bypass machinery (`AsyncBypass`, `_get_or_create_shared_executor`, `_get_thread_event_loop`, section 5) and `check_thread_oversubscription`; the memory guards (`check_memory_headroom`, `check_node_memory_headroom`, `check_thread_product`) live in section 2 of `utils_cli.py`.

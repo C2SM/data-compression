@@ -438,8 +438,9 @@ Warnings do not fail the run: CR drift above 25 %, failed combos, rows with `n_c
   than filtered. The cause is the integer bit view above, not the data, and `combo_is_valid` now
   excludes the pairing. Residual weakness: a finite-but-huge decode still overflows `_error_sums`
   before any gate sees it.
-- The repo-root `santis.run` is the old production driver. Its L1 values read like native units
-  (1.0 would allow 100 % relative error) and it lacks `SRUN_CPUS_PER_TASK`. Do not reuse its list.
+- The repo-root `santis.run` is the production driver: the topology, budgets and gates of this test,
+  with entries `RES|STREAM|FILE|IVAR|VAR|L1|SAMPLE|THREADS|GATE FLAGS` (IVAR is the name inside the
+  file, VAR names the results directory).
 - `--mask-abs-above` does not exist. Fields with undeclared fill sentinels (`runoff_s`, `lhfl_s`,
   `qhfl_s`, `cin_ml`, `smi`) are deliberately left out.
 - At the default `--phys-tolerance 0` the bounds gate has no slack. On a field that sits on its bounds (clct: many cells at
