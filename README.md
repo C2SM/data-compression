@@ -154,6 +154,35 @@ refuses it up front when the field has `NaN`/`Inf`, is not float32 without the `
 frame the tile does not divide.  Keep `--eval-data-size-limit` small on EBCC sweeps: a 5 GB sample takes
 about an hour per EBCC combo per thread.
 
+## Reading a store without dc_toolkit
+
+Every codec `compress` writes decodes in a bare zarr client except two, which exist only through
+dc_toolkit's `zarr.codecs` entry point: `numcodecs.zfpy_flat` (the flattening ZFPY encoder; its bytes are
+plain zfp, only the name is ours) and `numcodecs.ebcc_filter` (which also needs the `ebcc` package).  A store
+holding either fails at `zarr.open` in a client without them, even for its other arrays, because zarr resolves
+every array's codec chain when it opens the group.
+
+Two ways round it.  `compress --stock-codecs-only` skips such winners and writes the best kept row of
+`results_{var}.parquet` whose codecs are all stock, so the store opens anywhere (the sweep still evaluates every
+pipeline).  Or register the name in the reader; for `zfpy_flat` this needs only `zfpy` and zarr, no dc_toolkit:
+
+```python
+import numcodecs, numcodecs.zfpy
+from zarr.codecs.numcodecs import ZFPY
+from zarr.registry import register_codec
+
+class _ZFPYFlat(numcodecs.zfpy.ZFPY):          # numcodecs side: the same zfp codec under a second id
+    codec_id = "zfpy_flat"
+numcodecs.register_codec(_ZFPYFlat)
+
+class ZFPYFlat(ZFPY, codec_name="zfpy_flat"):  # zarr side: the wrapper zarr instantiates from zarr.json
+    pass
+register_codec("numcodecs.zfpy_flat", ZFPYFlat)
+```
+
+Both registrations are needed: zarr v3 keeps its own codec registry on top of numcodecs'.  Decoding needs no
+reshape logic, because a zfp stream carries its own shape.  EBCC has no such shortcut: `pip install "dc_toolkit[ebcc]"`.
+
 ## UI implementation
 
 Two user interfaces wrap the same workflow for one field of a netCDF file: choose the codec space and the

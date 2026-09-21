@@ -216,6 +216,10 @@ _VERIFY_THRESHOLD_OPTIONS = [
               help="Write the --vars fields with this pipeline instead of the sweep's best: a JSON object "
                    "with compressor, filter and serializer, or the path of a file holding one; a "
                    "manifest_{var}.json works directly.")
+@click.option("--stock-codecs-only", is_flag=True, default=False,
+              help="Write only pipelines a bare zarr client can decode: when the sweep's best uses a codec "
+                   "that needs dc_toolkit's zarr.codecs entry point (numcodecs.zfpy_flat, numcodecs.ebcc_filter), "
+                   "take the best such row of results_{var}.parquet instead.")
 @utils_cli.add_options(_PERSIST_OPTIONS)
 @utils_cli.add_options(_VERIFY_OPTIONS)
 @utils_cli.add_options(_VERIFY_THRESHOLD_OPTIONS)

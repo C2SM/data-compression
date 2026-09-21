@@ -579,9 +579,10 @@ def validate_pipeline(combo, da, var: str) -> None:
     """Refuse pairings the codecs cannot run and EBCC inputs the C library
     would exit on (wrong dtype, tile not dividing the frame, NaN/Inf)."""
     compressor, filt, serializer = combo
-    if not utils.combo_is_valid(filt, serializer, compressor):
+    if not utils.combo_is_valid(filt, serializer, compressor, dtype=da.dtype):
         raise click.ClickException(
             f"{var}: invalid pipeline {utils.pipeline_name(*combo)} (e.g. FixedScaleOffset->ZFPY, "
+            f"BitRound->ZFPY below the mantissa width, "
             f"or EBCC with a filter/compressor).")
     if isinstance(filt, utils.zarrcodecs_nc.AsType):  # numcodecs reinterprets the bytes on a mismatch
         decode = filt.codec_config.get("decode_dtype")
@@ -908,7 +909,7 @@ def sweep_config_space(compressors, filters, serializers, max_evals, rank, sampl
     regular = [s for s in serializers if not isinstance(s, utils.EBCC)]
     total = len(compressors) * len(filters) * len(regular)
     config_space = [(c, f, s) for c, f, s in itertools.product(compressors, filters, regular)
-                    if utils.combo_is_valid(f, s, c)]
+                    if utils.combo_is_valid(f, s, c, dtype=sample_np.dtype)]
     if rank == 0 and len(config_space) < total:
         click.echo(f"[combo-filter] skipped {total - len(config_space)} unsupported filter/serializer "
                    f"pairing(s) (e.g. FixedScaleOffset->ZFPY).")
@@ -1249,31 +1250,38 @@ def compress_candidates(opts):
         if not wanted:
             raise click.ClickException("--pipeline needs --vars to name the field(s) it applies to.")
         pipeline = parse_pipeline_arg(opts.pipeline)
+        if getattr(opts, "stock_codecs_only", False) and not utils.pipeline_is_stock(pipeline):
+            raise click.ClickException("--stock-codecs-only refuses this --pipeline: one of its codecs needs "
+                                       "dc_toolkit's zarr.codecs entry point to be read.")
         name = utils.pipeline_name(*pipeline_codecs(pipeline, "--pipeline"))
         candidates = [{"var": v, "name": name, "pipeline": pipeline, "ratio": None, "source": "--pipeline"}
                       for v in sorted(wanted)]
     else:
+        stock = bool(getattr(opts, "stock_codecs_only", False))
         for var, m in manifests.items():
             best = m.get("best")
             if best is None:
                 dropped[var] = "the sweep kept no combo (manifest has no best)"
             elif "pipeline" not in best:
                 dropped[var] = "the manifest predates the pipeline format; re-run evaluate_combos"
-            else:
+            elif not stock or utils.pipeline_is_stock(best["pipeline"]):
                 candidates.append({"var": var, "name": best["name"], "pipeline": best["pipeline"],
                                    "ratio": best.get("ratio"), "source": f"manifest_{var}.json"})
+            else:  # the winner needs dc_toolkit to be read: the parquet's best stock row instead
+                click.echo(f"[compress] {var}: the manifest best {best['name']} needs dc_toolkit's codec entry "
+                           f"point to be read; --stock-codecs-only takes the best stock row of the parquet.")
         for ppath in sorted(wtw.glob("results_*.parquet")):
             var = ppath.stem.removeprefix("results_")
-            if var in manifests:
+            if var in dropped or any(c["var"] == var for c in candidates):
                 continue
             try:
-                kept = kept_rows(pd.read_parquet(ppath))
-                if len(kept) == 0:
-                    dropped[var] = f"no kept rows in {ppath.name}"
+                row = best_kept_row(pd.read_parquet(ppath), stock_only=stock)
+                if row is None:
+                    dropped[var] = f"no kept rows in {ppath.name}" + (" with stock codecs only" if stock else "")
                     continue
-                row = kept.sort_values(["ratio", "l1_rel", "pipeline"], ascending=[False, True, True]).iloc[0]
                 candidates.append({"var": var, "name": str(row["name"]), "pipeline": json.loads(row["pipeline"]),
-                                   "ratio": float(row["ratio"]), "source": ppath.name})
+                                   "ratio": float(row["ratio"]),
+                                   "source": ppath.name + (" (stock codecs only)" if stock else "")})
             except Exception as e:
                 dropped[var] = f"cannot use {ppath.name}: {e}"
         if wanted:
@@ -1426,6 +1434,17 @@ def kept_rows(df: pd.DataFrame) -> pd.DataFrame:
     if "keep" not in df.columns:
         return df
     return df[df["keep"].astype(str).str.strip().str.lower().isin(("true", "1"))]
+
+
+def best_kept_row(df: pd.DataFrame, stock_only: bool = False):
+    """The kept row with the best ratio (ties: lower L1, then pipeline JSON), or
+    None; `stock_only` keeps to pipelines a bare zarr client can decode."""
+    kept = kept_rows(df)
+    if stock_only:
+        kept = kept[kept["pipeline"].map(lambda p: utils.pipeline_is_stock(json.loads(p)))]
+    if len(kept) == 0:
+        return None
+    return kept.sort_values(["ratio", "l1_rel", "pipeline"], ascending=[False, True, True]).iloc[0]
 
 
 def load_results(parquet_file: str) -> pd.DataFrame:

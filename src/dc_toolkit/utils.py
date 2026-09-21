@@ -740,22 +740,24 @@ def ebcc_sweep_entries(filters, serializers, sample_np):
 
 def serializer_space(da, with_lossy=True, serializer_class="all", with_ebcc=False, data_range=None,
                      chunk_shape=None):
-    """Array->bytes serializers: PCodec (plain bytes for 8-bit fields, which
-    pco refuses), ZFPY when lossy is allowed (floats; int32/int64 in fixed-rate
-    mode only; zfp takes no other integer dtype), EBCC when requested AND lossy is
-    allowed, for float (lat, lon) frame stacks.  `data_range` (full-field
+    """Array->bytes serializers: plain bytes always (a lossy filter in front of
+    a lossless byte compressor is the classic recipe, and 8-bit fields have
+    nothing else, since pco refuses them), PCodec, ZFPY when lossy is allowed
+    (floats only: zfp's fixed-rate mode is never exact on integers, and Delta,
+    their only filter, turns its error into a random walk on decode), EBCC when
+    requested AND lossy is allowed, for float (lat, lon) frame stacks.  `data_range` (full-field
     min, max) scales the EBCC error targets; without it EBCC falls back to
     targets relative to each tile's own range."""
     if serializer_class.lower() == "ebcc":
         with_ebcc = True
-    zfp_ok = da.dtype.kind == "f" or (da.dtype.kind == "i" and da.dtype.itemsize >= 4)
+    zfp_ok = da.dtype.kind == "f"
     classes = [zarrcodecs_nc.PCodec] + ([zarrcodecs_nc.ZFPY] if with_lossy and zfp_ok else [])
     if with_ebcc and with_lossy:
         if not EBCC_AVAILABLE:
             raise ValueError("--with-ebcc needs the ebcc package: pip install -e '.[ebcc]'")
         classes.append(EBCC)
-    classes, include_none = _select_classes(classes, serializer_class, "serializer")
-    space = [None] if include_none else []
+    classes, _ = _select_classes(classes, serializer_class, "serializer")
+    space = [None]
     for cls in classes:
         if cls is zarrcodecs_nc.PCodec:
             space += [cls(level=l, mode_spec="auto", delta_spec="auto", delta_encoding_order=d)
@@ -781,7 +783,7 @@ def serializer_space(da, with_lossy=True, serializer_class="all", with_ebcc=Fals
                           EBCC.from_params(*tile, r, mode="relative_error_target")
                           for r in _EBCC_ERROR_FRACTIONS]
     if da.dtype.itemsize == 1:
-        space = [None] + [s for s in space if s is not None and not isinstance(s, zarrcodecs_nc.PCodec)]
+        space = [s for s in space if not isinstance(s, zarrcodecs_nc.PCodec)]
     return space
 
 
@@ -850,13 +852,22 @@ def fixed_scale_offset_configs(da, data_range=None):
     return configs
 
 
-def combo_is_valid(filt, serializer, compressor=None) -> bool:
-    """Reject pairings that crash inside the codecs: FixedScaleOffset emits
-    unsigned ints, which ZFPY (every mode) and 8-bit PCodec refuse.  EBCC runs
-    alone: a filter before it breaks its error bound (AsType's float32
-    down-cast excepted) and a compressor after it gains nothing."""
+def combo_is_valid(filt, serializer, compressor=None, dtype=None) -> bool:
+    """Reject pairings that crash or corrupt inside the codecs.  FixedScaleOffset
+    emits unsigned ints, which ZFPY (every mode) and 8-bit PCodec refuse.
+    BitRound below the mantissa width emits the integer bit view of the floats;
+    ZFPY accepts it, compresses the bit pattern lossily, and the decode-side
+    reinterpretation corrupts exponents (`dtype`, the field's, enables that
+    check).  EBCC runs alone: a filter before it breaks its error bound
+    (AsType's float32 down-cast excepted) and a compressor after it gains
+    nothing."""
     if isinstance(serializer, EBCC):
         return compressor is None and (filt is None or isinstance(filt, zarrcodecs_nc.AsType))
+    if (isinstance(filt, zarrcodecs_nc.BitRound) and isinstance(serializer, zarrcodecs_nc.ZFPY)
+            and dtype is not None and np.issubdtype(dtype, np.floating)):
+        keepbits = int((getattr(filt, "codec_config", None) or {}).get("keepbits", 0))
+        if keepbits < np.finfo(dtype).nmant:
+            return False
     if isinstance(filt, zarrcodecs_nc.FixedScaleOffset):
         if isinstance(serializer, zarrcodecs_nc.ZFPY):
             return False
@@ -881,6 +892,15 @@ def codec_pipeline_kwargs(compressor, filt, serializer) -> dict:
 # replace zarr's stock ZFPY (same codec name in zarr.json); EBCC has no stock class.
 _CODEC_CLASSES = {"numcodecs.zfpy": ZFPYRank, "numcodecs.zfpy_flat": ZFPYFlat,
                   "numcodecs.ebcc_filter": EBCC}
+# Names a bare zarr client cannot resolve: they exist only through dc_toolkit's
+# zarr.codecs entry point (README, "Reading a store without dc_toolkit").
+ENTRY_POINT_CODECS = frozenset(("numcodecs.zfpy_flat", "numcodecs.ebcc_filter"))
+
+
+def pipeline_is_stock(pipeline: dict) -> bool:
+    """True when every codec of a pipeline dict decodes in a bare zarr client."""
+    return all((pipeline.get(k) or {}).get("name") not in ENTRY_POINT_CODECS
+               for k in ("compressor", "filter", "serializer"))
 
 
 def codec_from_dict(d):

@@ -72,8 +72,10 @@ are 3810 lines, down from 8029 at `870943c`.
 - **Blosc gets `typesize` = item size.** Through zarr's wrapper, shuffle was a no-op and 9 of the 33
   compressors were duplicates. **Blosc ratios therefore differ from every earlier sweep.** Error
   metrics do not change.
-- ZFPY runs only on floats, and on int32/int64 in fixed-rate mode, and the sweep carries **two**
-  encoders, because zfp's per-axis limit (2^24 in 2-D, 2^16 in 3-D, 2^12 in 4-D) overflows on the
+- ZFPY runs only on floats: zfp's fixed-rate mode is never exact on integers (about +-24 on int32 at
+  any rate), and Delta, the only filter integers get, turns that into a random walk of millions on
+  decode. Integer fields get PCodec and plain bytes. The sweep carries **two** ZFPY encoders,
+  because zfp's per-axis limit (2^24 in 2-D, 2^16 in 3-D, 2^12 in 4-D) overflows on the
   R02B10 cell axis (83.9 M cells) and the way round it is a real trade-off:
   - `ZFPYRank` (`numcodecs.zfpy`) drops size-1 axes and folds the slowest pair until the shape fits,
     so a `(t, 1, cells)` chunk encodes as 2-D and zfp's blocks span the chunk's real axes.
@@ -88,8 +90,16 @@ are 3810 lines, down from 8029 at `870943c`.
   chunks are `(1, 1, 4194304)`, is unaffected and its sweep does not grow.
   The serializer grid is therefore 32 wide, not 20, and sweeps on multi-axis chunks take ~60 % longer.
   A `zfpy_flat` store decodes with stock zfp but needs dc_toolkit's `zarr.codecs` entry point for the
-  name; `numcodecs.zfpy` stays readable by a bare zarr client.
+  name; `numcodecs.zfpy` stays readable by a bare zarr client. `compress --stock-codecs-only` skips such
+  winners (and EBCC's) for the parquet's best stock row, and the README documents the reader shim.
 - BitRound and Quantize take floats only (`dtype.kind in "iu"` guards). Integer fields get Delta.
+  BitRound below the mantissa width (23 for float32, 52 for float64) emits the integer bit view of
+  the floats. PCodec and plain bytes round-trip it exactly; ZFPY accepts int32/int64, compresses the
+  bit pattern lossily, and the reinterpretation corrupts exponents. `combo_is_valid` therefore
+  rejects BitRound -> ZFPY unless keepbits is the no-op value, which passes the floats through.
+- The plain bytes serializer is in every sweep, not only for 8-bit fields: a lossy filter in front
+  of a lossless byte compressor (`bitround -> bytes -> lzma`) is the classic recipe, and it beats
+  the same filter routed through a near-identity zfp pass-through by about 2x.
 - Relative errors: 0/0 = 0 and x/0 = inf. **All-zero fields now pass the gates.** v3 kept 0 of 8580
   combos on R02B10 `out_8/cape`, which is all zeros.
 - The gradient metric is computed slab-wise and reuses the decoded buffer.
@@ -422,12 +432,11 @@ Warnings do not fail the run: CR drift above 25 %, failed combos, rows with `n_c
 
 - Blosc ratios, and so some best pipelines, differ from v3 results. Heavy fields use 1 GiB samples
   here, so their numbers are not directly comparable with v3.
-- BitRound -> ZFPY decodes finite cells to NaN or ~-2.5e38 on fields whose values reach zero (clct,
-  tot_prec, both qc; never t_2m or the all-zero cape). The count depends on the encoder and the
-  field: 594 per field when every chunk was flattened (870261), 957 / 924 / 660 with the rank-aware
-  encoder (872001), and both families contribute once the sweep carries both. The finite gate
-  rejects every one, so nothing corrupt is written; it is data-dependent, so `combo_is_valid`
-  cannot prefilter it.
+- BitRound -> ZFPY used to decode finite cells to NaN, ~-2.5e38 (float32) or ~1e308 (float64); on
+  float64 the L2 accumulator then overflowed to inf and the combo was recorded as failed rather
+  than filtered. The cause is the integer bit view above, not the data, and `combo_is_valid` now
+  excludes the pairing. Residual weakness: a finite-but-huge decode still overflows `_error_sums`
+  before any gate sees it.
 - The repo-root `santis.run` is the old production driver. Its L1 values read like native units
   (1.0 would allow 100 % relative error) and it lacks `SRUN_CPUS_PER_TASK`. Do not reuse its list.
 - `--mask-abs-above` does not exist. Fields with undeclared fill sentinels (`runoff_s`, `lhfl_s`,
