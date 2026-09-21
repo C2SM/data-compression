@@ -107,7 +107,7 @@ srun --unbuffered dc_toolkit evaluate_combos input.nc \
     --threads-per-rank 32
 ```
 
-One rank per node holds a single copy of the sample; several ranks per node (`--allow-multi-rank-per-node`) each hold their own, which does not fit on large fields.  `santis.run` is the production driver; it reads the input location from the environment: `DYAMOND_DATA_ROOT=/path/to/parent sbatch santis.run`, where the parent directory holds the `Data_Dyamond_PostProcessed*` trees.
+One rank per node with 32 threads holds about 65 × the sample (one copy plus each thread's decoded buffers); 32 single-threaded ranks (`--allow-multi-rank-per-node`) each hold their own copy, about 96 × the sample per node: ~1.5× more, not 32×, because the per-thread decoded buffer dominates either way.  `docs/PARALLELIZATION.md` has the arithmetic.  `santis.run` is the production driver; it reads the input location from the environment: `DYAMOND_DATA_ROOT=/path/to/parent sbatch santis.run`, where the parent directory holds the `Data_Dyamond_PostProcessed*` trees.
 
 Codec-internal thread pools must be pinned to 1 to avoid nested oversubscription (the tool checks this at startup and aborts by default; `--no-oversubscription-check` disables the guard):
 
