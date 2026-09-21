@@ -738,8 +738,9 @@ def serializer_space(da, with_lossy=True, serializer_class="all", with_ebcc=Fals
     if serializer_class.lower() == "ebcc":
         with_ebcc = True
     zfp_ok = da.dtype.kind == "f"
-    if serializer_class.lower() == "zfpy" and not zfp_ok:
-        raise ValueError(f"ZFPY takes floats only; {da.dtype} gets PCodec and plain bytes")
+    if serializer_class.lower() == "zfpy" and not (zfp_ok and with_lossy):
+        raise ValueError("ZFPY is lossy: --serializer-class zfpy needs --with-lossy" if zfp_ok else
+                         f"ZFPY takes floats only, not {da.dtype}")
     classes = [zarrcodecs_nc.PCodec] + ([zarrcodecs_nc.ZFPY] if with_lossy and zfp_ok else [])
     if with_ebcc and with_lossy:
         if not EBCC_AVAILABLE:
@@ -748,7 +749,7 @@ def serializer_space(da, with_lossy=True, serializer_class="all", with_ebcc=Fals
     classes, include_none = _select_classes(classes, serializer_class, "serializer")
     if with_ebcc and with_lossy and EBCC not in classes:
         classes.append(EBCC)                     # --with-ebcc holds under a named class too
-    space = [None] if include_none or serializer_class.lower() == "all" else []
+    space, why = ([None] if include_none or serializer_class.lower() == "all" else []), None
     for cls in classes:
         if cls is zarrcodecs_nc.PCodec:
             space += [cls(level=l, mode_spec="auto", delta_spec="auto", delta_encoding_order=d)
@@ -765,7 +766,7 @@ def serializer_space(da, with_lossy=True, serializer_class="all", with_ebcc=Fals
             space += [v(mode=mode, **{param: fn(k)})
                       for v in variants for mode, param, fn in modes for k in _ZFPY_K_GRID]
         elif cls is EBCC:
-            tile, _ = ebcc_tile(da)
+            tile, why = ebcc_tile(da)
             if tile is not None:
                 span = float(data_range[1] - data_range[0]) if data_range else None
                 space += [EBCC.from_params(*tile, r * span) if span else
@@ -773,6 +774,8 @@ def serializer_space(da, with_lossy=True, serializer_class="all", with_ebcc=Fals
                           for r in _EBCC_ERROR_FRACTIONS]
     if da.dtype.itemsize == 1:
         space = [None] + [s for s in space if s is not None and not isinstance(s, zarrcodecs_nc.PCodec)]
+    if not space:  # a named class with nothing for this field: the caller skips or refuses it
+        raise ValueError(f"--serializer-class {serializer_class} has nothing for this field" + (f": {why}" if why else ""))
     return space
 
 

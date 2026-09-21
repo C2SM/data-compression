@@ -94,8 +94,7 @@ _CODEC_THREAD_OPTIONS = [
 ]
 _MEMORY_OPTION = click.option(
     "--memory-threshold", type=click.FloatRange(0.05, 0.95), default=0.80, show_default=True,
-    help="Max fraction of the memory budget (the cgroup limit, else the host's RAM) an estimated footprint "
-                   "may use before aborting.")
+    help="Max fraction of the available memory an estimated footprint may use before aborting.")
 _PERSIST_OPTIONS = _CHUNK_OVERRIDE_OPTIONS + [
     click.option("--shard-mib", type=int, default=512, show_default=True,
                  help="Target shard size in MiB (an integer number of inner chunks).  Sharding is "
@@ -105,7 +104,7 @@ _PERSIST_OPTIONS = _CHUNK_OVERRIDE_OPTIONS + [
                       "(max(source block, shard) + 3 x shard); the memory guard refuses what does not fit."),
 ] + _CODEC_THREAD_OPTIONS + [_MEMORY_OPTION]
 def _finite(ctx, param, value):
-    """A NaN or infinite bound would fail every combo without a word."""
+    """A NaN bound fails every combo without a word; refuse every non-finite value."""
     if value is not None and (value != value or abs(value) == float("inf")):
         raise click.BadParameter("must be finite")
     return value
@@ -285,9 +284,11 @@ def compress(ctx, **_):
             var = cand["var"]
             click.echo(f"\n[compress] ({i}/{len(candidates)}) {var} from {cand['source']}: {cand['name']}")
             if opts.skip_existing and var in existing:
-                click.echo(f"[compress] {var} already in {merged_path}; skipping.")
-                results[var] = {"status": "skipped-existing"}
-                continue
+                if not opts.stock_codecs_only or utils_cli.array_is_stock(merged_path, var):
+                    click.echo(f"[compress] {var} already in {merged_path}; skipping.")
+                    results[var] = {"status": "skipped-existing"}
+                    continue
+                click.echo(f"[compress] {var} in {merged_path} needs dc_toolkit to be read; rewriting it.")
             if var not in ds.data_vars:
                 any_error = True
                 click.echo(f"[compress] ERROR: variable '{var}' not in dataset; skipping.")
@@ -308,6 +309,12 @@ def compress(ctx, **_):
 
     for cand in candidates[stopped_at:] if stopped_at else []:
         results.setdefault(cand["var"], {"status": "not-attempted", "reason": "the run stopped at an earlier failure"})
+    if opts.stock_codecs_only:
+        left = sorted(v for v in utils_cli.existing_arrays(merged_path) if not utils_cli.array_is_stock(merged_path, v))
+        if left:
+            any_error = True
+            click.echo(f"[compress] ERROR: {merged_path} still holds array(s) that need dc_toolkit to be read: "
+                       f"{', '.join(left)}.")
     if Path(merged_path).is_dir():
         if opts.consolidate:
             names = utils_cli.consolidate_store(merged_path)

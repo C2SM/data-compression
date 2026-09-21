@@ -155,6 +155,16 @@ def existing_arrays(merged_path: str) -> set:
         return set()
 
 
+def array_is_stock(merged_path: str, var: str) -> bool:
+    """True when the stored array names no codec that needs dc_toolkit to be read
+    (the inner codecs of a sharded array included)."""
+    try:
+        text = (Path(merged_path) / var / "zarr.json").read_text()
+    except OSError:
+        return True
+    return not any(f'"{name}"' in text for name in utils.ENTRY_POINT_CODECS)
+
+
 def staging_path(merged_path: str) -> Path:
     """The store a field is written into before its gates have passed: a
     sibling of the real store, so an interrupted run leaves nothing inside it
@@ -310,27 +320,26 @@ def max_sample_bytes_for_threads(budget_bytes: int, threads_per_rank: int, inner
 
 
 def _cgroup_v2_memory_paths():
-    """(path, shared): the namespaced root (a container's limit, which its ranks
-    share), then the cgroup named in /proc/self/cgroup (the task's own) and its
-    ancestors.  Under SLURM the root is absent and the task's own cgroup reads
-    "max"; the limit sits on an ancestor that the job's tasks on the node share."""
-    yield "/sys/fs/cgroup/memory.max", True
+    """The namespaced root (a container's limit), then the cgroup named in
+    /proc/self/cgroup and its ancestors: under SLURM the root is absent and the
+    task's own cgroup reads "max", while the limit sits on an ancestor.  Wherever
+    it sits, the ranks on the node share it."""
+    yield "/sys/fs/cgroup/memory.max"
     try:
         with open("/proc/self/cgroup") as fh:
             rel = next((line.split(":", 2)[2].strip() for line in fh if line.startswith("0::")), "")
     except OSError:
         return
     parts = [p for p in rel.split("/") if p]
-    own = len(parts)
     while parts:
-        yield "/sys/fs/cgroup/" + "/".join(parts) + "/memory.max", len(parts) < own
+        yield "/sys/fs/cgroup/" + "/".join(parts) + "/memory.max"
         parts.pop()
 
 
 def detect_node_memory_budget() -> tuple[int, str]:
     """(bytes, source): cgroup v2 limit, else cgroup v1, else host RAM.  The
     cgroup is what actually OOM-kills a SLURM task; psutil cannot see it."""
-    for path, shared in _cgroup_v2_memory_paths():
+    for path in _cgroup_v2_memory_paths():
         try:
             with open(path) as fh:
                 val = fh.read().strip()
@@ -338,7 +347,7 @@ def detect_node_memory_budget() -> tuple[int, str]:
             continue
         try:
             if val and val != "max":
-                return int(val), f"cgroup v2 {'node' if shared else 'task'} ({path})"
+                return int(val), f"cgroup v2 ({path})"
         except ValueError:
             continue
     try:
@@ -358,23 +367,14 @@ def detect_node_memory_budget() -> tuple[int, str]:
     return psutil.virtual_memory().total, "psutil host total"
 
 
-def budget_is_per_task(source: str) -> bool:
-    """Only the task's own cgroup binds one rank; every other budget is shared by
-    the ranks on the node."""
-    return source.startswith("cgroup v2 task")
-
-
 def check_node_memory_headroom(per_rank_steady_bytes: int, ranks_on_node: int, rank: int,
                                label: str, threshold: float = 0.80) -> None:
-    """Abort if the sweep's steady-state footprint exceeds the memory budget: one
-    rank's when the limit is the task's own cgroup, all ranks' otherwise."""
+    """Abort if the steady-state footprint of the ranks on the node exceeds the
+    memory budget, which they share whether it is a cgroup limit or host RAM."""
     if rank != 0:
         return
     available, source = detect_node_memory_budget()
-    if budget_is_per_task(source):
-        required, scope = per_rank_steady_bytes, "per-rank (the task's own cgroup)"
-    else:
-        required, scope = max(1, ranks_on_node) * per_rank_steady_bytes, f"per-node ({ranks_on_node} rank(s) x per-rank)"
+    required, scope = max(1, ranks_on_node) * per_rank_steady_bytes, f"per-node ({ranks_on_node} rank(s) x per-rank)"
     if required > threshold * available:
         click.echo(
             f"[memcheck] REFUSING to start sweep: memory requirement {hsize(required)} ({scope}, "
@@ -778,7 +778,7 @@ def sweep_sample_limit(var: str, field_bytes: int, opts, sweep: SweepContext) ->
     memory budget, then run the memory guards.  Returns the effective limit."""
     threads, chunk_mib = opts.threads_per_rank, opts.inner_chunk_mib
     node_budget, source = detect_node_memory_budget()
-    effective_budget = node_budget if budget_is_per_task(source) else node_budget // max(1, sweep.ranks_on_node)
+    effective_budget = node_budget // max(1, sweep.ranks_on_node)
     max_safe = max_sample_bytes_for_threads(int(effective_budget * opts.memory_threshold), threads, chunk_mib)
     # Rank 0 sizes the sample for everyone, so every rank adopts the smallest node's limit.
     limit = sweep.comm.allreduce(min(int(opts.eval_data_size_limit), max_safe), op=MPI.MIN)
@@ -1281,21 +1281,23 @@ def compress_candidates(opts):
     else:
         stock, deferred = bool(getattr(opts, "stock_codecs_only", False)), {}
         for var, m in manifests.items():
+            if wanted and var not in wanted:
+                continue
             best = m.get("best")
             if best is None:
                 dropped[var] = "the sweep kept no combo (manifest has no best)"
-            elif "pipeline" not in best:
+            elif not isinstance(best, dict) or not isinstance(best.get("pipeline"), dict):
                 dropped[var] = "the manifest best has no pipeline; re-run evaluate_combos"
             elif not stock or utils.pipeline_is_stock(best["pipeline"]):
-                candidates.append({"var": var, "name": best["name"], "pipeline": best["pipeline"],
+                candidates.append({"var": var, "name": best.get("name", "?"), "pipeline": best["pipeline"],
                                    "ratio": best.get("ratio"), "source": f"manifest_{var}.json"})
             else:  # the winner needs dc_toolkit to be read: the parquet's best stock row instead
-                deferred[var] = best["name"]
-                click.echo(f"[compress] {var}: the manifest best {best['name']} needs dc_toolkit's codec entry "
+                deferred[var] = best.get("name", "?")
+                click.echo(f"[compress] {var}: the manifest best {best.get('name', '?')} needs dc_toolkit's codec entry "
                            f"point to be read; --stock-codecs-only takes the best stock row of the parquet.")
         for ppath in sorted(wtw.glob("results_*.parquet")):
             var = ppath.stem.removeprefix("results_")
-            if var in dropped or any(c["var"] == var for c in candidates):
+            if (wanted and var not in wanted) or var in dropped or any(c["var"] == var for c in candidates):
                 continue
             try:
                 row = best_kept_row(pd.read_parquet(ppath), stock_only=stock)
