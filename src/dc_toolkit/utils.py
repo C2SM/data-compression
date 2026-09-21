@@ -552,13 +552,12 @@ def filter_space(da, with_lossy=True, filter_class="all", data_range=None):
 # JSON (the resume key, the parquet pipeline column, the manifest's winner).
 
 
+# (Comments, not docstrings: zarr's wrapper replaces a codec class's docstring.)
+# ZFPYRank encodes each chunk at its own rank, folded only as far as zfp requires
+# (at most 4-D; per-axis header budget 2**24 at 2-D, 2**16 at 3-D, 2**12 at 4-D,
+# which DYAMOND's cell axis overflows): size-1 axes dropped, then the slowest pair
+# folded until the rank and every axis fit.  Its plain "zfpy" name decodes anywhere.
 class ZFPYRank(zarrcodecs_nc.ZFPY, codec_name="zfpy"):
-    """ZFPY that encodes each chunk at its own rank, folded only as far as zfp's
-    per-axis header budget requires (2**24 at 2-D, 2**16 at 3-D, 2**12 at 4-D;
-    DYAMOND's cell axis overflows it): size-1 axes dropped, then the slowest
-    pair folded until every axis fits.  Stored under the plain "zfpy" name,
-    which stock readers decode."""
-
     _ZFP_MAX_PER_AXIS = {1: 2**48, 2: 2**24, 3: 2**16, 4: 2**12}
 
     @classmethod
@@ -586,15 +585,15 @@ class _ZFPYFlatCodec(numcodecs.zfpy.ZFPY):
 numcodecs.register_codec(_ZFPYFlatCodec)
 
 
+# ZFPYFlat encodes every chunk as 1-D.  Decoding is stock zfp (the stream carries
+# its own shape), but a client without dc_toolkit cannot resolve the name.
 class ZFPYFlat(ZFPYRank, codec_name="zfpy_flat"):
-    """ZFPY that encodes every chunk as 1-D.  Decoding is stock zfp (the stream
-    carries its own shape), but the "zfpy_flat" name resolves only through
-    dc_toolkit's zarr.codecs entry point, so a bare zarr client cannot open a
-    store that uses it."""
-
     @classmethod
     def encode_shape(cls, shape) -> tuple:
         return (max(1, int(np.prod(shape))),)
+
+
+register_codec("numcodecs.zfpy_flat", ZFPYFlat)   # in-process reads must not depend on the install's entry points
 
 
 # ---- EBCC (optional): JPEG 2000 base layer + error-bounded residual ----------
@@ -724,25 +723,32 @@ def ebcc_sweep_entries(filters, serializers, sample_np):
 
 
 def serializer_space(da, with_lossy=True, serializer_class="all", with_ebcc=False, data_range=None,
-                     chunk_shape=None):
-    """Array->bytes serializers: plain bytes always (a lossy filter in front of
-    a lossless byte compressor is the classic recipe, and 8-bit fields have
-    nothing else, since pco refuses them), PCodec, ZFPY when lossy is allowed
+                     chunk_shapes=None):
+    """Array->bytes serializers: plain bytes (with 'all' and 'none': a lossy
+    filter in front of a lossless byte compressor is the classic recipe, and
+    8-bit fields have nothing else, since pco refuses them), PCodec, ZFPY when
+    lossy is allowed
     (floats only: zfp's fixed-rate mode is never exact on integers, and Delta,
     their only filter, turns its error into a random walk on decode), EBCC when
     requested AND lossy is allowed, for float (lat, lon) frame stacks.  `data_range` (full-field
     min, max) scales the EBCC error targets; without it EBCC falls back to
-    targets relative to each tile's own range."""
+    targets relative to each tile's own range.  `chunk_shapes`: the chunks ZFPY
+    will meet (the sample's and the store's); ZFPYFlat is planned unless
+    ZFPYRank already encodes every one of them as 1-D."""
     if serializer_class.lower() == "ebcc":
         with_ebcc = True
     zfp_ok = da.dtype.kind == "f"
+    if serializer_class.lower() == "zfpy" and not zfp_ok:
+        raise ValueError(f"ZFPY takes floats only; {da.dtype} gets PCodec and plain bytes")
     classes = [zarrcodecs_nc.PCodec] + ([zarrcodecs_nc.ZFPY] if with_lossy and zfp_ok else [])
     if with_ebcc and with_lossy:
         if not EBCC_AVAILABLE:
             raise ValueError("--with-ebcc needs the ebcc package: pip install -e '.[ebcc]'")
         classes.append(EBCC)
-    classes, _ = _select_classes(classes, serializer_class, "serializer")
-    space = [None]
+    classes, include_none = _select_classes(classes, serializer_class, "serializer")
+    if with_ebcc and with_lossy and EBCC not in classes:
+        classes.append(EBCC)                     # --with-ebcc holds under a named class too
+    space = [None] if include_none or serializer_class.lower() == "all" else []
     for cls in classes:
         if cls is zarrcodecs_nc.PCodec:
             space += [cls(level=l, mode_spec="auto", delta_spec="auto", delta_encoding_order=d)
@@ -753,11 +759,9 @@ def serializer_space(da, with_lossy=True, serializer_class="all", with_ebcc=Fals
                 (zfpy.mode_fixed_precision, "precision", compute_fixed_precision_param),
                 (zfpy.mode_fixed_rate, "rate", compute_fixed_rate_param),
             ]
-            if da.dtype.kind == "i":
-                modes = modes[2:]
             variants = [ZFPYRank]
-            if chunk_shape is None or ZFPYFlat.encode_shape(chunk_shape) != ZFPYRank.encode_shape(chunk_shape):
-                variants.append(ZFPYFlat)      # skipped when Rank already folds the chunk to 1-D
+            if not chunk_shapes or any(ZFPYFlat.encode_shape(c) != ZFPYRank.encode_shape(c) for c in chunk_shapes):
+                variants.append(ZFPYFlat)
             space += [v(mode=mode, **{param: fn(k)})
                       for v in variants for mode, param, fn in modes for k in _ZFPY_K_GRID]
         elif cls is EBCC:
@@ -768,7 +772,7 @@ def serializer_space(da, with_lossy=True, serializer_class="all", with_ebcc=Fals
                           EBCC.from_params(*tile, r, mode="relative_error_target")
                           for r in _EBCC_ERROR_FRACTIONS]
     if da.dtype.itemsize == 1:
-        space = [s for s in space if not isinstance(s, zarrcodecs_nc.PCodec)]
+        space = [None] + [s for s in space if s is not None and not isinstance(s, zarrcodecs_nc.PCodec)]
     return space
 
 
@@ -885,8 +889,8 @@ ENTRY_POINT_CODECS = frozenset(("numcodecs.zfpy_flat", "numcodecs.ebcc_filter"))
 
 def pipeline_is_stock(pipeline: dict) -> bool:
     """True when every codec of a pipeline dict decodes in a bare zarr client."""
-    return all((pipeline.get(k) or {}).get("name") not in ENTRY_POINT_CODECS
-               for k in ("compressor", "filter", "serializer"))
+    codecs = (pipeline.get(k) for k in ("compressor", "filter", "serializer"))
+    return all(not isinstance(c, dict) or c.get("name") not in ENTRY_POINT_CODECS for c in codecs)
 
 
 def codec_from_dict(d):
@@ -1233,7 +1237,7 @@ def compute_errors_distances(da_compressed, da, q99_abs=None):
     finite_orig, finite_dec = np.isfinite(da), np.isfinite(da_compressed)
     valid = finite_orig & finite_dec
     o = dask.array.where(valid, da, 0)
-    dec = dask.array.where(valid, da_compressed, np.nan)  # NaN outside the valid cells
+    dec = dask.array.where(valid, da_compressed, np.nan)  # so nanmin/nanmax skip the masked cells
     err = dask.array.where(valid, da_compressed, 0) - o
     reductions = [
         np.abs(err).sum(), np.abs(o).sum(),

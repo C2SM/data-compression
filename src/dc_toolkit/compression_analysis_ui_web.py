@@ -42,7 +42,7 @@ def load_and_resize_netcdf(file_content, original_name, max_size_bytes=1e7):
 
 
 def run_streaming(cmd, status):
-    """Run a command and mirror its output lines into a streamlit placeholder."""
+    """Run a command, showing its latest output line in a streamlit placeholder."""
     with subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
                           env=utils_cli.ui_env()) as proc:
         for line in proc.stdout:

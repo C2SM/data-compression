@@ -181,8 +181,8 @@ def promote_staged(merged_path: str, var: str) -> None:
 
 def consolidate_store(merged_path: str) -> list:
     """(Re)write the store's consolidated metadata; returns the array names
-    inside.  Staging leftovers of an interrupted run are dropped first, so
-    consolidation can never publish a half-written field."""
+    inside.  Staging leftovers of a killed run (its cleanup never ran) are
+    dropped first."""
     leftovers = sorted(p.name for p in staging_path(merged_path).iterdir()) if staging_path(merged_path).is_dir() else []
     if leftovers:
         click.echo(f"[store] discarding the unfinished write(s) of an interrupted run: {', '.join(leftovers)}")
@@ -310,11 +310,11 @@ def max_sample_bytes_for_threads(budget_bytes: int, threads_per_rank: int, inner
 
 
 def _cgroup_v2_memory_paths():
-    """(path, shared): the namespaced root, then the cgroup named in
-    /proc/self/cgroup and its ancestors.  Under SLURM the root is absent and the
-    task's own cgroup reads "max"; the limit sits on an ancestor that every task
-    on the node shares."""
-    yield "/sys/fs/cgroup/memory.max", False
+    """(path, shared): the namespaced root (a container's limit, which its ranks
+    share), then the cgroup named in /proc/self/cgroup (the task's own) and its
+    ancestors.  Under SLURM the root is absent and the task's own cgroup reads
+    "max"; the limit sits on an ancestor that the job's tasks on the node share."""
+    yield "/sys/fs/cgroup/memory.max", True
     try:
         with open("/proc/self/cgroup") as fh:
             rel = next((line.split(":", 2)[2].strip() for line in fh if line.startswith("0::")), "")
@@ -540,19 +540,18 @@ def space_args(opts) -> dict:
     return {k: getattr(opts, k) for k in SPACE_KEYS}
 
 
-def codec_spaces(sample_da, space_args: dict, fso_range, chunk_shape=None):
+def codec_spaces(sample_da, space_args: dict, fso_range, chunk_shapes=None):
     """(compressors, filters, serializers) built from the sample.  `fso_range`
     is the FULL field's (min, max): FixedScaleOffset and EBCC must not be
-    parameterised from a sample that may miss the extremes.  `chunk_shape` is
-    the evaluation chunk, which decides whether ZFPYFlat and ZFPYRank encode it
-    differently."""
+    parameterised from a sample that may miss the extremes.  `chunk_shapes`: see
+    utils.serializer_space."""
     try:
         return (utils.compressor_space(sample_da, space_args["with_lossy"], space_args["compressor_class"]),
                 utils.filter_space(sample_da, space_args["with_lossy"], space_args["filter_class"],
                                    data_range=fso_range),
                 utils.serializer_space(sample_da, space_args["with_lossy"], space_args["serializer_class"],
                                        with_ebcc=space_args["with_ebcc"], data_range=fso_range,
-                                       chunk_shape=chunk_shape))
+                                       chunk_shapes=chunk_shapes))
     except (ValueError, TypeError) as e:  # unknown class name, or a dtype a codec does not take
         raise click.ClickException(str(e))
 
@@ -928,7 +927,7 @@ def sweep_config_space(compressors, filters, serializers, max_evals, rank, sampl
                     if utils.combo_is_valid(f, s, c, dtype=sample_np.dtype)]
     if rank == 0 and len(config_space) < total:
         click.echo(f"[combo-filter] skipped {total - len(config_space)} unsupported filter/serializer "
-                   f"pairing(s) (e.g. FixedScaleOffset->ZFPY).")
+                   f"pairing(s) (FixedScaleOffset->ZFPY, BitRound->ZFPY below the mantissa width).")
     if max_evals is not None and max_evals < len(config_space):
         if rank == 0:
             click.echo(f"[max-evals] capping config space at {max_evals} (of {len(config_space)} possible).")
@@ -1198,10 +1197,10 @@ def sweep_variable(da, var: str, opts, sweep: SweepContext, n_vars: int) -> None
     if opts.extremes_sensitive and rank == 0:
         click.echo(f"[gates] {var}: q99(|value|)={q99_abs} (extreme-tail cut for the q99 gate)")
     try:
-        eval_chunks = utils.compute_chunk_shape_for_eval(
-            sample_np.shape, sample_np.dtype, target_mib=opts.inner_chunk_mib,
-            dims=sample_da.dims, allow_spatial_split=opts.spatial_split)
-        spaces = codec_spaces(sample_da, space_args(opts), fso_range, chunk_shape=eval_chunks)
+        chunks = [utils.compute_chunk_shape_for_eval(shape, sample_np.dtype, target_mib=opts.inner_chunk_mib,
+                                                      dims=sample_da.dims, allow_spatial_split=opts.spatial_split)
+                  for shape in (sample_np.shape, da.shape)]   # the sample's chunk and the store's
+        spaces = codec_spaces(sample_da, space_args(opts), fso_range, chunk_shapes=chunks)
     except click.ClickException as e:  # a class this field's dtype does not support; identical on every rank
         if opts.field_to_compress is not None:
             raise
@@ -1280,7 +1279,7 @@ def compress_candidates(opts):
         candidates = [{"var": v, "name": name, "pipeline": pipeline, "ratio": None, "source": "--pipeline"}
                       for v in sorted(wanted)]
     else:
-        stock = bool(getattr(opts, "stock_codecs_only", False))
+        stock, deferred = bool(getattr(opts, "stock_codecs_only", False)), {}
         for var, m in manifests.items():
             best = m.get("best")
             if best is None:
@@ -1291,6 +1290,7 @@ def compress_candidates(opts):
                 candidates.append({"var": var, "name": best["name"], "pipeline": best["pipeline"],
                                    "ratio": best.get("ratio"), "source": f"manifest_{var}.json"})
             else:  # the winner needs dc_toolkit to be read: the parquet's best stock row instead
+                deferred[var] = best["name"]
                 click.echo(f"[compress] {var}: the manifest best {best['name']} needs dc_toolkit's codec entry "
                            f"point to be read; --stock-codecs-only takes the best stock row of the parquet.")
         for ppath in sorted(wtw.glob("results_*.parquet")):
@@ -1307,6 +1307,9 @@ def compress_candidates(opts):
                                    "source": ppath.name + (" (stock codecs only)" if stock else "")})
             except Exception as e:
                 dropped[var] = f"cannot use {ppath.name}: {e}"
+        for var, name in deferred.items():
+            if var not in dropped and not any(c["var"] == var for c in candidates):
+                dropped[var] = f"the manifest best {name} is not stock and results_{var}.parquet is missing"
         if wanted:
             candidates = [c for c in candidates if c["var"] in wanted]
             dropped = {v: dropped.get(v, "no manifest_{var}.json or results_{var}.parquet in WHERE_TO_WRITE")
@@ -1320,10 +1323,11 @@ def compress_candidates(opts):
 
 def compress_one(da, var: str, cand: dict, manifest, merged_path: str, opts) -> dict:
     """Persist one field with its candidate pipeline and run the verify and
-    CR-drift gates.  The field is written under a staging name and renamed
-    into place only after the gates passed, so a failed or interrupted write
-    never counts as done and never replaces an earlier good array.  Returns
-    the entry for batch_manifest.json; gate failures raise RuntimeError."""
+    CR-drift gates.  The field is written into the staging store next to the
+    shared one and renamed into place only after the gates passed, so a failed
+    or interrupted write never counts as done and never replaces an earlier
+    good array.  Returns the entry for batch_manifest.json; gate failures
+    raise RuntimeError."""
     combo = pipeline_codecs(cand["pipeline"], var)
     validate_pipeline(combo, da, var)
     geometry, sources = chunk_geometry(opts, manifest)

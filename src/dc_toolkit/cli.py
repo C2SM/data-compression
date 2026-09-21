@@ -57,8 +57,8 @@ _CODEC_SPACE_OPTIONS = [
                       "field without the class is skipped (an error when it is the --field-to-compress)."),
     click.option("--serializer-class", default="all", show_default=True,
                  type=click.Choice(["all", "none", "pcodec", "zfpy", "ebcc"], case_sensitive=False),
-                 help="Restrict the serializers to one class; 'none' = plain bytes.  Fields the class cannot "
-                      "take are skipped, as for --filter-class."),
+                 help="Restrict the serializers to one class; 'all' includes plain bytes, 'none' is plain bytes "
+                      "alone.  Fields the class cannot take are skipped, as for --filter-class."),
     click.option("--with-lossy/--without-lossy", default=True, show_default=True,
                  help="Include lossy filters and serializers in the codec space."),
     click.option("--with-ebcc/--without-ebcc", default=False, show_default=True,
@@ -94,7 +94,8 @@ _CODEC_THREAD_OPTIONS = [
 ]
 _MEMORY_OPTION = click.option(
     "--memory-threshold", type=click.FloatRange(0.05, 0.95), default=0.80, show_default=True,
-    help="Max fraction of available RAM a single tracked allocation may use before aborting.")
+    help="Max fraction of the memory budget (the cgroup limit, else the host's RAM) an estimated footprint "
+                   "may use before aborting.")
 _PERSIST_OPTIONS = _CHUNK_OVERRIDE_OPTIONS + [
     click.option("--shard-mib", type=int, default=512, show_default=True,
                  help="Target shard size in MiB (an integer number of inner chunks).  Sharding is "
@@ -228,7 +229,7 @@ _VERIFY_THRESHOLD_OPTIONS = [
                    "with compressor, filter and serializer, or the path of a file holding one; a "
                    "manifest_{var}.json works directly.")
 @click.option("--stock-codecs-only", is_flag=True, default=False,
-              help="Write only pipelines a bare zarr client can decode: when the sweep's best uses a codec "
+              help="Write only pipelines a zarr client without dc_toolkit can decode: when the sweep's best uses a codec "
                    "that needs dc_toolkit's zarr.codecs entry point (numcodecs.zfpy_flat, numcodecs.ebcc_filter), "
                    "take the best such row of results_{var}.parquet instead.")
 @utils_cli.add_options(_PERSIST_OPTIONS)

@@ -35,7 +35,7 @@ uenv image pull $UENV_NAME
 uenv start --view=default $UENV_NAME
 ```
 
-once the above is complete (just for Santis, locally it is not needed):
+once the above is complete (the uenv steps are for ALPS only; locally they are not needed):
 
 ```commandline
 git clone git@github.com:C2SM/data-compression.git dc_toolkit
@@ -154,11 +154,11 @@ about an hour per EBCC combo per thread.
 
 ## Reading a store without dc_toolkit
 
-Every codec `compress` writes decodes in a bare zarr client except two, which exist only through
+Every codec `compress` writes decodes in a zarr client without dc_toolkit (given numcodecs, `pcodec` and `zfpy`) except two, which exist only through
 dc_toolkit's `zarr.codecs` entry point: `numcodecs.zfpy_flat` (the flattening ZFPY encoder; its bytes are
 plain zfp, only the name is ours) and `numcodecs.ebcc_filter` (which also needs the `ebcc` package).  A store
 holding either fails at `zarr.open` in a client without them, even for its other arrays, because zarr resolves
-every array's codec chain when it opens the group.
+every array's codec chain when it opens the group's consolidated metadata.
 
 Two ways round it.  `compress --stock-codecs-only` skips such winners and writes the best kept row of
 `results_{var}.parquet` whose codecs are all stock, so the store opens anywhere (the sweep still evaluates every
@@ -237,14 +237,14 @@ docker run \
 
 **Command Breakdown:**
 
-* **`-u $(id -u):$(id -g)`**: Runs the container using your local machine's User and Group IDs rather than the Docker default `root`. This guarantees that compressed files output to your machine, are fully owned by you and aren't locked behind root permissions.
+* **`-u $(id -u):$(id -g)`**: Runs the container using your local machine's User and Group IDs rather than the Docker default `root`. The files written to your machine are then owned by you and aren't locked behind root permissions.
 * **`-w /mnt/data/docker_saved_files`**: Sets the Working Directory.
 * **`-v "$(pwd)/netCDF_files":/mnt/data`**: The volume mount. This creates a bridge between your local computer and the container so the toolkit can read your input data and write the results back to your hard drive.
 * **`-e XDG_CACHE_HOME=/tmp/.cache`**: Sets the cache directory to a temporary location inside the container.
 * **`-e OMP_NUM_THREADS=1 ...`**: Pins the codec-internal thread pools to 1; `evaluate_combos` aborts at startup otherwise (`--no-oversubscription-check` disables the guard).
 * **`--entrypoint /bin/bash`**: Forces Docker to start with a Bash shell instead of the default program (dc_toolkit).
 * **`dc-toolkit`**: The name of the Docker image to run.
-* **`-c '...'`**: Executes a custom shell command to handle the complex environment setup:
+* **`-c '...'`**: The shell command the container runs:
   * **`mkdir -p docker_saved_files`**: Creates an output directory on your host.
   * **`dc_toolkit evaluate_combos ...`**: Executes the actual compression tool, using a file inside the container and saving the results (under `--where-to-write`) to your mounted volume.
 
@@ -286,7 +286,7 @@ docker run \
 * **`dc-toolkit`**: The image name.
 * **`-n 1`**: One MPI rank per node; on a Docker container that's one rank total. Parallelism inside the rank comes from threads, not from multiple ranks.
 * **`bash -c '...'`**: Executes the dc_toolkit command:
-  * **`HOME=/tmp/$OMPI_COMM_WORLD_RANK`**: A `$HOME` per rank, so multi-rank launches do not share caches; a no-op with `-n 1`.
+  * **`HOME=/tmp/$OMPI_COMM_WORLD_RANK`**: A `$HOME` per rank under the writable `/tmp` (`/tmp/0` with `-n 1`), so ranks do not share caches.
   * **`exec dc_toolkit evaluate_combos ... --where-to-write /mnt/data/docker_saved_files ...`**: Runs the sweep, writing all outputs into the mounted volume.
 
 ---
@@ -314,7 +314,7 @@ docker run `
 
 * **`-e HOME=/tmp`**: Sets a base temporary home directory for the container environment.
 * **`-e OMP_NUM_THREADS=1 ...`**: Pins codec-internal thread pools to 1 (prevents nested oversubscription).
-* **`-w /mnt/data/docker_saved_files`**: Sets the Working Directory inside the container so output files (like `config_space_{var}.csv` and `results_{var}.parquet`) drop exactly into your mounted folder.
+* **`-w /mnt/data/docker_saved_files`**: Sets the Working Directory inside the container.
 * **`-v "${PWD}\netCDF_files:/mnt/data"`**: Windows equivalent of the volume mount. `${PWD}` dynamically grabs your current PowerShell directory to link your local files to the container.
 * **`--entrypoint mpirun`**: Bypasses the default container start command to run OpenMPI.
 * **`dc-toolkit`**: The image name.
