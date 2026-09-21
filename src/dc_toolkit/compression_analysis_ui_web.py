@@ -30,9 +30,8 @@ def parse_args():
 
 @st.cache_data
 def load_and_resize_netcdf(file_content, original_name, max_size_bytes=1e7):
-    """Open the upload; when the file is above max_size_bytes, keep a leading
-    block of every dimension (the size fraction spread over the dimensions, at
-    least one entry each) so the interactive sweep stays quick."""
+    """Open the upload; above max_size_bytes, keep a leading block of every
+    dimension so the interactive sweep stays quick."""
     ds = xr.open_dataset(BytesIO(file_content))
     if len(file_content) > max_size_bytes:
         dims = [d for d in ds.dims if ds.sizes[d] > 1]
@@ -92,7 +91,7 @@ if st.button("Evaluate combos"):
                                                   with_lossy, with_ebcc, l1_threshold), status)
     status.empty()
     if rc != 0:
-        st.error(f"evaluate_combos failed with exit code {rc}; see the terminal for the full output.")
+        st.error(f"evaluate_combos failed with exit code {rc}.")
         st.session_state.pop("swept", None)
     else:
         st.session_state["swept"] = current
@@ -120,7 +119,7 @@ if results is not None:
         status.empty()
         store = utils_cli.merged_store_path(OUT_DIR, dataset_path)
         if rc != 0 or not os.path.isdir(store):
-            st.error(f"compress failed with exit code {rc}; see the terminal for the full output.")
+            st.error(f"compress failed with exit code {rc}.")
         else:
             st.session_state["archive"] = (current, utils_cli.zip_directory(store), choice)
     archived = st.session_state.get("archive")

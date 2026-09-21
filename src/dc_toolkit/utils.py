@@ -542,34 +542,22 @@ def filter_space(da, with_lossy=True, filter_class="all", data_range=None):
 
 
 # ---- ZFPY: two encoders, because neither rank wins --------------------------
-# zfp compresses 4^d blocks and earns its ratio from the correlation inside each
-# block, so the rank a chunk is encoded at decides what it can exploit.  Its
-# header budget also caps every axis (2**24 at 2-D, 2**16 at 3-D, 2**12 at 4-D),
-# which an ICON cell axis overflows, so some reshape is unavoidable.
-#
-# Encoding at the chunk's own rank keeps neighbours along every axis inside one
-# block, which preserves cross-axis gradients and pays wherever those axes are
-# correlated -- a temperature field over consecutive timesteps, say.  Flattening
-# gives that up, and wins where the slower axes carry little signal: zfp spends
-# no bits decorrelating noise, and the flatter output leaves more redundancy for
-# the compressor that runs after it.  Fixed-rate mode fixes zfp's own byte count
-# either way, so the choice lands in the error at that size and, through that
-# compressor, in the final ratio.  Neither dominates, so the sweep carries both
-# and the gates choose per field.
-#
-# The two must keep distinct codec names: a pipeline's identity is its codecs'
-# zarr JSON, which is the resume key, the parquet's unique-pipeline column and
-# the manifest's best.  One class with a flag collides all three silently.
+# zfp codes 4^d blocks, so the rank a chunk is encoded at decides which
+# correlations it can exploit.  The chunk's own rank keeps cross-axis gradients
+# inside a block and wins when the slower axes are correlated; 1-D gives them
+# up and wins when those axes carry little signal, since zfp then spends no
+# bits on noise and leaves the compressor after it more redundancy.  Neither
+# dominates, so the sweep carries both and each field picks its winner.  They
+# need distinct codec names because a pipeline's identity is its codecs' zarr
+# JSON (the resume key, the parquet pipeline column, the manifest's winner).
 
 
 class ZFPYRank(zarrcodecs_nc.ZFPY, codec_name="zfpy"):
-    """ZFPY that encodes each chunk at the lowest rank zfp accepts: size-1 axes
-    dropped, then the slowest pair folded until the shape fits zfp's per-axis
-    header budget (2**24 at 2-D, 2**16 at 3-D, 2**12 at 4-D), which the DYAMOND
-    cell axis overflows.  zfp's blocks then span the chunk's real axes, so
-    cross-axis gradients survive; that wins when those axes are correlated and
-    loses to ZFPYFlat when they are not, so the sweep carries both.  Stored
-    under the plain "zfpy" name, which stock readers decode."""
+    """ZFPY that encodes each chunk at its own rank, folded only as far as zfp's
+    per-axis header budget requires (2**24 at 2-D, 2**16 at 3-D, 2**12 at 4-D;
+    DYAMOND's cell axis overflows it): size-1 axes dropped, then the slowest
+    pair folded until every axis fits.  Stored under the plain "zfpy" name,
+    which stock readers decode."""
 
     _ZFP_MAX_PER_AXIS = {1: 2**48, 2: 2**24, 3: 2**16, 4: 2**12}
 
@@ -589,9 +577,8 @@ class ZFPYRank(zarrcodecs_nc.ZFPY, codec_name="zfpy"):
 
 
 class _ZFPYFlatCodec(numcodecs.zfpy.ZFPY):
-    """The numcodecs side of ZFPYFlat: zfpy under a second id, so the zarr layer
-    can tell the two encoders apart.  zarr's numcodecs wrapper resolves
-    codec_name against the numcodecs registry, which has no "zfpy_flat"."""
+    """zfpy under a second numcodecs id: zarr's numcodecs wrapper resolves
+    codec_name against the numcodecs registry."""
 
     codec_id = "zfpy_flat"
 
@@ -600,12 +587,10 @@ numcodecs.register_codec(_ZFPYFlatCodec)
 
 
 class ZFPYFlat(ZFPYRank, codec_name="zfpy_flat"):
-    """ZFPY that flattens every chunk to 1-D.  Costs no bytes in fixed-rate mode
-    but gives up every cross-axis relationship, which wins when the slower axes
-    carry little correlation (zfp would spend bits decorrelating noise) and
-    loses heavily when they do.  Decoding is stock zfp -- the stream carries its
-    own shape -- but the "zfpy_flat" name needs dc_toolkit's zarr.codecs entry
-    point, so a store using it is not readable by a bare zarr client."""
+    """ZFPY that encodes every chunk as 1-D.  Decoding is stock zfp (the stream
+    carries its own shape), but the "zfpy_flat" name resolves only through
+    dc_toolkit's zarr.codecs entry point, so a bare zarr client cannot open a
+    store that uses it."""
 
     @classmethod
     def encode_shape(cls, shape) -> tuple:
@@ -772,7 +757,7 @@ def serializer_space(da, with_lossy=True, serializer_class="all", with_ebcc=Fals
                 modes = modes[2:]
             variants = [ZFPYRank]
             if chunk_shape is None or ZFPYFlat.encode_shape(chunk_shape) != ZFPYRank.encode_shape(chunk_shape):
-                variants.append(ZFPYFlat)      # a chunk that is already one run encodes the same either way
+                variants.append(ZFPYFlat)      # skipped when Rank already folds the chunk to 1-D
             space += [v(mode=mode, **{param: fn(k)})
                       for v in variants for mode, param, fn in modes for k in _ZFPY_K_GRID]
         elif cls is EBCC:
@@ -827,8 +812,8 @@ def full_field_data_range(da):
 
 def fixed_scale_offset_configs(da, data_range=None):
     """FixedScaleOffset kwargs mapping [min, max] onto each uint width in
-    _FSO_TARGET_UINTS.  Falls back to `da`'s own range when data_range is None
-    (only valid if `da` is the full field)."""
+    _FSO_TARGET_UINTS narrower than the float.  Falls back to `da`'s own range
+    when data_range is None (only valid if `da` is the full field)."""
     dtype = da.dtype
     if not np.issubdtype(dtype, np.floating):
         return []
@@ -888,8 +873,9 @@ def codec_pipeline_kwargs(compressor, filt, serializer) -> dict:
             "serializer": "auto" if serializer is None else serializer}
 
 
-# Our classes, used when a pipeline is rebuilt from its dict: ZFPYFlat must
-# replace zarr's stock ZFPY (same codec name in zarr.json); EBCC has no stock class.
+# Our classes, used when a pipeline is rebuilt from its dict: ZFPYRank must
+# replace zarr's stock ZFPY (same codec name in zarr.json); ZFPYFlat and EBCC
+# have no stock class.
 _CODEC_CLASSES = {"numcodecs.zfpy": ZFPYRank, "numcodecs.zfpy_flat": ZFPYFlat,
                   "numcodecs.ebcc_filter": EBCC}
 # Names a bare zarr client cannot resolve: they exist only through dc_toolkit's
@@ -950,10 +936,10 @@ def pipeline_name(compressor, filt, serializer) -> str:
 # 5. ZARR SYNC BYPASS
 # =============================================================================
 # zarr 3's sync API funnels every call through one process-global event loop,
-# which serialises codec work from concurrent threads (5x slowdown at 32
-# threads).  With the bypass on, each user thread owns a persistent event loop
-# and all loops share one bounded ThreadPoolExecutor, so total OS threads stay
-# at user_threads + shared_workers instead of user_threads * 32.
+# which serialises codec work from concurrent threads.  With the bypass on,
+# each user thread owns a persistent event loop and all loops share one bounded
+# ThreadPoolExecutor, so total OS threads stay at user_threads + shared_workers
+# instead of user_threads * 32.
 
 _thread_local_loops = threading.local()
 _shared_executor = None
@@ -962,11 +948,10 @@ _thread_loops = []  # every per-thread loop, so that AsyncBypass.close_loops can
 
 
 class _SharedExecutor(ThreadPoolExecutor):
-    """The default executor of every per-thread loop.  Closing a loop (which
-    happens when a finished worker thread's loop is garbage-collected) shuts
-    its default executor down; on the shared pool that would fail every combo
-    of the following variables, so shutdown requests are ignored.  The
-    interpreter's exit hook still stops the workers."""
+    """Default executor of every per-thread loop.  Closing a loop (a finished
+    worker thread's loop being garbage-collected) shuts its default executor
+    down, which on the shared pool would fail every later submission, so
+    shutdown is a no-op; the interpreter's exit hook still stops the workers."""
 
     def shutdown(self, wait=True, *, cancel_futures=False):
         pass
@@ -1140,7 +1125,7 @@ def evaluate_codec_pipeline(sample_np: np.ndarray, dims, codec_kwargs: dict, chu
 
     The gradient metric is one more pass over the sample, so with
     `precheck_thresholds` it is skipped for combos that already fail a cheap
-    gate (L1/L2/Linf/bias).  The decoded buffer is freed right after.
+    gate (L1/L2/Linf/bias).
     """
     decoded, ratio = AsyncBypass.run(_zarr_roundtrip(sample_np, dims, codec_kwargs, chunks))
     want_q99 = q99_abs is not None and math.isfinite(q99_abs)
@@ -1227,7 +1212,7 @@ def persist_with_codec_pipeline(da, store, component: str, codec_kwargs: dict,
         dask.array.to_zarr(da.data.rechunk(write_unit), store, component=component,
                            overwrite=True, compute=True, **zarr_kwargs)
 
-    # use_consolidated=False: a store consolidated by an earlier run does not list this array yet.
+    # use_consolidated=False: consolidated metadata written before this array does not list it.
     z = zarr.open_group(store, mode="r", use_consolidated=False)[component]
     count_bytes, count_bytes_stored = _info_bytes(z.info_complete())
     ratio = count_bytes / count_bytes_stored
@@ -1329,9 +1314,10 @@ def broadcast_numpy(arr, comm=None, root: int = 0) -> np.ndarray:
 
 
 def check_thread_oversubscription(abort_if_unsafe: bool = True, rank: int = 0, comm=None) -> None:
-    """Abort (collectively) unless every THREAD_ENV_VARS entry equals 1.  Also
-    pins zarr's internal pool when several ranks share a node without the
-    bypass, since each rank would otherwise spawn its own ~32-thread pool."""
+    """Warn on rank 0, and abort collectively unless `abort_if_unsafe` is off,
+    when any THREAD_ENV_VARS entry is not 1.  Also pins zarr's internal pool
+    when several ranks share a node without the bypass, since each rank would
+    otherwise spawn its own ~32-thread pool."""
     comm = comm or MPI.COMM_WORLD
     problems = []
     for v in THREAD_ENV_VARS:
@@ -1407,8 +1393,8 @@ def print_profile_summary():
     if not _TIMINGS or MPI.COMM_WORLD.Get_rank() != 0:
         return
     print("\n=== Timing Summary (rank 0; ranks balanced via deterministic shuffle) ===")
-    print("Sum of Total = thread-seconds inside the eval pipeline (excludes bcast,")
-    print("file I/O, dask graph setup, and result-write overhead).\n")
+    print("Sum of Total = thread-seconds inside the timed sections (excludes bcast,")
+    print("dask graph setup and result-write overhead).\n")
     width = max(len(label) for label in _TIMINGS)
     totals = {label: sum(d) for label, d in _TIMINGS.items()}
     grand = sum(totals.values()) or 1.0

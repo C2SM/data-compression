@@ -324,8 +324,8 @@ cli.add_command(utils_cli.alias(compress, "compress_fields_from_results"))
              context_settings={"ignore_unknown_options": True, "allow_extra_args": True})
 @click.argument("args", nargs=-1, type=click.UNPROCESSED)
 def compress_with_optimal(args):
-    """Removed with the index-based workflow; points to `compress`."""
-    raise click.ClickException("compress_with_optimal was replaced by `compress DATASET WHERE_TO_WRITE "
+    """Hidden stub: refuses the call and points to `compress`."""
+    raise click.ClickException("compress_with_optimal is a stub; use `compress DATASET WHERE_TO_WRITE "
                                "[--vars FIELD --pipeline JSON]`; the sweep's manifest_{var}.json holds the pipeline.")
 
 
@@ -334,8 +334,8 @@ def compress_with_optimal(args):
 @click.argument("compressed_files_location", type=click.Path(dir_okay=True, file_okay=False, exists=False))
 def merge_compressed_fields(dataset_file: str, compressed_files_location: str):
     """Consolidate metadata on {compressed_files_location}/{dataset}.zarr,
-    after discarding the unfinished write of an interrupted run (compress does
-    all of this itself; kept for scripts that still call it)."""
+    after discarding the unfinished write of an interrupted run (what compress
+    does at its end)."""
     utils_cli.require_single_process("merge_compressed_fields")
     merged_path = utils_cli.merged_store_path(compressed_files_location, dataset_file)
     if not Path(merged_path).is_dir():
@@ -391,9 +391,8 @@ def open_zarr_and_inspect(zarr_path: str, head: int):
 def from_nc_to_zarr(ctx, **_):
     """
     Convert a NetCDF file to an UNCOMPRESSED zarr v3 store (no filters, no
-    compressors, no sharding; coordinates included), for filesystem-level
-    deduplication experiments.  Whatever compression the netCDF had is undone
-    by the reader; the output stores plain bytes.
+    compressors, no sharding; coordinates included; whatever compression the
+    netCDF had is undone), for filesystem-level deduplication experiments.
     """
     utils_cli.require_single_process("from_nc_to_zarr")
     utils_cli.nc_to_zarr(utils_cli.opts(ctx))

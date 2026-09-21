@@ -1,9 +1,10 @@
 """
 Helpers behind the dc_toolkit commands.  cli.py declares the commands and
 their options and hands the parsed parameters to the functions here as one
-`opts` namespace (attribute names == click parameter names).  Two setup
-helpers add resolved values to it: sweep_setup sets opts.threads_per_rank
-and opts.with_ebcc, single_process_setup sets opts.threads.
+`opts` namespace (attribute names == click parameter names).  Three helpers
+add resolved values to it: sweep_setup sets opts.threads_per_rank and
+opts.with_ebcc, sweep_variable sets opts.phys_slack, single_process_setup
+sets opts.threads.
 
 A codec combination is identified by its pipeline dict (utils.pipeline_to_dict):
 the sweep records it in every result row and in manifest_{var}.json, and
@@ -82,7 +83,7 @@ def add_options(options):
 
 
 def alias(command, name: str):
-    """A hidden second name for a command (old names kept for one release)."""
+    """A hidden second name for a command."""
     cmd = copy.copy(command)
     cmd.name, cmd.hidden = name, True
     return cmd
@@ -168,9 +169,9 @@ def remove_staged(merged_path: str, var=None) -> None:
 
 
 def promote_staged(merged_path: str, var: str) -> None:
-    """Move the verified field into the store: a directory rename within one
-    directory (a zarr v3 array does not record its own name), so readers see
-    either the previous array or the new one, never a partial write."""
+    """Move the verified field into the store by one directory rename (a zarr v3
+    array does not record its own name), so no reader ever sees a half-written
+    array."""
     target = Path(merged_path) / var
     if target.exists():
         shutil.rmtree(target)
@@ -288,9 +289,8 @@ def single_process_setup(opts) -> None:
 
 
 # Per-thread working set in units of the sample: decoded buffer (1x) + encoded
-# MemoryStore (up to 1x) + a filter's copy while encoding/decoding.  Measured
-# (tracemalloc, one combo, with and without the gradient gate): 1.9-2.5x at the
-# transient peak; 2.0 because the threads do not peak together and the
+# MemoryStore (up to 1x) + a filter's copy while encoding/decoding, 1.9-2.5x at
+# the transient peak; 2.0 because the threads do not peak together and the
 # --memory-threshold headroom absorbs the rest.
 PER_THREAD_WORKING_FACTOR = 2.0
 
@@ -536,7 +536,8 @@ def codec_spaces(sample_da, space_args: dict, fso_range, chunk_shape=None):
     """(compressors, filters, serializers) built from the sample.  `fso_range`
     is the FULL field's (min, max): FixedScaleOffset and EBCC must not be
     parameterised from a sample that may miss the extremes.  `chunk_shape` is
-    the evaluation chunk, which decides whether the two ZFPY ranks differ."""
+    the evaluation chunk, which decides whether ZFPYFlat and ZFPYRank encode it
+    differently."""
     try:
         return (utils.compressor_space(sample_da, space_args["with_lossy"], space_args["compressor_class"]),
                 utils.filter_space(sample_da, space_args["with_lossy"], space_args["filter_class"],
@@ -646,8 +647,8 @@ def persist_field(da, var: str, merged_path: str, combo, opts, geometry: dict, q
                  else f"shards={shards}, {hsize(shard_bytes)}"))
     click.echo(f"[persist] {var} -> {merged_path} ({layout})")
 
-    # Measured: a write task holds its source dask block, the rechunked write unit, zarr's encode copy
-    # and the encoded bytes; small fields top out near 3x their size.
+    # A write task holds its source dask block, the rechunked write unit, zarr's encode copy
+    # and the encoded bytes; a small field tops out near 3x its size.
     source_block = itemsize * int(np.prod(da.data.chunksize))
     write_peak = min(int(opts.threads) * (max(source_block, shard_bytes) + 3 * shard_bytes), 3 * int(da.nbytes))
     check_memory_headroom(write_peak, threshold=opts.memory_threshold,
@@ -749,7 +750,7 @@ def sweep_setup(opts) -> SweepContext:
 
 def sweep_variables(ds, field, rank: int) -> list:
     """The data variables to sweep: the named field, else every one the codecs
-    can take (integers, float32/float64, at least one dim).  CF bounds,
+    can take (non-empty integer/float32/float64 arrays with at least one dim);
     datetimes, strings and scalars such as `crs` are skipped."""
     names = [v for v in ds.data_vars if field in (None, v)]
     usable = [v for v in names if ds[v].ndim > 0 and ds[v].size > 0
@@ -896,7 +897,7 @@ def reusable_rows(prev: pd.DataFrame, q99_abs, opts, thresholds: dict) -> pd.Ser
         ok &= prev["q99_rel"].notna()
     if opts.gradient_gate:
         needed = pd.Series(True, index=prev.index)
-        if opts.gradient_shortcircuit:  # the sweep only computes it for rows that pass the cheap gates
+        if opts.gradient_shortcircuit:
             for column, key in (("l1_rel", "l1"), ("l2_rel", "l2"), ("linf_rel", "linf"), ("bias_rel", "bias")):
                 if math.isfinite(thresholds[key]):
                     needed &= ~(prev[column] > thresholds[key])
@@ -1116,8 +1117,7 @@ def sweep_select_best(where_to_write, var, gate, planned: set):
     (best, n_passed, parquet_path); best is a dict with name, pipeline, ratio,
     l1_rel, eucd, or None."""
     consolidated = read_rank_csvs(where_to_write, var)
-    # A combo evaluated again for a metric a newly enabled gate needs has several rows, measured on the
-    # same sample: merge them, keeping the last non-null value of every column.
+    # a combo re-evaluated for a metric a newly enabled gate needs has several rows on the same sample
     consolidated = consolidated.groupby("pipeline", as_index=False, sort=False).last()
     stale = ~consolidated["pipeline"].isin(planned)
     if stale.any():
@@ -1240,7 +1240,8 @@ def compress_candidates(opts):
     """(candidates, manifests, dropped): what to write, one candidate per
     variable as {var, name, pipeline, ratio, source}.  With --pipeline every
     --vars field gets that pipeline; otherwise the best of manifest_{var}.json,
-    falling back to the best kept row of results_{var}.parquet.  `manifests`
+    falling back to the best kept row of results_{var}.parquet (with
+    --stock-codecs-only, the best row a bare zarr client can decode).  `manifests`
     holds every readable manifest (thresholds and geometry); `dropped` maps
     the fields that have no usable pipeline to the reason."""
     wtw = Path(opts.where_to_write)
@@ -1272,7 +1273,7 @@ def compress_candidates(opts):
             if best is None:
                 dropped[var] = "the sweep kept no combo (manifest has no best)"
             elif "pipeline" not in best:
-                dropped[var] = "the manifest predates the pipeline format; re-run evaluate_combos"
+                dropped[var] = "the manifest best has no pipeline; re-run evaluate_combos"
             elif not stock or utils.pipeline_is_stock(best["pipeline"]):
                 candidates.append({"var": var, "name": best["name"], "pipeline": best["pipeline"],
                                    "ratio": best.get("ratio"), "source": f"manifest_{var}.json"})
@@ -1385,7 +1386,7 @@ def nc_to_zarr(opts) -> None:
                    f"| chunks = {'source-native' if opts.preserve_source_chunks else 'auto'} "
                    f"| mask_and_scale = {opts.mask_and_scale} | decode_times = {opts.decode_times} "
                    f"| dask workers = {threads}")
-        # Clear netCDF-side encoding and force no codecs on every variable and coordinate.
+        # explicit None: zarr would otherwise default to a Zstd compressor
         encoding = {}
         for name in ds.variables:
             ds[name].encoding = {}

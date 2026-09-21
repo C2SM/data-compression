@@ -74,9 +74,7 @@ The typical pipeline is two commands:
 1. **`evaluate_combos`** — sweep `(compressor × filter × serializer)` combinations on a representative sample of each field and record the compression ratio and error metrics of every combo.  `--l1-threshold` (a relative L1 error budget) is mandatory; the L2, Linf and bias gates default to 2x, 10x and 0.5x of it.  The winner of each field goes to `manifest_{var}.json`.  With `--resume` (the default) combos already recorded in the output directory are not evaluated again: their metrics are reused (as long as the sample and chunk settings are unchanged), the gates are re-applied with the current thresholds, a combo that lacks a metric a newly enabled gate needs is evaluated again, and rows outside the current codec space are left out of the results.  `--no-resume` starts the field from scratch.  `--compressor-class` / `--filter-class` / `--serializer-class` accept a fixed list of names (a typo is refused when the command line is parsed); a field whose dtype the chosen class cannot take is skipped with a message (an error when it is the `--field-to-compress`), except integer fields, which have Delta as their only filter and fall back to it (with a message) for any `--filter-class` but `none`; variables that are not numeric arrays (CF bounds, datetimes, strings, scalars such as `crs`) are skipped too.
 2. **`compress`** — persist the fields into one shared `.zarr` store (dataset opened once) with the winning pipeline of each field, then consolidate the store's metadata so readers open it quickly.  The chunk geometry (`--inner-chunk-mib`, `--max-inner-chunk-mib`, `--spatial-split`) defaults to what the sweep used, as recorded in the manifest, so the store matches what was measured; the command prints where each value came from.  After each write the field is re-read and gated against the sweep's thresholds and physical bounds (`--l1-threshold` ... `--bias-threshold` override them, e.g. for a field without a manifest) and its ratio is compared with the sweep's.  Each field is written under a staging name and renamed into place only after its gates passed, so an interrupted or failed write never counts as done and never replaces an earlier good array; a failed field, or one without a usable pipeline, is recorded in `batch_manifest.json` and makes the command exit with status 1, so a later run retries it.
 
-A combination is identified by its **pipeline**: the zarr JSON of its three codecs, as stored in `zarr.json` (`{"compressor": {...}, "filter": {...}, "serializer": {...}}`, `null` for an absent codec).  It appears in every result row, in the manifests and in the store itself, so nothing has to be rebuilt or re-sampled between the sweep and the write.  `compress --vars t --pipeline '{...}'` (or `--pipeline @file.json`) writes a field with a pipeline of your own, for example one picked from `results_{var}.parquet` or from a UI.
-
-The index-based commands of earlier versions are gone: `compress_with_optimal` only prints a pointer to `compress`, and the hidden aliases `compress_fields_from_results` and `merge_compressed_fields` take the options of the current commands.
+A combination is identified by its **pipeline**: the zarr JSON of its three codecs, as stored in `zarr.json` (`{"compressor": {...}, "filter": {...}, "serializer": {...}}`, `null` for an absent codec).  It appears in every result row, in the manifests and in the store itself, so nothing has to be rebuilt or re-sampled between the sweep and the write.  `compress --vars t --pipeline '{...}'` (or `--pipeline file.json`, a `manifest_{var}.json` included) writes a field with a pipeline of your own, for example one picked from `results_{var}.parquet` or from a UI.
 
 ### Output files
 
@@ -94,7 +92,7 @@ The index-based commands of earlier versions are gone: `compress_with_optimal` o
 
 ### HPC parallelism (SLURM / MPI)
 
-> For a thorough walkthrough of how every command parallelizes work — including how the `--bypass-zarr-sync` machinery actually works, why we cap at 32 threads on a 288-core node, and the chunk-vs-shard distinction — see [`docs/PARALLELIZATION.md`](docs/PARALLELIZATION.md).
+> How every command parallelizes work (the `--bypass-zarr-sync` machinery, the 32-thread cap on a 288-core node, chunks vs shards): [`docs/PARALLELIZATION.md`](docs/PARALLELIZATION.md).
 
 `evaluate_combos` runs as **one MPI rank per node**, with each rank driving 32 user threads via the `--bypass-zarr-sync` machinery (default on).  Scale out by increasing `--nodes` and keeping `--ntasks-per-node=1`:
 
@@ -109,7 +107,7 @@ srun --unbuffered dc_toolkit evaluate_combos input.nc \
     --threads-per-rank 32
 ```
 
-This topology was selected over multi-rank-per-node (32 ranks × 1 thread, the original design) to avoid OOM on large fields — the latter duplicates the sample buffer once per rank.  See `santis.run` for the validated production driver and the inline comment block summarising the experiments behind the choice.  The script reads the input location from the environment: `DYAMOND_DATA_ROOT=/path/to/parent sbatch santis.run`, where the parent directory holds the `Data_Dyamond_PostProcessed*` trees.
+One rank per node holds a single copy of the sample; several ranks per node (`--allow-multi-rank-per-node`) each hold their own, which does not fit on large fields.  `santis.run` is the production driver; it reads the input location from the environment: `DYAMOND_DATA_ROOT=/path/to/parent sbatch santis.run`, where the parent directory holds the `Data_Dyamond_PostProcessed*` trees.
 
 Codec-internal thread pools must be pinned to 1 to avoid nested oversubscription (the tool checks this at startup and aborts by default; `--no-oversubscription-check` disables the guard):
 
@@ -119,7 +117,7 @@ export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 \
        VECLIB_MAXIMUM_THREADS=1 OMP_THREAD_LIMIT=1
 ```
 
-The `--codec-threads N` flag (default 1) is available on `evaluate_combos`, `compress`, and `from_zarr_to_netcdf` for use cases where codec-internal threading is genuinely needed (e.g. very large chunks on workloads that aren't memory-bandwidth-bound).  Direct testing on Santis with the production Dyamond data showed `--codec-threads > 1` does **not** help on this workload; leave it at the default unless you have a specific reason and can A/B test the change.
+`--codec-threads N` (default 1, on `evaluate_combos`, `compress` and `from_zarr_to_netcdf`) enables codec-internal threading.  Compression here is memory-bandwidth-bound, so codec-internal threads compete with the outer threads for the same bandwidth and gain nothing on this workload; leave it at 1 unless an A/B test says otherwise.
 
 `compress` is a single-process command — launch with `srun -n 1 ...` or plain invocation. Parallelism inside the write comes from dask's threaded scheduler, tuned via `--threads` (default: auto-detected from visible cores), `--inner-chunk-mib` (default: the sweep's value from the manifest, else 16), and `--shard-mib` (default: 512). `--verify/--no-verify` (default on) re-reads the store to compute error norms — skip with `--no-verify` on re-compression runs where the combo is already trusted.
 
@@ -136,7 +134,7 @@ zfp; at tight bounds the advantage disappears.  It is **off by default** because
   first and skips or refuses instead;
 - one frame (or an exact tile of it, 32 to 2047 cells per side) per inner chunk; `--inner-chunk-mib` and `--spatial-split` are ignored, `--shard-mib` still groups frames into shards;
 - runs alone: a filter in front breaks its error bound and a compressor after it gains nothing;
-- a store written with EBCC can only be read where the `ebcc` package is installed.
+- a store written with EBCC can only be read where `dc_toolkit[ebcc]` is installed (see [Reading a store without dc_toolkit](#reading-a-store-without-dc_toolkit)).
 
 Install (needs `cmake`, a C/C++ toolchain and HDF5 headers; the Docker image includes it):
 
@@ -216,13 +214,12 @@ dc_toolkit run_local_ui
 
 ## Docker
 
-A self-contained image has been setup in the `Dockerfile`. You can copy the file locally, the run:
+The `Dockerfile` builds a self-contained image (all dependencies, the repository cloned inside):
 
 ```commandline
 docker build -t dc-toolkit .
 ```
-The image contains all dependencies and automatically clones the repository.
-Once this build is complete, you can run commands with docker. An example:
+An example run:
 
 ```commandline
 docker run \
@@ -251,14 +248,6 @@ docker run \
   * **`mkdir -p docker_saved_files`**: Creates an output directory on your host.
   * **`dc_toolkit evaluate_combos ...`**: Executes the actual compression tool, using a file inside the container and saving the results (under `--where-to-write`) to your mounted volume.
 
-Single-machine runs (Docker included) get their parallelism from the node-local `ThreadPoolExecutor` inside a single MPI rank — no multi-rank `mpirun` is needed. The thread pins shown above keep the codec-internal pools from fighting the outer threads:
-
-```bash
--e OMP_NUM_THREADS=1 -e MKL_NUM_THREADS=1 -e OPENBLAS_NUM_THREADS=1 \
--e BLOSC_NTHREADS=1 -e NUMBA_NUM_THREADS=1 \
--e VECLIB_MAXIMUM_THREADS=1 -e OMP_THREAD_LIMIT=1
-```
-
 Or for the web UI:
 
 ```commandline
@@ -267,7 +256,7 @@ docker run -p 8501:8501 dc-toolkit run_web_ui
 
 ### Running with MPI (single-container, exercises the MPI code path)
 
-OpenMPI + Docker requires specific file permission and cache handling. Note that on a single container `evaluate_combos` runs with **one** MPI rank (`-n 1`) — the rank-per-node invariant means multi-rank on one node is not supported. Parallel work inside the single rank is done by the `ThreadPoolExecutor`; the `mpirun` launch is useful for exercising the MPI code path in CI or smoke tests. For real multi-node speedup, use SLURM (see the HPC section above).
+OpenMPI + Docker requires specific file permission and cache handling. On a single container `evaluate_combos` runs with **one** MPI rank (`-n 1`): several ranks on one node abort at startup unless `--allow-multi-rank-per-node` is passed, and the parallelism comes from the rank's threads. The `mpirun` launch exercises the MPI code path in CI or smoke tests; for real multi-node speedup use SLURM (see the HPC section above).
 
 ---
 
@@ -297,7 +286,7 @@ docker run \
 * **`dc-toolkit`**: The image name.
 * **`-n 1`**: One MPI rank per node; on a Docker container that's one rank total. Parallelism inside the rank comes from threads, not from multiple ranks.
 * **`bash -c '...'`**: Executes the dc_toolkit command:
-  * **`HOME=/tmp/$OMPI_COMM_WORLD_RANK`**: Assigns a unique `$HOME` per rank — harmless with `-n 1`, kept for parity with multi-rank launches.
+  * **`HOME=/tmp/$OMPI_COMM_WORLD_RANK`**: A `$HOME` per rank, so multi-rank launches do not share caches; a no-op with `-n 1`.
   * **`exec dc_toolkit evaluate_combos ... --where-to-write /mnt/data/docker_saved_files ...`**: Runs the sweep, writing all outputs into the mounted volume.
 
 ---
