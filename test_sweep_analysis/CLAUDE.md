@@ -106,7 +106,8 @@ are 3810 lines, down from 8029 at `870943c`.
 - The memory model's `PER_THREAD_WORKING_FACTOR` is 2.0, a measured value; the v3 generator assumed
   1.5. The sweep can therefore auto-shrink a sample where v3 did not (`[memcheck] auto-shrunk ...`).
   That is not a failure.
-- Non-numeric variables (CF bounds, datetimes, scalars like `crs`) are skipped.
+- Datetimes, strings and scalars like `crs` are skipped, and so are CF bounds (`clon_bnds`, `clat_bnds`:
+  grid geometry, which a lossy codec would move) unless one is named with `--field-to-compress`.
 
 **MPI and threads.**
 - Under MPI, an uncaught exception on any rank calls `comm.Abort` through `sys.excepthook`, so an

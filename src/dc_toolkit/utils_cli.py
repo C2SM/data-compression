@@ -765,9 +765,18 @@ def sweep_setup(opts) -> SweepContext:
 
 def sweep_variables(ds, field, rank: int) -> list:
     """The data variables to sweep: the named field, else every one the codecs
-    can take (non-empty integer/float32/float64 arrays with at least one dim);
-    datetimes, strings and scalars such as `crs` are skipped."""
+    can take (non-empty integer/float32/float64 arrays with at least one dim).
+    Datetimes, strings and scalars such as `crs` are skipped, and so are CF
+    bounds (the variables a `bounds` or `climatology` attribute names) unless
+    named: they are grid geometry, which a lossy codec would move."""
+    bounds = {str(src[a]) for v in ds.variables.values() for src in (v.attrs, v.encoding)
+              for a in ("bounds", "climatology") if a in src}
     names = [v for v in ds.data_vars if field in (None, v)]
+    geometry = [v for v in names if v in bounds and field is None]
+    if rank == 0 and (geometry or field in bounds):
+        click.echo(f"[var] skipping grid geometry (CF bounds): {', '.join(geometry)}" if geometry else
+                   f"[var] {field} is CF bounds (grid geometry); sweeping it because it was named.")
+    names = [v for v in names if v not in geometry]
     usable = [v for v in names if ds[v].ndim > 0 and ds[v].size > 0
               and (ds[v].dtype.kind in "iu" or ds[v].dtype in (np.float32, np.float64))]
     skipped = [f"{v} ({ds[v].dtype}, {ds[v].ndim}-d)" for v in names if v not in usable]
