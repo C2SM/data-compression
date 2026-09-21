@@ -103,6 +103,11 @@ def env_versions() -> dict:
     env = {"zarr": getattr(zarr, "__version__", None),
            "numpy": getattr(np, "__version__", None),
            "dask": getattr(dask, "__version__", None)}
+    for pkg in ("numcodecs", "zfpy", "pcodec"):
+        try:
+            env[pkg] = importlib.metadata.version(pkg)
+        except importlib.metadata.PackageNotFoundError:
+            env[pkg] = None
     if utils.EBCC_AVAILABLE:
         try:
             env["ebcc"] = importlib.metadata.version("ebcc")
