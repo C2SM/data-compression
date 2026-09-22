@@ -1,573 +1,223 @@
-
-import importlib.util
-import math
-import re
-import subprocess
-import sys
-
-
-# PyQt6 might encounter issues when installed from pyproject.toml
-print("Installing PyQt6")
-subprocess.check_call([
-    sys.executable, "-m", "pip", "install", "PyQt6", "--only-binary", ":all:"
-])
-
-import sys
+"""
+Desktop (Qt) UI: open a netCDF file, sweep the codec space on one field
+(one local MPI rank), inspect the results in the browser, write the field
+with a chosen pipeline and save the store as a zip.  Launched by
+`dc_toolkit run_local_ui`.
+"""
+import json
 import os
 import shutil
 import subprocess
-import tempfile
+import sys
 
-from PyQt6.QtCore import QThread, pyqtSignal, QLocale
-from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
-                             QPushButton, QLabel, QComboBox, QProgressBar, QTextEdit, QFormLayout,
-                             QSpinBox, QToolButton, QFrame, QFileDialog, QMessageBox, QCheckBox, QDoubleSpinBox,
-                             QGridLayout)
+# PyQt6 is not a declared dependency (it does not build everywhere); install
+# a wheel on first use.
+subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet", "PyQt6", "--only-binary", ":all:"])
 
-import xarray as xr
+import xarray as xr  # noqa: E402
+from PyQt6.QtCore import QLocale, QThread, pyqtSignal  # noqa: E402
+from PyQt6.QtGui import QValidator  # noqa: E402
+from PyQt6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QGridLayout,  # noqa: E402
+                             QLabel, QMainWindow, QMessageBox, QPushButton, QTextEdit, QVBoxLayout, QWidget)
 
-import pandas as pd
-import numpy as np
-from sklearn.cluster import KMeans
-import plotly.express as px
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
+from dc_toolkit import utils_cli  # noqa: E402
 
-from dc_toolkit import utils
-import zipfile
+OUT_DIR = "out"
 
-def load_scored_results(file_name: str, params_str: str):
-    return np.load(os.path.join("out", file_name + params_str + "_scored_results_with_names.npy"), allow_pickle=True)
 
-def create_cluster_plots(clean_arr_l1, clean_arr_l2, clean_arr_linf, n_clusters):
-    config_idxs = pd.read_csv("config_space.csv")
-    kmeans = KMeans(n_clusters=n_clusters, random_state=0, n_init="auto")
+class CommandThread(QThread):
+    """Run a command in the background, streaming its output lines."""
+    line = pyqtSignal(str)
+    done = pyqtSignal(int)
 
-    fig = make_subplots(rows=3, cols=1,
-                        subplot_titles=[
-                            "L1 VS Ratio KMeans Clustering", "L2 VS Ratio KMeans Clustering",
-                            "LInf VS Ratio KMeans Clustering"
-                        ])
-
-    # L1 clustering
-    clean_arr_l1_filtered = np.column_stack((clean_arr_l1[:, 0].astype(float), clean_arr_l1[:, 1].astype(float)))
-    df_l1 = pd.DataFrame(clean_arr_l1_filtered, columns=["Ratio", "L1"])
-    df_l1["compressor"] = clean_arr_l1[:, 2]
-    df_l1["filter"] = clean_arr_l1[:, 3]
-    df_l1["serializer"] = clean_arr_l1[:, 4]
-    df_l1["compressor_idx"] = utils.get_indexes(clean_arr_l1[:, 2], config_idxs['0'])
-    df_l1["filter_idx"] = utils.get_indexes(clean_arr_l1[:, 3], config_idxs['1'])
-    df_l1["serializer_idx"] = utils.get_indexes(clean_arr_l1[:, 4], config_idxs['2'])
-    # To account for overlapping cases
-    df_l1["Ratio"] = df_l1["Ratio"] + np.random.normal(0, 0.00001, size=len(df_l1))
-
-    y_kmeans = kmeans.fit_predict(pd.DataFrame(df_l1, columns=["Ratio", "L1"]))
-    color = np.ones(y_kmeans.shape) if len(np.unique(y_kmeans)) == 1 else y_kmeans
-
-    fig_l1 = px.scatter(df_l1, x="Ratio", y="L1", color=color,
-                        title="L1 VS Ratio KMeans Clustering", hover_data=["compressor", "filter", "serializer", "compressor_idx", "filter_idx", "serializer_idx"])
-
-    fig.add_trace(
-        go.Scatter(
-            x=kmeans.cluster_centers_[:, 0],
-            y=kmeans.cluster_centers_[:, 1],
-            mode="markers+text",
-            marker=dict(color="black", size=12, symbol="x"),
-            textposition="top center",
-            name="Centroids",
-            showlegend=True
-        ),
-        row=1,
-        col=1
-    )
-    fig.update_xaxes(title_text="Ratio", row=1, col=1)
-    fig.update_yaxes(title_text="L1", row=1, col=1)
-
-    for trace in fig_l1.data:
-        fig.add_trace(trace, row=1, col=1)
-
-    # L2 clustering
-    clean_arr_l2_filtered = np.column_stack((clean_arr_l2[:, 0].astype(float), clean_arr_l2[:, 1].astype(float)))
-    df_l2 = pd.DataFrame(clean_arr_l2_filtered, columns=["Ratio", "L2"])
-    df_l2["compressor"] = clean_arr_l2[:, 2]
-    df_l2["filter"] = clean_arr_l2[:, 3]
-    df_l2["serializer"] = clean_arr_l2[:, 4]
-    df_l2["compressor_idx"] = utils.get_indexes(clean_arr_l2[:, 2], config_idxs['0'])
-    df_l2["filter_idx"] = utils.get_indexes(clean_arr_l2[:, 3], config_idxs['1'])
-    df_l2["serializer_idx"] = utils.get_indexes(clean_arr_l2[:, 4], config_idxs['2'])
-    # To account for overlapping cases
-    df_l2["Ratio"] = df_l2["Ratio"] + np.random.normal(0, 0.00001, size=len(df_l2))
-
-    y_kmeans = kmeans.fit_predict(pd.DataFrame(df_l2, columns=["Ratio", "L2"]))
-    color = np.ones(y_kmeans.shape) if len(np.unique(y_kmeans)) == 1 else y_kmeans
-
-    fig_l2 = px.scatter(df_l2, x="Ratio", y="L2", color=color,
-                        title="L2 VS Ratio KMeans Clustering", hover_data=["compressor", "filter", "serializer", "compressor_idx", "filter_idx", "serializer_idx"])
-
-    fig.add_trace(
-        go.Scatter(
-            x=kmeans.cluster_centers_[:, 0],
-            y=kmeans.cluster_centers_[:, 1],
-            mode="markers+text",
-            marker=dict(color="black", size=12, symbol="x"),
-            textposition="top center",
-            name="Centroids",
-            showlegend=False,
-        ),
-        row=2,
-        col=1
-    )
-    fig.update_xaxes(title_text="Ratio", row=2, col=1)
-    fig.update_yaxes(title_text="L2", row=2, col=1)
-    for trace in fig_l2.data:
-        fig.add_trace(trace, row=2, col=1)
-
-    # LInf clustering
-    clean_arr_linf_filtered = np.column_stack(
-        (clean_arr_linf[:, 0].astype(float), clean_arr_linf[:, 1].astype(float)))
-    df_linf = pd.DataFrame(clean_arr_linf_filtered, columns=["Ratio", "LInf"])
-    df_linf["compressor"] = clean_arr_linf[:, 2]
-    df_linf["filter"] = clean_arr_linf[:, 3]
-    df_linf["serializer"] = clean_arr_linf[:, 4]
-    df_linf["compressor_idx"] = utils.get_indexes(clean_arr_linf[:, 2], config_idxs['0'])
-    df_linf["filter_idx"] = utils.get_indexes(clean_arr_linf[:, 3], config_idxs['1'])
-    df_linf["serializer_idx"] = utils.get_indexes(clean_arr_linf[:, 4], config_idxs['2'])
-    # To account for overlapping cases
-    df_linf["Ratio"] = df_linf["Ratio"] + np.random.normal(0, 0.00001, size=len(df_linf))
-
-    y_kmeans = kmeans.fit_predict(pd.DataFrame(df_linf, columns=["Ratio", "LInf"]))
-    color = np.ones(y_kmeans.shape) if len(np.unique(y_kmeans)) == 1 else y_kmeans
-
-    fig_linf = px.scatter(df_linf, x="Ratio", y="LInf", color=color,
-                          title="LInf VS Ratio KMeans Clustering", hover_data=["compressor", "filter", "serializer", "compressor_idx", "filter_idx", "serializer_idx"])
-
-    fig.add_trace(
-        go.Scatter(
-            x=kmeans.cluster_centers_[:, 0],
-            y=kmeans.cluster_centers_[:, 1],
-            mode="markers+text",
-            marker=dict(color="black", size=12, symbol="x"),
-            textposition="top center",
-            name="Centroids",
-            showlegend=False
-        ),
-        row=3,
-        col=1
-    )
-    fig.update_xaxes(title_text="Ratio", row=3, col=1)
-    fig.update_yaxes(title_text="LInf", row=3, col=1)
-    for trace in fig_linf.data:
-        fig.add_trace(trace, row=3, col=1)
-
-    fig.update_layout(
-        title="",
-        showlegend=False,
-        height=900,
-        hovermode="closest",
-        template="plotly_white"
-    )
-    fig.show()
-
-def load_and_resize_netcdf(ds, file_path, max_size_bytes=1e7):
-    file_bytes_size= os.path.getsize(file_path)
-    if file_bytes_size > max_size_bytes:
-        percent_size = max_size_bytes / file_bytes_size
-        for coord in list(ds.coords):
-            if len(ds[coord]) > 1:
-                ds = ds.isel({coord: slice(0, int(ds[coord].size * percent_size))})
-
-    return ds
-
-class CompressorThread(QThread):
-    progress = pyqtSignal(str)
-    log = pyqtSignal(str)
-    finished = pyqtSignal()
-
-    def __init__(self, cmd, field_to_compress, compressor_class, filter_class, serializer_class, with_lossy):
+    def __init__(self, cmd):
         super().__init__()
         self.cmd = cmd
-        self.field_to_compress = field_to_compress
-        self.compressor_class = compressor_class
-        self.filter_class = filter_class
-        self.serializer_class = serializer_class
-        pattern = r'--.*?-?'
-        self.with_lossy = re.sub(pattern, '', with_lossy, count=1)
 
     def run(self):
-        with subprocess.Popen(
-            self.cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1
-        ) as proc:
+        with subprocess.Popen(self.cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
+                              env=utils_cli.ui_env()) as proc:
             for line in proc.stdout:
-                self.progress.emit(line)
-            proc.wait()
+                self.line.emit(line.rstrip())
+        self.done.emit(proc.returncode)
 
-        where_am_i = subprocess.run(["uname", "-a"], capture_output=True, text=True)
-        file_name = self.cmd[3] if "santis" in where_am_i.stdout.strip() else self.cmd[5]
-        score_results_file_name = [self.field_to_compress, self.compressor_class, self.filter_class, self.serializer_class, self.with_lossy]
-        params_str = '_' + '_'.join(score_results_file_name)
-        scored_results = load_scored_results(os.path.basename(file_name), params_str)
-        scored_results_pd = pd.DataFrame(scored_results)
-        max_n_rows, max_nclusters = 42976, 6
-
-        adjusted_n_clusters = math.ceil(max_nclusters*len(scored_results_pd)/max_n_rows)
-
-        numeric_cols = scored_results_pd.select_dtypes(include=[np.number]).columns
-        mask = np.isfinite(scored_results_pd[numeric_cols]).all(axis=1)
-        scored_results_pd = scored_results_pd[mask].dropna()
-        clean_arr_l1 = utils.slice_array(scored_results_pd, [0, 1, 5, 6, 7])
-        clean_arr_l2 = utils.slice_array(scored_results_pd, [0, 2, 5, 6, 7])
-        clean_arr_linf = utils.slice_array(scored_results_pd, [0, 3, 5, 6, 7])
-
-        create_cluster_plots(
-            clean_arr_l1, clean_arr_l2, clean_arr_linf, adjusted_n_clusters
-        )
-
-        self.finished.emit()
 
 class ScientificSpinBox(QDoubleSpinBox):
     def __init__(self):
-        super(ScientificSpinBox, self).__init__(None)
+        super().__init__(None)
         self.setLocale(QLocale(QLocale.Language.English, QLocale.Country.UnitedStates))
         self.setDecimals(10)
-        self.setMinimum(0e0)
-        self.setMaximum(1e0)
-        self.setSingleStep(0.0000000001)
-        self.setKeyboardTracking(False)
+        self.setRange(1e-10, 1.0)
+        self.setSingleStep(1e-4)
+        self.setValue(utils_cli.UI_DEFAULT_L1)
 
     def textFromValue(self, value: float) -> str:
-        return f'{value:.2e}'
+        return f"{value:.2e}"
 
     def valueFromText(self, text: str) -> float:
         try:
             return float(text)
         except ValueError:
-            return 0.0
+            return utils_cli.UI_DEFAULT_L1
+
+    def validate(self, text: str, pos: int):
+        """Accept what float() reads within the range; the stock validator rejects '1e-4'."""
+        try:
+            ok = self.minimum() <= float(text) <= self.maximum()
+        except ValueError:
+            ok = False
+        return (QValidator.State.Acceptable if ok else QValidator.State.Intermediate), text, pos
+
 
 class CompressionAnalysisUI(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Evaluate and compress netCDF files")
+        self.setWindowTitle("Evaluate and compress netCDF fields")
+        self.dataset_path = None
+        self.results = None
+        self.swept_field = None  # the field the pipeline list belongs to
+        self.thread = None
+        self.launcher = utils_cli.ui_launcher()
 
-        central_widget = QWidget()
-        self.setCentralWidget(central_widget)
-        self.main_layout = QVBoxLayout(central_widget)
+        root = QWidget()
+        self.setCentralWidget(root)
+        layout = QVBoxLayout(root)
 
-        self.open_button = QPushButton("Upload netCDF file")
+        self.open_button = QPushButton("Open netCDF file")
         self.open_button.clicked.connect(self.open_file)
-        self.main_layout.addWidget(self.open_button)
-
+        layout.addWidget(self.open_button)
         self.file_label = QLabel("No file selected")
-        self.main_layout.addWidget(self.file_label)
+        layout.addWidget(self.file_label)
+        layout.addWidget(QLabel("Field to compress:"))
+        self.field_box = QComboBox()
+        self.field_box.currentTextChanged.connect(self.forget_results)
+        layout.addWidget(self.field_box)
 
-        self.field_selection = QComboBox()
-        self.main_layout.addWidget(QLabel("Select field to compress:"))
-        self.main_layout.addWidget(self.field_selection)
+        grid = QGridLayout()
+        self.class_boxes = {}
+        for col, kind in enumerate(("compressor", "filter", "serializer")):
+            grid.addWidget(QLabel(f"{kind.capitalize()} class:"), 0, col)
+            box = QComboBox()
+            box.addItems(utils_cli.UI_CLASS_OPTIONS[kind])
+            grid.addWidget(box, 1, col)
+            self.class_boxes[kind] = box
+        layout.addLayout(grid)
+        self.lossy_check = QCheckBox("Include lossy codecs")
+        self.lossy_check.setChecked(True)
+        layout.addWidget(self.lossy_check)
+        self.ebcc_check = QCheckBox("Add EBCC (optional package; float lat/lon frames only)")
+        layout.addWidget(self.ebcc_check)
+        layout.addWidget(QLabel("Relative L1 error budget:"))
+        self.l1_box = ScientificSpinBox()
+        layout.addWidget(self.l1_box)
 
-        self.toggle_button = QToolButton(self)
-        self.toggle_button.setText("Advanced Options")
-        self.toggle_button.setCheckable(True)
-        self.main_layout.addWidget(self.toggle_button)
-
-        self.panel_frame = QFrame(self)
-        self.panel_frame.setVisible(False)
-        self.panel_layout = QVBoxLayout(self.panel_frame)
-        self.panel_layout.setContentsMargins(0, 0, 0, 0)
-
-        self.grid_layout = QGridLayout()
-
-        self.grid_layout.addWidget(QLabel("Choose a compressor:"), 0, 0)
-        self.options_compressor = QComboBox()
-        self.options_compressor.addItems(["all", "Blosc", "LZ4", "Zstd", "Zlib", "GZip", "BZ2", "LZMA", "None"])
-        self.grid_layout.addWidget(self.options_compressor, 1, 0)
-
-        self.grid_layout.addWidget(QLabel("Choose a filter:"), 0, 1)
-        self.options_filter = QComboBox()
-        self.options_filter.addItems(["all", "Delta", "BitRound", "Quantize", "None"])
-        self.grid_layout.addWidget(self.options_filter, 1, 1)
-
-        self.grid_layout.addWidget(QLabel("Choose a serializer:"), 0, 2)
-        self.options_serializer = QComboBox()
-        self.options_serializer.addItems(["all", "PCodec", "ZFPY", "None"])
-        self.grid_layout.addWidget(self.options_serializer, 1, 2)
-
-        self.grid_layout.addWidget(QLabel("Lossy:"), 2, 0)
-        self.options_lossy = QComboBox()
-        self.options_lossy.addItems(["with", "without"])
-        self.grid_layout.addWidget(self.options_lossy, 3, 0)
-
-
-        self.panel_layout.addLayout(self.grid_layout)
-
-        self.predefined_l1 = QCheckBox("Use pre-defined L1 error")
-        self.predefined_l1.setChecked(True)
-        self.predefined_l1.stateChanged.connect(self.toggle_spinbox_enabled)
-        self.panel_layout.addWidget(self.predefined_l1)
-
-        options_l1_error_label = QLabel("Set max L1 error:")
-        self.options_l1_error = ScientificSpinBox()
-        self.options_l1_error.setValue(0.0e0)
-        self.options_l1_error.setEnabled(False)
-        self.panel_layout.addWidget(options_l1_error_label)
-        self.panel_layout.addWidget(self.options_l1_error)
-
-        self.main_layout.addWidget(self.panel_frame)
-        self.toggle_button.toggled.connect(self.toggle_compression)
-
-        self.analyze_button = QPushButton("Analyze Compressors")
-        self.analyze_button.clicked.connect(self.analyze_compressors)
+        self.analyze_button = QPushButton("Evaluate combos")
+        self.analyze_button.clicked.connect(self.evaluate_combos)
         self.analyze_button.setEnabled(False)
-        self.main_layout.addWidget(self.analyze_button)
-
-        self.progress_bar = QProgressBar()
-        self.main_layout.addWidget(self.progress_bar)
-
+        layout.addWidget(self.analyze_button)
         self.log = QTextEdit()
         self.log.setReadOnly(True)
-        self.main_layout.addWidget(self.log)
+        layout.addWidget(self.log)
 
-        form_layout = QFormLayout()
-
-        self.comp_idx_spin = QSpinBox()
-        self.comp_idx_spin.setRange(0, 79)
-        self.comp_idx_spin.setValue(10)
-
-        self.filt_idx_spin = QSpinBox()
-        self.filt_idx_spin.setRange(0, 16)
-        self.filt_idx_spin.setValue(10)
-
-        self.ser_idx_spin = QSpinBox()
-        self.ser_idx_spin.setRange(0, 34)
-        self.ser_idx_spin.setValue(10)
-
-        form_layout.addRow("Compressor index:", self.comp_idx_spin)
-        form_layout.addRow("Filter index:", self.filt_idx_spin)
-        form_layout.addRow("Serializer index:", self.ser_idx_spin)
-        self.main_layout.addLayout(form_layout)
-
-        self.compress_button = QPushButton("Compress File")
-        self.compress_button.clicked.connect(self.compress_file)
+        layout.addWidget(QLabel("Pipeline to write (best ratio first):"))
+        self.pipeline_box = QComboBox()
+        layout.addWidget(self.pipeline_box)
+        self.compress_button = QPushButton("Compress field and save as zip")
+        self.compress_button.clicked.connect(self.compress_field)
         self.compress_button.setEnabled(False)
-        self.main_layout.addWidget(self.compress_button)
+        layout.addWidget(self.compress_button)
 
-        self.file_path = None
-        self.modified_file_path = None
-        self.thread = None
-        self.file_name = None
+    def forget_results(self, *_):
+        """Another field or file: the pipeline list no longer applies."""
+        self.swept_field = self.results = None
+        self.pipeline_box.clear()
+        self.compress_button.setEnabled(False)
 
-    def toggle_spinbox_enabled(self, state):
-        self.options_l1_error.setEnabled(not self.predefined_l1.isChecked())
-
-    def toggle_compression(self, checked):
-        self.panel_frame.setVisible(checked)
-
-    def retrieve_file(self):
-        with tempfile.NamedTemporaryFile(suffix=".nc", delete=False) as tmp:
-            self.modified_file_path = tmp.name
-            ds = xr.open_dataset(self.file_path)
-            ds.to_netcdf(self.modified_file_path)
-            ds.close()
+    def set_busy(self, busy: bool):
+        """No file, field or command change while a command runs."""
+        for widget in (self.open_button, self.field_box, self.analyze_button):
+            widget.setEnabled(not busy)
+        self.compress_button.setEnabled(not busy and self.pipeline_box.count() > 0)
 
     def open_file(self):
-        file_dialog = QFileDialog()
-        path, _ = file_dialog.getOpenFileName(self, "Upload netCDF file", "", "NetCDF files (*.nc)")
-        if path:
-            self.file_path = path
-            self.file_label.setText(f"Selected file: {path}")
-            self.log.append(f"Opened file: {path}")
+        path, _ = QFileDialog.getOpenFileName(self, "Open netCDF file", "", "NetCDF files (*.nc)")
+        if not path:
+            return
+        try:  # an unreadable file must not take the window down
+            with xr.open_dataset(path) as ds:
+                variables = list(ds.data_vars)
+        except Exception as e:
+            QMessageBox.warning(self, "Cannot open file", f"{path}: {e}")
+            return
+        if not variables:
+            QMessageBox.warning(self, "Nothing to compress", f"{path} has no data variables.")
+            return
+        self.dataset_path = path
+        self.file_label.setText(f"Selected file: {path}")
+        self.field_box.clear()
+        self.field_box.addItems(variables)
+        self.forget_results()
+        self.analyze_button.setEnabled(bool(variables))
 
-            ds = xr.open_dataset(self.file_path)
-            self.file_name = os.path.basename(self.file_path)
-            variables = list(ds.data_vars.keys())
-            ds.close()
-            self.field_selection.clear()
-            if variables:
-                self.field_selection.addItems(variables)
-                self.analyze_button.setEnabled(True)
-                self.compress_button.setEnabled(True)
-            else:
-                self.log.append("No variables found.")
-                self.analyze_button.setEnabled(False)
-                self.compress_button.setEnabled(False)
-
-    def analyze_compressors(self):
-        selected_var = self.field_selection.currentText()
-        self.retrieve_file()
-        ds = load_and_resize_netcdf(xr.open_dataset(self.file_path), self.file_path)
-        with tempfile.NamedTemporaryFile(suffix=".nc", delete=False) as tmp:
-            path_to_modified_file = tmp.name
-            ds.to_netcdf(path_to_modified_file)
-
-        compressor_class = self.options_compressor.currentText()
-        filter_class = self.options_filter.currentText()
-        serializer_class = self.options_serializer.currentText()
-        with_options_ls = []
-        with_options_ls.append("--with-lossy") if self.options_lossy.currentText() == "with" else with_options_ls.append("--without-lossy")
-
-        # create ./out dir if it doesn't exist, to place all generated files there
-        if not os.path.exists("out"):
-            os.makedirs("out")
-        if self.predefined_l1.isChecked():
-            cmd = [
-                "mpirun",
-                "-n",
-                "1",
-                "dc_toolkit",
-                "evaluate_combos",
-                self.modified_file_path,
-                "--where-to-write=out",
-                "--field-to-compress=" + selected_var,
-                "--compressor-class=" + compressor_class,
-                "--filter-class=" + filter_class,
-                "--serializer-class=" + serializer_class,
-                *with_options_ls
-            ]
-        else:
-            cmd = [
-                "mpirun",
-                "-n",
-                "1",
-                "dc_toolkit",
-                "evaluate_combos",
-                self.modified_file_path,
-                os.getcwd(),
-                "--field-to-compress=" + selected_var,
-                "--l1-threshold=" + str(self.options_l1_error.value()),
-                "--compressor-class=" + compressor_class,
-                "--filter-class=" + filter_class,
-                "--serializer-class=" + serializer_class,
-                *with_options_ls
-            ]
-
-        self.thread = CompressorThread(cmd,
-                                       field_to_compress=selected_var,
-                                       compressor_class=compressor_class,
-                                       filter_class=filter_class,
-                                       serializer_class=serializer_class,
-                                       with_lossy=with_options_ls[0]
-                                       )
-        self.thread.progress.connect(self.update_progress)
-        self.thread.log.connect(self.log.append)
-        self.main_dir_files = os.listdir(os.getcwd())
-        self.thread.finished.connect(self.analysis_finished)
+    def evaluate_combos(self):
+        os.makedirs(OUT_DIR, exist_ok=True)
+        classes = {kind: box.currentText() for kind, box in self.class_boxes.items()}
+        self.forget_results()
+        self.swept_field = self.field_box.currentText()
+        cmd = utils_cli.ui_sweep_command(self.launcher, self.dataset_path, OUT_DIR, self.swept_field,
+                                         classes, self.lossy_check.isChecked(), self.ebcc_check.isChecked(),
+                                         self.l1_box.value())
+        self.log.append("Sweeping the codec space ...")
+        self.set_busy(True)
+        self.thread = CommandThread(cmd)
+        self.thread.line.connect(self.log.append)
+        self.thread.done.connect(self.sweep_finished)
         self.thread.start()
 
-        self.analyze_button.setEnabled(False)
-        self.compress_button.setEnabled(False)
-        self.progress_bar.setValue(0)
-        self.log.append("Initializing compressors anaylsis...")
+    def sweep_finished(self, returncode):
+        if returncode != 0:
+            self.set_busy(False)
+            QMessageBox.warning(self, "evaluate_combos failed", f"exit code {returncode}; see the log.")
+            return
+        self.results = utils_cli.ui_results(OUT_DIR, self.swept_field)
+        if self.results.empty:
+            self.set_busy(False)
+            self.log.append("No combination passed the gates; loosen the error budget and sweep again.")
+            return
+        self.pipeline_box.addItems(list(self.results["name"]))
+        self.set_busy(False)
+        self.log.append(f"{len(self.results)} combinations passed the gates; best: {self.results['name'].iloc[0]}")
+        utils_cli.clustering_figure(self.results).show()
 
-    def update_progress(self, pct):
-        self.log.append(f"{pct}")
+    def compress_field(self):
+        field = self.swept_field
+        name = self.pipeline_box.currentText()
+        pipeline = json.loads(self.results.loc[self.results["name"] == name, "pipeline"].iloc[0])
+        cmd = utils_cli.ui_compress_command(self.launcher, self.dataset_path, OUT_DIR, field, pipeline)
+        self.log.append(f"Compressing {field} with {name} ...")
+        self.set_busy(True)
+        self.thread = CommandThread(cmd)
+        self.thread.line.connect(self.log.append)
+        self.thread.done.connect(self.compress_finished)
+        self.thread.start()
 
-    def analysis_finished(self):
-        self.log.append("Analysis finished.")
-        new_files = set(os.listdir(os.getcwd())) - set(self.main_dir_files)
-        for file in new_files:
-            if "scored_results" not in file:
-                os.remove(file)
-        self.main_dir_files = new_files
-        self.analyze_button.setEnabled(True)
-        self.compress_button.setEnabled(True)
+    def compress_finished(self, returncode):
+        self.set_busy(False)
+        store = utils_cli.merged_store_path(OUT_DIR, self.dataset_path)
+        if returncode != 0 or not os.path.isdir(store):
+            QMessageBox.warning(self, "compress failed", f"exit code {returncode}; see the log.")
+            return
+        archive = utils_cli.zip_directory(store)
+        save_path, _ = QFileDialog.getSaveFileName(self, "Save the compressed store", os.path.basename(archive),
+                                                   "ZIP archives (*.zip)")
+        if save_path:
+            shutil.move(archive, save_path)
+            self.log.append(f"Saved {save_path}")
 
-    def show_popup(self, param, input_value, max_value):
-        msg_box = QMessageBox(self)
-        msg_box.setText(f"{param} input value {input_value} is higher than the max allowed {max_value}")
-        msg_box.setIcon(QMessageBox.Icon.Information)
-        msg_box.setStandardButtons(QMessageBox.StandardButton.Ok)
-        msg_box.exec()
-
-    def compress_file(self):
-        self.retrieve_file()
-        selected_field = self.field_selection.currentText()
-
-        da = xr.open_dataset(self.modified_file_path)[selected_field]
-
-        with_lossy = True if self.options_lossy.currentText() == "with" else False
-
-        compressors_options = len(utils.compressor_space(da=da, with_lossy=with_lossy,
-                                                     compressor_class=self.options_compressor.currentText()))
-        filters_options = len(utils.filter_space(da=da, with_lossy=with_lossy,
-                                             filter_class=self.options_filter.currentText()))
-        serializers_options = len(utils.serializer_space(da=da, with_lossy=with_lossy,
-                                                     serializer_class=self.options_serializer.currentText()))
-
-        if self.comp_idx_spin.value() > compressors_options:
-            param = "Compressor"
-            self.show_popup(param, self.comp_idx_spin.value(), compressors_options)
-        elif self.filt_idx_spin.value() > filters_options:
-            param = "Filter"
-            self.show_popup(param, self.filt_idx_spin.value(), filters_options)
-        elif self.ser_idx_spin.value() > serializers_options:
-            param = "Serializer"
-            self.show_popup(param, self.ser_idx_spin.value(), serializers_options)
-        else:
-            comp_idx = self.comp_idx_spin.value()
-            filt_idx = self.filt_idx_spin.value()
-            ser_idx = self.ser_idx_spin.value()
-
-            temp_dir = os.path.dirname(self.modified_file_path)
-            with_options_ls = []
-            with_options_ls.append("--with-lossy") if with_lossy else with_options_ls.append("--without-lossy")
-
-            cmd = [
-                "dc_toolkit",
-                "compress_with_optimal",
-                self.modified_file_path,
-                temp_dir,
-                selected_field,
-                str(comp_idx), str(filt_idx), str(ser_idx),
-                "--compressor-class=" + self.options_compressor.currentText(),
-                "--filter-class=" + self.options_filter.currentText(),
-                "--serializer-class=" + self.options_serializer.currentText(),
-                *with_options_ls
-
-            ]
-
-            self.log.append(f"Running compression with parameters: comp_idx={comp_idx}, filt_idx={filt_idx}, ser_idx={ser_idx}")
-            before = set(os.listdir(temp_dir))
-            try:
-                subprocess.run(cmd, capture_output=True, text=True, check=True)
-                self.log.append("Compression completed successfully.")
-                after = set(os.listdir(temp_dir))
-                generated_files = list(after - before)
-                output_file = os.path.join(temp_dir, generated_files[0])
-
-                split_tmp_name = os.path.basename(output_file).split(".=.", 1)
-                compressed_file_name = f"{self.file_name}.=.{split_tmp_name[0]}"
-                self.log.append(f"Generated file: {compressed_file_name}")
-
-                save_path, _ = QFileDialog.getSaveFileName(
-                    self,
-                    "save as zip file",
-                    compressed_file_name,
-                    "ZIP Archives (*.zip);;All Files (*)"
-                )
-
-                with zipfile.ZipFile(save_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
-                    if os.path.isdir(output_file):
-                        for root, _, files in os.walk(output_file):
-                            for file in files:
-                                file_path = os.path.join(root, file)
-                                arcname = os.path.relpath(file_path, temp_dir)
-                                zipf.write(file_path, arcname=arcname)
-                    else:
-                        zipf.write(output_file, arcname=os.path.basename(output_file))
-                self.log.append(f"zip file saved to: {save_path}")
-                if os.path.isdir(output_file):
-                    shutil.rmtree(output_file)
-                else:
-                    os.remove(output_file)
-
-            except subprocess.CalledProcessError as e:
-                self.log.append(f"Compression failed:\n{e.stderr}")
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     window = CompressionAnalysisUI()
-    window.resize(700, 600)
+    window.resize(700, 700)
     window.show()
     sys.exit(app.exec())

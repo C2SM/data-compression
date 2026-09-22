@@ -14,6 +14,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxkbcommon0 \
     libfontconfig1 \
     git \
+    cmake \
  && rm -rf /var/lib/apt/lists/*
 
 RUN git clone https://github.com/C2SM/data-compression.git /opt/data-compression
@@ -23,7 +24,7 @@ WORKDIR /opt/data-compression
 RUN python -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
-RUN bash install_dc_toolkit.sh
+RUN WITH_EBCC=1 bash install_dc_toolkit.sh
 
 ENTRYPOINT ["dc_toolkit"]
 CMD ["--help"]

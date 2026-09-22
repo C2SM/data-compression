@@ -1,7 +1,6 @@
 __pycache__/
 *.egg-info/
 *.zarr*
-EBCC/
 *.npy
 *.nc
 venv/
@@ -9,6 +8,5 @@ out-*
 *.csv
 *.parquet
 *manifest*.json
-sample*.json
 SWEEP*/
 VAST*/
