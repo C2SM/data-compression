@@ -982,8 +982,9 @@ def sweep_banner(var, spaces, config_space, configs_for_rank, sample_np, opts, s
                    f"variable (~{hsize(sample_np.nbytes)} each over the interconnect).")
     n_ebcc = sum(isinstance(cfg[2], utils.EBCC) for cfg in config_space)
     n_regular = sum(not isinstance(s, utils.EBCC) for s in serializers)
+    cap = f", --max-evals {opts.max_evals}" if opts.max_evals is not None else ""
     click.echo(f"[sweep] {num_loops} combos: {num_loops - n_ebcc} from the {len(compressors)} x {len(filters)} x "
-               f"{n_regular} grid (valid pairings, after --max-evals) + {n_ebcc} EBCC; split across "
+               f"{n_regular} grid (valid pairings{cap}) + {n_ebcc} EBCC; split across "
                f"{sweep.size} rank(s), ~{len(configs_for_rank)} per rank, running {threads}-wide.")
 
 

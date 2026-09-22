@@ -48,6 +48,8 @@ bash install_dc_toolkit.sh
 
 ## Usage
 
+> New to the toolkit?  [`docs/intro.md`](docs/intro.md) goes from a laptop installation to a verified store: both commands and their pipelines, `compress` without a sweep, and EBCC.
+
 ```
 --------------------------------------------------------------------------------
 
