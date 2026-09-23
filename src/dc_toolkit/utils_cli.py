@@ -727,9 +727,10 @@ def sweep_setup(opts) -> SweepContext:
     node_comm, ranks_on_node, local_rank = utils.detect_node_topology(comm)
     leaders = comm.Split(0 if local_rank == 0 else MPI.UNDEFINED, key=rank)
     cores_avail = utils.detect_cores_available()
-    if rank == 0 and size == 1 and cores_avail > 1:
-        click.echo(f"[topology] NOTE: one rank on {cores_avail} cores.  A rank evaluates one pipeline at a time; "
-                   f"start one rank per core to use them all (mpirun -n {cores_avail} dc_toolkit ...).")
+    cores = utils.detect_physical_cores() if size == 1 else 1
+    if cores > 1:
+        click.echo(f"[topology] NOTE: one rank on {cores} cores.  A rank evaluates one pipeline at a time; "
+                   f"start one rank per core to use them all (mpirun -n {cores} dc_toolkit ...).")
     utils.check_thread_oversubscription(abort_if_unsafe=opts.oversubscription_check, rank=rank, comm=comm)
     zarr.config.set({"threading.max_workers": 1})  # one core per rank: zarr's own pool must not multiply it
     if rank == 0:
@@ -844,9 +845,9 @@ def shared_sample_window(local_np, shape, dtype, sweep: SweepContext):
         win = MPI.Win.Allocate_shared(count * dtype.itemsize if sweep.local_rank == 0 else 0, dtype.itemsize,
                                       comm=sweep.node_comm)
     except MPI.Exception as e:
-        if sweep.rank == 0:
-            click.echo(f"[shared-sample] FATAL: MPI.Win.Allocate_shared failed ({e}); the node communicator "
-                       f"is not a shared-memory one (MPI without COMM_TYPE_SHARED?).")
+        click.echo(f"[shared-sample] FATAL on rank {sweep.rank}: MPI.Win.Allocate_shared failed ({e}).  The shared "
+                   f"memory may be smaller than the sample ({hsize(count * dtype.itemsize)}; in a container raise "
+                   f"docker run --shm-size), or the MPI has no shared-memory communicator.")
         sweep.comm.Abort(1)
     buf, _ = win.Shared_query(0)
     sample_np = np.frombuffer(buf, dtype=dtype, count=count).reshape(shape)
@@ -949,16 +950,16 @@ def reusable_rows(prev: pd.DataFrame, q99_abs, opts, thresholds: dict) -> pd.Ser
     return ok
 
 
-def sweep_config_space(compressors, filters, serializers, max_evals, rank, sample_np) -> list:
+def sweep_config_space(compressors, filters, serializers, max_evals, rank, dtype, all_finite: bool) -> list:
     """The (compressor, filter, serializer) triples to evaluate: the valid part
     of the Cartesian product (EBCC excluded), cut to its first --max-evals
     entries (a quick-test knob, not a sample), plus the guarded standalone EBCC
-    triples (never cut), shuffled with a seed that depends only on the count
-    (stable across --resume restarts)."""
+    triples (never cut; `all_finite`: the sample holds no NaN/Inf), shuffled
+    with a seed that depends only on the count (stable across --resume restarts)."""
     regular = [s for s in serializers if not isinstance(s, utils.EBCC)]
     total = len(compressors) * len(filters) * len(regular)
     config_space = [(c, f, s) for c, f, s in itertools.product(compressors, filters, regular)
-                    if utils.combo_is_valid(f, s, c, dtype=sample_np.dtype)]
+                    if utils.combo_is_valid(f, s, c, dtype=dtype)]
     if rank == 0 and len(config_space) < total:
         click.echo(f"[combo-filter] skipped {total - len(config_space)} unsupported filter/serializer "
                    f"pairing(s) (FixedScaleOffset->ZFPY, BitRound->ZFPY below the mantissa width).")
@@ -966,7 +967,7 @@ def sweep_config_space(compressors, filters, serializers, max_evals, rank, sampl
         if rank == 0:
             click.echo(f"[max-evals] capping config space at {max_evals} (of {len(config_space)} possible).")
         config_space = config_space[:max_evals]
-    entries, reason = utils.ebcc_sweep_entries(filters, serializers, sample_np)
+    entries, reason = utils.ebcc_sweep_entries(filters, serializers, dtype, all_finite)
     if reason and rank == 0:
         click.echo(f"[ebcc] skipping EBCC combos: {reason}.")
     config_space += entries
@@ -1253,7 +1254,10 @@ def _sweep_variable_body(da, var, opts, sweep: SweepContext, n_vars, t0, sample_
     if opts.with_ebcc and rank == 0:
         tile, reason = utils.ebcc_tile(sample_da)
         click.echo(f"[ebcc] {var}: " + (f"tile {tile[0]}x{tile[1]}" if tile else f"not applicable ({reason})"))
-    config_space = sweep_config_space(*spaces, opts.max_evals, rank, sample_np)
+    all_finite = True  # EBCC cannot encode NaN/Inf; rank 0 checks the sample for every rank
+    if any(isinstance(s, utils.EBCC) for s in spaces[2]):
+        all_finite = sweep.comm.bcast(bool(np.isfinite(sample_np).all()) if rank == 0 else None, root=0)
+    config_space = sweep_config_space(*spaces, opts.max_evals, rank, sample_np.dtype, all_finite)
     keys = [utils.pipeline_json(*cfg) for cfg in config_space]
     configs_for_rank = config_space[rank::size]
     if rank == 0:
@@ -1689,8 +1693,7 @@ def ui_mpirun() -> list:
     PATH, else nothing (one rank): a sweep's parallelism comes from its ranks,
     and Open MPI refuses more ranks than cores."""
     launcher = shutil.which("mpirun") or shutil.which("mpiexec")
-    cores = psutil.cpu_count(logical=False) or utils.detect_cores_available()
-    return [launcher, "-n", str(cores)] if launcher else []
+    return [launcher, "-n", str(utils.detect_physical_cores())] if launcher else []
 
 
 def ui_sweep_command(launcher, dataset, out_dir, field, classes: dict, with_lossy: bool, with_ebcc: bool,

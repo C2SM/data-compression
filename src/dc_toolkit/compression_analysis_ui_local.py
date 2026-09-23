@@ -1,8 +1,8 @@
 """
 Desktop (Qt) UI: open a netCDF file, sweep the codec space on one field
-(one local MPI rank), inspect the results in the browser, write the field
-with a chosen pipeline and save the store as a zip.  Launched by
-`dc_toolkit run_local_ui`.
+(under mpirun, one rank per physical core), inspect the results in the
+browser, write the field with a chosen pipeline and save the store as a zip.
+Launched by `dc_toolkit run_local_ui`.
 """
 import json
 import os

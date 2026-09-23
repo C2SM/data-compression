@@ -33,6 +33,7 @@ import dask
 import dask.array
 import humanize
 import numpy as np
+import psutil
 import xarray as xr
 import zarr
 import numcodecs
@@ -701,22 +702,22 @@ def ebcc_chunks(codec: EBCC, shape) -> Tuple[int, ...]:
     return (1,) * (len(shape) - 2) + (codec.height, codec.width)
 
 
-def ebcc_sweep_entries(filters, serializers, sample_np):
+def ebcc_sweep_entries(filters, serializers, dtype, all_finite: bool):
     """Standalone (None, filter, EBCC) sweep triples for every EBCC serializer;
     the filter is None for float32 and the AsType cast to float32 otherwise
     (EBCC's own requirement, so it is added even when --filter-class left
     AsType out of `filters`).  Returns (triples, reason) with triples empty
-    when EBCC cannot run on this sample."""
+    when EBCC cannot run on this sample; `all_finite` says whether the sample
+    holds finite values only."""
     ebccs = [s for s in serializers if isinstance(s, EBCC)]
     if not ebccs:
         return [], ""
-    if not np.isfinite(sample_np).all():
+    if not all_finite:
         return [], "the sample contains NaN/Inf, which EBCC cannot encode"
-    filt = None
-    if sample_np.dtype != np.float32:
+    dtype, filt = np.dtype(dtype), None
+    if dtype != np.float32:
         astype = [f for f in filters if isinstance(f, zarrcodecs_nc.AsType)]
-        filt = astype[0] if astype else zarrcodecs_nc.AsType(encode_dtype="float32",
-                                                             decode_dtype=str(sample_np.dtype))
+        filt = astype[0] if astype else zarrcodecs_nc.AsType(encode_dtype="float32", decode_dtype=str(dtype))
     return [(None, filt, s) for s in ebccs], ""
 
 
@@ -1217,6 +1218,13 @@ def detect_cores_available() -> int:
         except Exception:
             pass
     return max(1, os.cpu_count() or 1)
+
+
+def detect_physical_cores() -> int:
+    """Physical cores this process may use: the affinity mask capped by the
+    machine's physical cores, the number of ranks Open MPI accepts by default."""
+    avail = detect_cores_available()
+    return max(1, min(avail, psutil.cpu_count(logical=False) or avail))
 
 
 def check_thread_oversubscription(abort_if_unsafe: bool = True, rank: int = 0, comm=None) -> None:

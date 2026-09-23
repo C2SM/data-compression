@@ -2,9 +2,9 @@
 Streamlit UI: upload a netCDF file, sweep the codec space on one field, look
 at the results, write the field with a chosen pipeline and download the store.
 
-Launched by `dc_toolkit run_web_ui` (sweeps run as one local MPI rank) or by
-`dc_toolkit run_web_ui_vcluster` (sweeps run under srun; the extra arguments
-select the allocation and name the file on the cluster).
+Launched by `dc_toolkit run_web_ui` (sweeps run under mpirun, one rank per
+physical core) or by `dc_toolkit run_web_ui_vcluster` (sweeps run under srun;
+the extra arguments select the allocation and name the file on the cluster).
 """
 import argparse
 import json
