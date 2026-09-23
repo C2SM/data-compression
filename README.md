@@ -73,8 +73,8 @@ dc_toolkit \                                                # CLI-tool
 
 The typical pipeline is two commands:
 
-1. **`evaluate_combos`** — sweep `(compressor × filter × serializer)` combinations on a representative sample of each field and record the compression ratio and error metrics of every combo.  `--l1-threshold` (a relative L1 error budget) is mandatory; the L2, Linf and bias gates default to 2x, 10x and 0.5x of it.  The winner of each field goes to `manifest_{var}.json`.  With `--resume` (the default) combos already recorded in the output directory are not evaluated again: their metrics are reused (as long as the sample and chunk settings are unchanged), the gates are re-applied with the current thresholds, a combo that lacks a metric a newly enabled gate needs is evaluated again, and rows outside the current codec space are left out of the results.  `--no-resume` starts the field from scratch.  `--compressor-class` / `--filter-class` / `--serializer-class` accept a fixed list of names (a typo is refused when the command line is parsed); a field whose dtype the chosen class cannot take is skipped with a message (an error when it is the `--field-to-compress`), except integer fields, which have Delta as their only filter and fall back to it (with a message) for any `--filter-class` but `none`; variables that are not numeric arrays (datetimes, strings, scalars such as `crs`) are skipped too, and so are CF bounds such as `clon_bnds` (grid geometry, which a lossy codec would move) unless one is named with `--field-to-compress`.
-2. **`compress`** — persist the fields into one shared `.zarr` store (dataset opened once) with the winning pipeline of each field, then consolidate the store's metadata so readers open it quickly.  The chunk geometry (`--inner-chunk-mib`, `--max-inner-chunk-mib`, `--spatial-split`) defaults to what the sweep used, as recorded in the manifest, so the store matches what was measured; the command prints where each value came from.  After each write the field is re-read and gated against the sweep's thresholds and physical bounds (`--l1-threshold` ... `--bias-threshold` override them, e.g. for a field without a manifest) and its ratio is compared with the sweep's.  Each field is written under a staging name and renamed into place only after its gates passed, so an interrupted or failed write never counts as done and never replaces an earlier good array; a failed field, or one without a usable pipeline, is recorded in `batch_manifest.json` and makes the command exit with status 1, so a later run retries it.
+1. **`evaluate_combos`** — sweep `(compressor × filter × serializer)` combinations on a representative sample of each field and record the compression ratio and error metrics of every combo.  `--l1-threshold` (a relative L1 error budget) is mandatory; the L2, Linf and bias gates default to 2x, 10x and 0.5x of it.  The winner of each field goes to `manifest_{var}.json`.  With `--resume` (the default) combos already recorded in the output directory are not evaluated again: their metrics are reused (as long as the dataset, the sample, the chunk settings, the library versions and EBCC's env vars are unchanged), the gates are re-applied with the current thresholds, a combo that lacks a metric a newly enabled gate needs is evaluated again, and rows outside the current codec space are left out of the results.  `--no-resume` starts the field from scratch.  `--compressor-class` / `--filter-class` / `--serializer-class` accept a fixed list of names (a typo is refused when the command line is parsed); a field whose dtype the chosen class cannot take is skipped with a message (an error when it is the `--field-to-compress`), except integer fields, which have Delta as their only filter and get it for any `--filter-class` but `none` (with a message when the class names another filter); variables that are not numeric arrays (datetimes, strings, scalars such as `crs`) are skipped too, and so are CF bounds such as `clon_bnds` (grid geometry, which a lossy codec would move) unless one is named with `--field-to-compress`.
+2. **`compress`** — persist the fields into one shared `.zarr` store (dataset opened once) with the winning pipeline of each field, then consolidate the store's metadata so readers open it quickly.  The chunk geometry (`--inner-chunk-mib`, `--max-inner-chunk-mib`, `--spatial-split`) defaults to what the sweep used, as recorded in the manifest, so the store matches what was measured; the command prints where each value came from.  After each write the field is re-read and gated against the sweep's thresholds and physical bounds (`--l1-threshold` ... `--bias-threshold` override them, e.g. for a field without a manifest) and its ratio is compared with the sweep's.  Each field is written into a staging store beside the real one (`{dataset_stem}.zarr.__staging__`) and moved into place only after its gates passed, so an interrupted or failed write never counts as done and never replaces an earlier good array (the next `compress` deletes what a killed run left in the staging store); a failed field, or one without a usable pipeline, is recorded in `batch_manifest.json` and makes the command exit with status 1, so a later run retries it.
 
 A combination is identified by its **pipeline**: the zarr JSON of its three codecs, as stored in `zarr.json` (`{"compressor": {...}, "filter": {...}, "serializer": {...}}`, `null` for an absent codec).  It appears in every result row, in the manifests and in the store itself, so nothing has to be rebuilt or re-sampled between the sweep and the write.  `compress --vars t --pipeline '{...}'` (or `--pipeline file.json`, a `manifest_{var}.json` included) writes a field with a pipeline of your own, for example one picked from `results_{var}.parquet` or from a UI.
 
@@ -84,19 +84,19 @@ A combination is identified by its **pipeline**: the zarr JSON of its three code
 
 | File | What it is |
 |------|------------|
-| `config_space_{var}.csv` | The planned combos in sweep order (name, codec labels, pipeline JSON): the valid `(compressor, filter, serializer)` triples after the pairing rules, `--max-evals` and the EBCC entries, shuffled with a count-dependent seed. |
-| `config_space_{var}_rank{N}.csv` | Per-rank streaming audit trail, flushed every 10 rows (plus `failures_{var}_rank{N}.csv` for combos that raised).  Useful to tail during long sweeps, to inspect after a crash, and read back by `--resume`. |
+| `config_space_{var}.csv` | The planned combos in sweep order (name, codec labels, pipeline JSON): the EBCC entries first (the slowest combos), then the valid `(compressor, filter, serializer)` triples after the pairing rules and `--max-evals`, shuffled with a count-dependent seed. |
+| `config_space_{var}_rank{N}.csv` | Per-rank streaming audit trail, one line per combo as it completes, so a killed job loses at most the combos in flight (plus `failures_{var}_rank{N}.csv` for combos that raised, which the next run retries).  Useful to tail during long sweeps, to inspect after a crash, and read back by `--resume`. |
 | `results_{var}.parquet` | Consolidated results across all ranks: one row per combo with its `name`, codec labels, `pipeline` JSON, ratio, error metrics, the per-gate verdicts and a `keep` column marking the combos that passed every gate.  The canonical file for analysis (`perform_clustering`, `analyze_clustering`) and the fallback of `compress` when a manifest is missing. |
-| `sweep_state_{var}.json` | What the recorded rows were measured on (dataset, sample shape, value range, sampling policy, chunk settings).  `--resume` reuses rows only while it matches; otherwise the field restarts from scratch. |
-| `manifest_{var}.json` | The best kept combo (`best.name`, `best.pipeline`, its ratio, relative L1 error and Euclidean distance), the effective thresholds, the sweep arguments (chunk geometry, codec-space settings, ...), the q99 cut and the environment.  Read by `compress` and `plot_compression_errors`. |
+| `sweep_state_{var}.json` | What the recorded rows were measured on (dataset, sample shape, dtype and digest, full-field value range, sampling policy and vertical floor, chunk settings, library versions and EBCC's env vars).  `--resume` reuses rows only while it matches; otherwise the field restarts from scratch. |
+| `manifest_{var}.json` | The best kept combo (`best.name`, `best.pipeline`, its ratio, relative L1 error and Euclidean distance), the effective thresholds and physical bounds, the sweep arguments (chunk geometry, codec-space settings, ...), the q99 cut and the environment.  Read by `compress` and `plot_compression_errors`. |
 
 `compress` writes the compressed data into `{where_to_write}/{dataset_stem}.zarr` (the input filename without extension), one zarr array per variable at the root of the store, and `batch_manifest.json` summarising the run (per field: status, pipeline, ratio, predicted ratio and CR drift, error norms, the verify-gate and CR-drift verdicts, chunk/shard geometry).
 
 ### HPC parallelism (SLURM / MPI)
 
-> How every command parallelizes work (MPI ranks sharing one sample per node, the 32-rank cap on a 288-core node, chunks vs shards): [`docs/PARALLELIZATION.md`](docs/PARALLELIZATION.md).
+> How every command parallelizes work (MPI ranks sharing one sample per node, why the production driver runs 32 ranks on a 288-core node, chunks vs shards): [`docs/PARALLELIZATION.md`](docs/PARALLELIZATION.md).
 
-`evaluate_combos` runs as **one MPI rank per core**: the ranks of a node share one copy of the sample through an MPI shared-memory window, and every rank evaluates one pipeline at a time.  Scale out by increasing `--nodes`:
+`evaluate_combos` runs as **one MPI rank per core**: the ranks of a node share one copy of the sample through an MPI shared-memory window.  The combos still to evaluate are split across the nodes, and inside a node every rank claims the next combo of the node's share from a counter in the node's shared memory each time it finishes one, evaluating one pipeline at a time (the `[sweep]` line prints the share per node).  Scale out by increasing `--nodes`; the node count is not part of the resume state, so a sweep can be resubmitted on more or fewer nodes:
 
 ```bash
 #SBATCH --nodes=8 --ntasks-per-node=32 --cpus-per-task=1
@@ -108,9 +108,9 @@ srun --unbuffered dc_toolkit evaluate_combos input.nc \
     --eval-data-size-limit 5GB
 ```
 
-A node holds one copy of the sample plus a working set of about twice the sample per rank, about 65 × the sample at 32 ranks; the `[memory]` line prints the estimate and the sweep shrinks the sample when it does not fit.  `docs/PARALLELIZATION.md` has the arithmetic.  `santis.run` is the production driver; it reads the input location from the environment: `DYAMOND_DATA_ROOT=/path/to/parent sbatch santis.run`, where the parent directory holds the `Data_Dyamond_PostProcessed*` trees.
+A node holds one copy of the sample plus a working set of about twice the sample per rank, about 65 × the sample at 32 ranks; the `[memory]` line prints the estimate and the sweep shrinks the sample when it does not fit.  `docs/PARALLELIZATION.md` has the arithmetic.  `santis.run` is the production driver; it reads the input location from the environment and is submitted from the repository root: `DYAMOND_DATA_ROOT=/path/to/parent sbatch --account=<account> santis.run`, where the parent directory holds the `Data_Dyamond_PostProcessed*` trees.  Each entry of its field list may set its own sample size and ranks per node.
 
-Codec-internal thread pools must be pinned to 1 to avoid nested oversubscription (the tool checks this at startup and aborts by default; `--no-oversubscription-check` disables the guard):
+Codec-internal thread pools must be pinned to 1, since every rank, and every dask worker of `compress`, owns one core (`evaluate_combos` and `compress` check this at startup and abort by default; `--no-oversubscription-check` disables the guard):
 
 ```bash
 export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 \
@@ -118,9 +118,7 @@ export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 \
        VECLIB_MAXIMUM_THREADS=1 OMP_THREAD_LIMIT=1
 ```
 
-`--codec-threads N` (default 1, on `compress` and `from_zarr_to_netcdf`) enables codec-internal threading inside those single-process writes.  Compression here is memory-bandwidth-bound, so codec-internal threads gain nothing on this workload; leave it at 1 unless an A/B test says otherwise.
-
-`compress` is a single-process command — launch with `srun -n 1 ...` or plain invocation. Parallelism inside the write comes from dask's threaded scheduler, tuned via `--threads` (default: auto-detected from visible cores), `--inner-chunk-mib` (default: the sweep's value from the manifest, else 16), and `--shard-mib` (default: 512). `--verify/--no-verify` (default on) re-reads the store to compute error norms — skip with `--no-verify` on re-compression runs where the combo is already trusted.
+`compress` is a single-process command whose write runs on dask's threaded scheduler: inside a job, give its one task the cores it should use (`srun --ntasks=1 --cpus-per-task=32 ...`), since `--threads` (the dask workers) defaults to the cores that task sees and may not exceed them; outside Slurm, invoke it directly.  The write is further tuned via `--inner-chunk-mib` (default: the sweep's value from the manifest, else 16) and `--shard-mib` (default: 512). `--verify/--no-verify` (default on) re-reads the store to compute error norms — skip with `--no-verify` on re-compression runs where the combo is already trusted.
 
 ## EBCC (optional)
 
@@ -180,7 +178,7 @@ register_codec("numcodecs.zfpy_flat", ZFPYFlat)
 ```
 
 Both registrations are needed: zarr v3 keeps its own codec registry on top of numcodecs'.  Decoding needs no
-reshape logic, because a zfp stream carries its own shape.  EBCC has no such shortcut: `pip install "dc_toolkit[ebcc]"`.
+reshape logic, because a zfp stream carries its own shape.  EBCC has no such shortcut: the reader needs dc_toolkit itself with EBCC, and mpi4py, which dc_toolkit's codec module imports; install them from a clone as in [Installation](#installation), with `WITH_EBCC=1 bash install_dc_toolkit.sh`.
 
 ## UI implementation
 
@@ -191,11 +189,13 @@ The web UI also shows the combinations as a table and exports the plots as HTML;
 plots in the browser.  Outputs go to `./out`; the UIs pin the codec thread variables for the commands they
 launch.
 
-The web UI (streamlit) runs its sweeps under `mpirun`, one rank per core:
+The web UI (streamlit) runs its sweeps under `mpirun`, one rank per physical core:
 ```
 dc_toolkit run_web_ui
 ```
-On a vcluster the same UI launches them under `srun` with the given allocation and works on a file that is
+An upload whose decoded data exceeds 10 MB is cut to a leading block of every dimension so the interactive sweep stays quick; the sweep and the compressed store (`<upload>_reduced.zarr.zip`) then cover that block only.  For the full field run `evaluate_combos` and `compress` directly, or use `run_web_ui_vcluster`, which works on `--uploaded_file` as it is.
+
+On a vcluster the same UI launches its sweeps under `srun` with the given allocation and works on a file that is
 already on the cluster (`--uploaded_file`, required; `--partition` defaults to `debug`); forward the port
 first (`ssh -L 8501:localhost:8501 santis`):
 ```
@@ -215,7 +215,7 @@ dc_toolkit run_local_ui
 
 ## Docker
 
-The `Dockerfile` builds a self-contained image (all dependencies, the repository cloned inside):
+The `Dockerfile` builds a self-contained image (all dependencies, and the repository's default branch cloned from GitHub: local changes are not in the image):
 
 ```commandline
 docker build -t dc-toolkit .
@@ -233,7 +233,7 @@ docker run \
   -e VECLIB_MAXIMUM_THREADS=1 -e OMP_THREAD_LIMIT=1 \
   --entrypoint /bin/bash \
   dc-toolkit \
-  -c 'mkdir -p docker_saved_files && dc_toolkit evaluate_combos /opt/data-compression/netCDF_files/tigge_pl_t_q_dx=2_2024_08_02.nc --where-to-write /mnt/data/docker_saved_files --field-to-compress t --l1-threshold 0.005'
+  -c 'dc_toolkit evaluate_combos /opt/data-compression/netCDF_files/tigge_pl_t_q_dx=2_2024_08_02.nc --where-to-write /mnt/data/docker_saved_files --field-to-compress t --l1-threshold 0.005'
 ```
 
 **Command Breakdown:**
@@ -246,7 +246,6 @@ docker run \
 * **`--entrypoint /bin/bash`**: Forces Docker to start with a Bash shell instead of the default program (dc_toolkit).
 * **`dc-toolkit`**: The name of the Docker image to run.
 * **`-c '...'`**: The shell command the container runs:
-  * **`mkdir -p docker_saved_files`**: Creates an output directory on your host.
   * **`dc_toolkit evaluate_combos ...`**: Executes the actual compression tool with a single rank (the next section runs one rank per core), using a file inside the container and saving the results (under `--where-to-write`) to your mounted volume.
 
 Or for the web UI:
@@ -285,7 +284,7 @@ docker run \
 * **`-v $(pwd)/netCDF_files:/mnt/data`**: Volume mount bridging local and container filesystems.
 * **`--shm-size=5g`**: Room in `/dev/shm` for the sample the ranks share; at least the sample size.
 * **`-e OMP_NUM_THREADS=1 ...`**: Pins codec-internal thread pools to 1: every rank owns one core.
-* **`--entrypoint mpirun`**: Bypasses the default entrypoint to launch via OpenMPI.
+* **`--entrypoint mpirun`**: Replaces the default entrypoint (dc_toolkit) with OpenMPI's launcher.
 * **`dc-toolkit`**: The image name.
 * **`-n 4`**: Four MPI ranks, one per core the container may use; they share one copy of the sample.
 * **`bash -c '...'`**: Executes the dc_toolkit command:
@@ -321,11 +320,11 @@ docker run `
 * **`-w /mnt/data/docker_saved_files`**: Sets the Working Directory inside the container.
 * **`-v "${PWD}\netCDF_files:/mnt/data"`**: Windows equivalent of the volume mount. `${PWD}` dynamically grabs your current PowerShell directory to link your local files to the container.
 * **`--shm-size=5g`**: Room in `/dev/shm` for the sample the ranks share; at least the sample size.
-* **`--entrypoint mpirun`**: Bypasses the default container start command to run OpenMPI.
+* **`--entrypoint mpirun`**: Replaces the default container start command with OpenMPI's launcher.
 * **`dc-toolkit`**: The image name.
-* **`--allow-run-as-root`**: The container defaults to `root` on Windows; this flag bypasses OpenMPI's built-in safety restrictions against running parallel jobs as root.
+* **`--allow-run-as-root`**: The container defaults to `root` on Windows; this flag lifts OpenMPI's built-in refusal to run parallel jobs as root.
 * **`-n 4`**: Four MPI ranks, one per core the container may use.
-* **`bash -c "..."`**: Executes the parallel command. Note double-quotes for PowerShell, with an escaped backtick (` `$ `) in front of the MPI variable to prevent PowerShell from evaluating it on your host before it reaches the container.
+* **`bash -c "..."`**: Executes the parallel command. Note the double quotes for PowerShell, and PowerShell's escape character, a backtick, in front of the MPI variable (`` `$OMPI_COMM_WORLD_RANK ``) to prevent PowerShell from evaluating it on your host before it reaches the container.
 
 ## Slides
 

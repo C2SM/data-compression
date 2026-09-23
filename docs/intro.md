@@ -73,8 +73,8 @@ export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 BLOSC_NTHREADS
 ```
 
 The sweep runs one process per core, each evaluating one pipeline at a time. If the compression libraries
-also started their own threads, they would fight over the same cores, so the toolkit refuses to start until
-they are pinned to 1:
+also started their own threads, they would fight over the same cores, so `evaluate_combos` and `compress`
+refuse to start until they are pinned to 1:
 
 ```text
 [oversubscription-check] WARNING: codec-internal thread variables not pinned to 1:
@@ -109,8 +109,8 @@ up to three codecs, applied in this order:
 | **serializer** | turn the array into bytes | depends | plain bytes and `pcodec` are lossless; `zfpy` and `EBCC` are lossy |
 | **compressor** | squeeze the bytes | never | `zstd`, `blosc`, `lzma`, `bz2`, `zlib`, `lz4` |
 
-Any stage can be absent. A pipeline is written down as a small JSON object, which is exactly what Zarr
-stores next to the data:
+Any stage can be absent. A pipeline is written down as a small JSON object whose entries are the codecs'
+own Zarr JSON (the form the array's `zarr.json` records them in):
 
 ```json
 {
@@ -181,7 +181,7 @@ mpirun -n 8 dc_toolkit evaluate_combos "$FILE" \
 | `--where-to-write` | the directory for the results; created if missing |
 | `--field-to-compress t` | sweep only the variable `t`; leave it out to sweep every field of the file |
 | `--l1-threshold 0.005` | the error budget (required) |
-| `--max-evals 300` | try only 300 pipelines instead of all of them: a quick first look |
+| `--max-evals 300` | try only the first 300 pipelines of the grid, in its fixed order (here all with one compressor), not a random pick: a quick first look |
 
 The interesting lines of the output:
 
@@ -190,19 +190,20 @@ The interesting lines of the output:
 [max-evals] capping config space at 300 (of 17127 possible).
 [topology] 1 node(s) x 8 rank(s)/node = 8 parallel evaluations, one shared sample per node.
 [memory] ... = 258.1 MiB total.
-[sweep] 300 combos: 300 from the 33 x 23 x 33 grid (valid pairings, after --max-evals) + 0 EBCC; ...
+[sweep] 300 combos: 300 from the 33 x 23 x 33 grid (valid pairings, --max-evals 300) + 0 EBCC; 300 to evaluate, ~300 per node, claimed by its ranks as they free up.
 [sweep] consolidated the per-rank CSVs -> .../sweep/results_t.parquet (300 row(s)).
 best pipeline: blosc(clevel=1, cname=lz4, shuffle=0, typesize=8) | bitround(keepbits=52) | zfpy_flat(mode=2, rate=8)
 Compression Ratio: 12.886 | Relative L1 Error: 3.357e-03 | Euclidean Distance: 1.803e+02
 ```
 
 Reading it top to bottom: the full search space for this field is 33 compressors × 23 filters × 33
-serializers; pairings that cannot work are removed up front; your laptop evaluates one pipeline per core;
-and the best pipeline within the budget shrinks `t` by a factor of 12.9.
+serializers; pairings that cannot work are removed up front; your laptop evaluates one pipeline per core
+(a process that finishes one takes the next from a counter the processes share); and the best pipeline
+within the budget shrinks `t` by a factor of 12.9.
 
-On a laptop the output usually begins with `[memcheck] auto-shrunk sample budget ...`: the default budget of
-5 GB does not fit beside eight working sets in a laptop's memory, so the sweep lowers it. That is expected;
-section 10 explains the memory.
+On a laptop the output usually also has a `[memcheck] auto-shrunk sample budget ...` line above these: the
+default budget of 5 GB does not fit beside eight working sets in a laptop's memory, so the sweep lowers it.
+That is expected; section 10 explains the memory.
 
 ### What was written
 
@@ -210,8 +211,9 @@ section 10 explains the memory.
 |---|---|
 | `results_t.parquet` | **every** pipeline tried: ratio, all error metrics, a verdict per gate, and `keep` |
 | `manifest_t.json` | the winner, the thresholds that were applied, and the sweep's settings; `compress` reads this |
-| `config_space_t.csv` | the list of planned pipelines, in the order they were run |
-| `config_space_t_rank0.csv` | results as they were produced; this is what lets an interrupted sweep resume |
+| `config_space_t.csv` | the list of planned pipelines, in the order the processes claim them |
+| `config_space_t_rank0.csv` … `config_space_t_rank7.csv` | one per process: the results as they were produced; this is what lets an interrupted sweep resume |
+| `failures_t_rank0.csv` … `failures_t_rank7.csv` | one per process: the pipelines that raised an error, with the error (just a header when none failed) |
 | `sweep_state_t.json` | what the results were measured on; if it changes, the sweep starts over instead of resuming |
 
 ### Look at the results yourself
@@ -277,10 +279,11 @@ Three safety nets are at work here:
   store. If they exceed the sweep's thresholds, the field fails.
 - **CR drift.** The sweep measured a *sample*; this line compares the ratio it predicted with the one the
   whole field achieved. A large drift means the sample did not represent the field well.
-- **Staging.** A field is written under a temporary name and moved into place only after its checks passed.
-  An interrupted or failed write never leaves a half-written array behind, and never replaces a good one.
+- **Staging.** A field is written into a staging store beside the real one and moved in only after its
+  checks passed. An interrupted or failed write never leaves a half-written array behind, and never replaces
+  a good one.
 
-The store is `$OUT/sweep/<name of your file>.zarr`, with one array per field. `batch_manifest.json` records
+The store is `$OUT/sweep/<your file's name without its extension>.zarr`, with one array per field. `batch_manifest.json` records
 what happened to each field. If any field fails, `compress` exits with status 1, so scripts notice.
 
 ### Open the store
@@ -316,8 +319,8 @@ largest error: 14.37 K
 
 A ratio of 12.9 sounded great; a temperature that is wrong by 14 K does not. Nothing malfunctioned. The
 budget was `0.005`, *relative to the magnitude of the field*. Temperature is stored in kelvin, around 280, so
-0.5 % is 1.4 K on average, and the worst-cell gate (10 × L1 = 5 %) allows 14 K. The budget was simply far
-too loose for this field.
+0.5 % is 1.4 K on average, and the worst-cell gate (10 × L1 = 5 % of the field's largest value, about
+320 K) allows 16 K. The budget was simply far too loose for this field.
 
 **A budget that suits one field can ruin another.** Think about what an error means in the units of *your*
 field, and always look at the decoded data once before you trust a setting.
@@ -359,7 +362,7 @@ mpirun -n 8 dc_toolkit evaluate_combos "$FILE" --where-to-write "$OUT/full" --fi
 ```
 
 ```text
-[sweep] 17127 combos: 17127 from the 33 x 23 x 33 grid (valid pairings, after --max-evals) + 0 EBCC; ...
+[sweep] 17127 combos: 17127 from the 33 x 23 x 33 grid (valid pairings) + 0 EBCC; 17127 to evaluate, ~17127 per node, claimed by its ranks as they free up.
 best pipeline: bz2(level=3) | quantize(digits=1, dtype=float64) | -
 Compression Ratio: 7.866 | Relative L1 Error: 5.486e-05 | Euclidean Distance: 2.309e+00
 ```
@@ -449,7 +452,9 @@ left in the store, and the exit status is 1:
 [verify-gate] FAIL: t: verify gate FAILED (pass_l1) | L1=5.224e-05 ... | thresholds: l1=1.000e-07 ...
 ```
 
-`--l2-threshold`, `--linf-threshold` and `--bias-threshold` work the same way.
+`--l2-threshold`, `--linf-threshold` and `--bias-threshold` work the same way. Unlike in a sweep, they are
+not derived from `--l1-threshold` here: without a sweep's manifest in the directory, `compress` checks only
+the norms you give a threshold for.
 
 ### Inline, and several fields at once
 
@@ -464,8 +469,14 @@ A manifest is accepted as it is, so the result of one sweep can be applied to an
 time step, without searching again:
 
 ```bash
-dc_toolkit compress "$FILE" "$OUT/reuse" --vars t --pipeline "$OUT/sweep/manifest_t.json" --l1-threshold 0.0001
+dc_toolkit compress "$FILE" "$OUT/reuse" --vars t --pipeline "$OUT/sweep/manifest_t.json" \
+    --l1-threshold 0.0001 --linf-threshold 0.001
 ```
+
+Only the pipeline is taken from the manifest, not its thresholds, so pass the budget again, a worst-cell
+one included: the verify gate is what catches a pipeline that does not suit the new data, and a few wrong
+cells barely move L1. A `fixedscaleoffset` filter, for one, is fitted to the value range of the swept
+field and does not clip, so values outside that range come back wrong.
 
 ### Use a row that is not the winner
 
@@ -477,7 +488,7 @@ import json, os, pandas as pd
 
 out = os.path.expanduser("~/dc_tutorial")
 df = pd.read_parquet(f"{out}/sweep/results_t.parquet")
-row = df[df["keep"] & (df["l1_rel"] == 0)].sort_values("ratio", ascending=False).iloc[0]   # best lossless
+row = df[df["keep"] & (df["l1_rel"] == 0)].sort_values("ratio", ascending=False).iloc[0]   # zero error on the sample
 print(row["name"], row["ratio"])
 json.dump(json.loads(row["pipeline"]), open(f"{out}/picked.json", "w"), indent=1)
 ```
@@ -502,8 +513,9 @@ common ones:
 | plain bytes / no stage | `null` |
 
 Some pairings are refused because they cannot produce valid data: `bitround` in front of `zfpy` (unless
-`keepbits` keeps the full mantissa, 23 for float32 and 52 for float64), `fixedscaleoffset` in front of `zfpy`,
-and anything around EBCC, which runs alone. `compress` tells you when a pipeline is one of these.
+`keepbits` keeps the full mantissa, 23 for float32 and 52 for float64), `fixedscaleoffset` in front of `zfpy`
+(or of `pcodec` when it packs into 8 bits), and anything but the `astype` cast around EBCC, which runs alone.
+`compress` tells you when a pipeline is one of these.
 
 ---
 
@@ -527,9 +539,14 @@ pip install -e ".[ebcc]"          # inside the venv; about ten minutes
 
 - float fields whose last two dimensions are a regular **(lat, lon)** grid; unstructured grids such as ICON's
   native cells do not qualify;
-- no `NaN` or `Inf` anywhere in the field (the toolkit checks first and refuses, because the library would
-  otherwise terminate the program);
-- float64 fields are stored as float32, through an `astype` filter the toolkit adds for you;
+- each side of the frame at least 32 points, and a side above 2047 needs a divisor between 32 and 2047 (the
+  tile);
+- no `NaN` or `Inf` anywhere in the field (the toolkit checks first, because the library would otherwise
+  terminate the program: a sweep leaves EBCC out when its sample holds any, and `compress` checks the whole
+  field and refuses it, so a field whose `NaN` lie outside the sample can win with EBCC and still fail in
+  `compress`);
+- float64 fields are stored as float32, through an `astype` filter that a sweep adds for you; a pipeline of
+  your own must carry it (see "EBCC without any sweep");
 - it runs alone: no other filter, no compressor.
 
 ### Add EBCC to a sweep
@@ -541,7 +558,7 @@ mpirun -n 8 dc_toolkit evaluate_combos "$FILE" --where-to-write "$OUT/sweep_ebcc
 
 ```text
 [ebcc] t: tile 91x180
-[sweep] 307 combos: 300 from the 33 x 23 x 33 grid (valid pairings, after --max-evals) + 7 EBCC; ...
+[sweep] 307 combos: 300 from the 33 x 23 x 33 grid (valid pairings, --max-evals 300) + 7 EBCC; 307 to evaluate, ~307 per node, claimed by its ranks as they free up.
 best pipeline: - | astype(decode_dtype=float64, encode_dtype=float32) | EBCC(height=91, width=180, base_cr=2, max_error_target=0.259055)
 Compression Ratio: 12.034 | Relative L1 Error: 1.417e-04 | Euclidean Distance: 6.439e+00
 ```
@@ -596,9 +613,9 @@ dc_toolkit compress "$FILE" "$OUT/ebcc_manual" --vars t --pipeline "$OUT/ebcc.js
 [verify-gate] t: PASS, production error norms are within the sweep thresholds.
 ```
 
-The height and width are those of your (lat, lon) frame: the last two numbers of the field's shape. An EBCC
-pipeline from a sweep can also be reused through `--pipeline path/to/manifest_t.json`, as long as the frame
-size is the same.
+The height and width are those of your (lat, lon) frame: the last two numbers of the field's shape (a side
+above 2047 takes the largest divisor of it between 32 and 2047, as a sweep does). An EBCC pipeline from a sweep can
+also be reused through `--pipeline path/to/manifest_t.json`, as long as the frame size is the same.
 
 ### Reading an EBCC store
 
@@ -617,13 +634,15 @@ mpirun -n 8 dc_toolkit evaluate_combos "$FILE" --where-to-write "$OUT/lossless" 
 ```
 
 ```text
-[sweep] 297 combos: 297 from the 33 x 1 x 9 grid (valid pairings, after --max-evals) + 0 EBCC; ...
+[sweep] 297 combos: 297 from the 33 x 1 x 9 grid (valid pairings) + 0 EBCC; 297 to evaluate, ~297 per node, claimed by its ranks as they free up.
 best pipeline: lzma(preset=6) | delta(dtype=float64) | -
 Compression Ratio: 3.077 | Relative L1 Error: 0.000e+00 | Euclidean Distance: 0.000e+00
 ```
 
-Bit-for-bit identical data at a ratio of 3.1: the price of "no error at all", next to 7.9 for an error of
-0.09 K.
+Zero error on the sample at a ratio of 3.1: the price of "no error at all", next to 7.0 for a largest error
+of 0.09 K (section 5). The one filter left for a float field, `delta`, is not exactly invertible on floats (taking the
+differences and summing them back both round), so the field is not guaranteed to come back bit for bit;
+add `--filter-class none` when it must.
 
 **Only some codecs.** `--compressor-class`, `--filter-class` and `--serializer-class` each restrict one stage
 to one family, for example `--compressor-class zstd --serializer-class pcodec`. `none` means "leave this
@@ -656,32 +675,47 @@ The winner of that sweep was EBCC (section 8), so the best pipeline that needs n
 instead: a ratio of 7.9 rather than 12.0, which is what portability costs here. The sweep had evaluated
 everything already, so nothing is re-run. An array that was written earlier with such a codec is rewritten.
 
-**Back to NetCDF.** `dc_toolkit from_zarr_to_netcdf STORE.zarr --out file.nc` converts a store back.
+**Back to NetCDF.** `dc_toolkit from_zarr_to_netcdf STORE.zarr --out file.nc` writes the store's fields to a
+NetCDF file. A `compress` store holds only the fields, with their dimension names but no coordinate values
+or attributes (units), so the file has none either.
 
 ---
 
 ## 10. Your own files on a laptop
 
 **The sample.** The sweep does not run on the whole field but on a representative sample of at most
-`--eval-data-size-limit` (default `5GB`). A field smaller than that is evaluated in full. For big files on a
-laptop, lower it, for example `--eval-data-size-limit 512MiB`.
+`--eval-data-size-limit` (default `5GB`, or less after `[memcheck] auto-shrunk`). A field that fits is
+evaluated in full, and so is a field with no time or vertical dimension to thin, whatever its size
+(`[sample] WARNING ... cannot stride-sample`); the memory checks count only the budget, not that excess, so
+start fewer ranks for such a field. For big files on a laptop, lower the limit, for example
+`--eval-data-size-limit 512MiB`.
 
 **Memory.** The processes of one machine share a single copy of the sample; each adds a working set of
 about twice the sample for the pipeline it is evaluating, so memory grows with the number of ranks. The
 `[memory]` line at the start of a sweep shows the estimate. If it does not fit, the toolkit shrinks the
 sample by itself (`[memcheck] auto-shrunk ...`) or refuses to start and tells you what to change. The two
 knobs are `--eval-data-size-limit` and the number of ranks you start (`mpirun -n`). The estimate is checked
-against the machine's total memory, not what is free at that moment: when other programs hold much of it,
-close them or start fewer ranks, or the sweep will swap.
+against the machine's total memory, not what is free at that moment; only the sample itself (twice the
+sample on the first rank) is checked against what is free, and the sweep refuses with `[memcheck] REFUSING
+to proceed` when it does not fit. When other programs hold much of the memory, close them or start fewer
+ranks, or the sweep will swap.
 
 **Time.** A sweep's duration grows with the sample size and with the number of pipelines. Start with
 `--max-evals` to see whether the numbers make sense, then run the full sweep. Leave your laptop usable by
 starting fewer ranks, for example `mpirun -n 4`.
 
-**Interruptions.** Closing the lid or pressing Ctrl-C loses nothing: run the same command again and the
-sweep continues where it stopped (`[resume] N of M combo(s) ... already recorded`). It starts over only when
-something that affects the measurements changed: the file, the sample size, the chunk settings, or the
-versions of the compression libraries. `--no-resume` forces a fresh start.
+**Interruptions.** Pressing Ctrl-C loses only the pipelines being evaluated at that moment: run the same
+command again and the sweep continues where it stopped (`[resume] N of M combo(s) ... already recorded`). It
+starts over only when something that affects the measurements changed: the file, the sample (its size, its
+sampling settings or its values), the chunk settings, or the versions of the compression libraries (EBCC's
+tuning environment variables included). An auto-shrunk sample is sized for the number of ranks, so resume
+with the same `mpirun -n`: a different count can build a different sample (when the field is larger than
+the budget), which starts the field over. `--no-resume` forces a fresh start.
+
+**Fields with NaN.** Cells that are NaN in your file (fill values, masked land or sea) are left out of every
+error norm. A `fixedscaleoffset` pipeline decodes them as finite numbers and no gate notices: compare
+`np.isnan` of the store with the original, or keep that filter out of the sweep (`--filter-class bitround`,
+`quantize` or `none`). In section 5's check, use `np.nanmax`.
 
 **`compress` is safe to repeat.** Fields already in the store are skipped, and a field that failed is
 retried.
@@ -697,13 +731,13 @@ retried.
 | `Unsupported file format` | the extension is not `.nc`, `.grib` or `.zarr` | rename the file; the format is chosen from the extension |
 | `Field x not found in dataset. Available fields: [...]` | a typo in `--field-to-compress` | pick a name from the list it prints |
 | `--with-ebcc needs the ebcc package` | EBCC is not installed | `pip install -e ".[ebcc]"` (section 8) |
-| `--serializer-class ebcc has nothing for this field: ...` | the field is not a float (lat, lon) grid | sweep it without EBCC |
-| `invalid pipeline ... BitRound->ZFPY ...` | a pairing that cannot produce valid data | remove `bitround`, or use `pcodec` or plain bytes after it |
+| `--serializer-class ebcc has nothing for this field: ...` | the field is not a float (lat, lon) grid, or no tile fits its frame (section 8) | sweep it without EBCC |
+| `invalid pipeline ... (e.g. FixedScaleOffset->ZFPY, ...)` | one of the pairings section 7 lists as refused | fix that pairing: `bitround` before `zfpy` only with the full mantissa, no `fixedscaleoffset` before `zfpy` (or before 8-bit `pcodec`), EBCC with no compressor and at most the `astype` filter |
 | `[verify-gate] FAIL` and exit status 1 | the written field exceeds the budget | loosen the budget, or choose a more careful pipeline; nothing was left in the store |
 | `[verify-gate] ... no thresholds ...; verification advisory only` | `--pipeline` without a budget | add `--l1-threshold` if you want the check enforced |
 | `t already in ...; skipping.` | the store already holds the field | add `--no-skip-existing` to overwrite |
-| `[resume] ... starting this field from scratch` | the file, sample, chunking or library versions changed | nothing; the old results no longer apply |
-| `[memcheck] REFUSING to start sweep` | the estimate exceeds your memory | lower `--eval-data-size-limit` or start fewer ranks |
+| `[resume] ... starting this field from scratch` | the file, sample, chunking or library versions changed | nothing; the recorded results do not match, so the field is measured again |
+| `[memcheck] REFUSING to proceed: ...` | too little memory is free at that moment: for a sweep, for the sample (twice it on the first rank); for `compress`, for the write | close other programs, or lower `--eval-data-size-limit` (sweep) or `--threads` (compress) |
 | `[memcheck] FATAL: cannot fit any sample with N rank(s) per node` | too many ranks for the memory | start fewer ranks (`mpirun -n`) |
 | `[shared-sample] FATAL ... Allocate_shared failed` | the shared memory is smaller than the sample, usually in a container | `docker run --shm-size` of at least the sample size |
 | `[cr-drift] WARNING` | the sample predicted a different ratio than the whole field achieved | informative; a larger sample predicts better |
@@ -731,7 +765,7 @@ dc_toolkit compress FILE DIR
 
 # no sweep: your own pipeline
 dc_toolkit compress FILE DIR --vars VAR --pipeline pipeline.json --l1-threshold 0.0005
-dc_toolkit compress FILE DIR --vars VAR --pipeline other_sweep/manifest_VAR.json
+dc_toolkit compress FILE DIR --vars VAR --pipeline other_sweep/manifest_VAR.json --l1-threshold 0.0005 --linf-threshold 0.005
 
 # EBCC
 mpirun -n 8 dc_toolkit evaluate_combos FILE --where-to-write DIR --field-to-compress VAR --l1-threshold 0.0005 --with-ebcc

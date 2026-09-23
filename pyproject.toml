@@ -44,9 +44,11 @@ ebcc = ["ebcc[zarr] @ git+https://github.com/spcl/EBCC.git"]
 dc_toolkit = 'dc_toolkit.cli:cli'
 
 [project.entry-points."zarr.codecs"]
-# Lets any zarr client with dc_toolkit + ebcc installed decode EBCC-compressed arrays.
+# Any zarr client with dc_toolkit and mpi4py installed (plus ebcc, for EBCC) decodes these
+# codecs: both entry points import dc_toolkit.utils, which imports mpi4py (not a declared dependency).
 "numcodecs.ebcc_filter" = "dc_toolkit.utils:EBCC"
-# The flattening ZFPY variant under its own name, so stock "numcodecs.zfpy" decodes without dc_toolkit.
+# ZFPY on each chunk flattened to 1-D.  Its bytes are plain zfp; it needs a name of its own because
+# a pipeline's identity is its JSON and "numcodecs.zfpy" is the rank-wise encoder (ZFPYRank).
 "numcodecs.zfpy_flat" = "dc_toolkit.utils:ZFPYFlat"
 
 [tool.setuptools]

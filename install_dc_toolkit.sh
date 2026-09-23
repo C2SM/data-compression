@@ -3,28 +3,21 @@ set -euo pipefail
 
 pip install --upgrade pip
 
-# Install dc_toolkit
 pip install -e .
+# Not a declared dependency: mpi4py is built with the mpicc on PATH so that it links
+# the MPI that srun or mpirun starts.
 CC=$(which mpicc) pip install --no-binary=mpi4py mpi4py
 
-# Optional: EBCC (Error Bounded Climate Compressor), enabled in dc_toolkit with
-# --with-ebcc.  Builds OpenJPEG + an HDF5 filter: needs cmake and HDF5 headers.
-#   WITH_EBCC=1 bash install_dc_toolkit.sh
+# WITH_EBCC=1 adds EBCC (Error Bounded Climate Compressor, evaluate_combos --with-ebcc).
+# Its build (OpenJPEG + an HDF5 filter) needs cmake, a C/C++ toolchain and HDF5 headers.
 if [[ "${WITH_EBCC:-0}" == "1" ]]; then
   echo "[install] Installing EBCC (optional serializer)..."
   pip install "ebcc[zarr] @ git+https://github.com/spcl/EBCC.git"
 fi
 
-# Thread pinning is not part of the venv: export the codec-internal thread
-# caps in your shell (e.g. in your sbatch script):
-#
-#   export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 \
-#          BLOSC_NTHREADS=1 NUMBA_NUM_THREADS=1 \
-#          VECLIB_MAXIMUM_THREADS=1 OMP_THREAD_LIMIT=1
-#
-# dc_toolkit's oversubscription-check (on by default) catches any lapse.
-# --codec-threads N on the write commands allows codec-internal threading;
-# --threads * --codec-threads must stay <= physical cores.
+# The codec and BLAS thread pools are sized from the variables below, which the venv does
+# not set (santis.run exports them).  evaluate_combos and compress refuse to start unless
+# all are 1 (--no-oversubscription-check only warns); the other commands do not check.
 echo "[install] Done.  Remember to export thread-pinning env vars manually:"
 echo "[install]   export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 \\"
 echo "[install]          BLOSC_NTHREADS=1 NUMBA_NUM_THREADS=1 \\"
