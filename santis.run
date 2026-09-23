@@ -161,7 +161,7 @@ for i in "${!LIST[@]}"; do
     IFS='|' read -r RES_TAG STREAM FNAME IVAR VAR L1_THRESHOLD SAMPLE RANKS GATES <<<"${LIST[$i]}"
     SAMPLE=${SAMPLE:-$DEFAULT_SAMPLE}; RANKS=${RANKS:-$DEFAULT_RANKS}
 
-    if [[ -z "$VAR" || ! "$L1_THRESHOLD" =~ ^[0-9.]+([eE][-+]?[0-9]+)?$ ]]; then
+    if [[ -z "$VAR" || ! "$L1_THRESHOLD" =~ ^[0-9.]+([eE][-+]?[0-9]+)?$ || ! "$RANKS" =~ ^[1-9][0-9]*$ ]]; then
         echo "[$((i+1))/$n_total] SKIP malformed entry (RES|STREAM|FILE|IVAR|VAR|L1|...): ${LIST[$i]}"
         n_skip=$((n_skip+1)); PROBLEMS+=("SKIP  ${LIST[$i]}  (malformed)")
         continue
@@ -192,8 +192,10 @@ for i in "${!LIST[@]}"; do
     fi
     mkdir -p "$OUTDIR"
 
-    # $GATES is split on purpose: it holds several flags
-    srun --unbuffered --ntasks-per-node="$RANKS" --cpus-per-task=1 dc_toolkit \
+    # $GATES is split on purpose: it holds several flags.  --ntasks is explicit, since the
+    # job's SLURM_NTASKS would otherwise override --ntasks-per-node.
+    srun --unbuffered --nodes="$SLURM_JOB_NUM_NODES" --ntasks=$(( SLURM_JOB_NUM_NODES * RANKS )) \
+         --ntasks-per-node="$RANKS" --cpus-per-task=1 dc_toolkit \
          evaluate_combos \
          "$INPUT" \
          --where-to-write              "$OUTDIR" \

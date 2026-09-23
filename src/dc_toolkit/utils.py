@@ -537,6 +537,10 @@ def filter_space(da, with_lossy=True, filter_class="all", data_range=None):
             space += [cls(**cfg) for cfg in fixed_scale_offset_configs(da, data_range=data_range)]
         elif cls is zarrcodecs_nc.AsType:
             space.append(cls(encode_dtype="float32", decode_dtype=str(da.dtype)))
+    if not space:  # a named class with nothing for this field: the caller skips or refuses it
+        raise ValueError(f"--filter-class {filter_class} has nothing for this field"
+                         + (": FixedScaleOffset needs the full field's value range"
+                            if zarrcodecs_nc.FixedScaleOffset in classes else ""))
     return space
 
 
@@ -772,7 +776,8 @@ def serializer_space(da, with_lossy=True, serializer_class="all", with_ebcc=Fals
                           EBCC.from_params(*tile, r, mode="relative_error_target")
                           for r in _EBCC_ERROR_FRACTIONS]
     if da.dtype.itemsize == 1:
-        space = [None] + [s for s in space if s is not None and not isinstance(s, zarrcodecs_nc.PCodec)]
+        space = [s for s in space if not isinstance(s, zarrcodecs_nc.PCodec)]
+        why = why or "pcodec does not take 8-bit fields"
     if not space:  # a named class with nothing for this field: the caller skips or refuses it
         raise ValueError(f"--serializer-class {serializer_class} has nothing for this field" + (f": {why}" if why else ""))
     return space
@@ -805,22 +810,29 @@ def full_field_data_range(da, comm=None):
     dmin, dmax, failed = np.inf, -np.inf, 0
     try:
         if isinstance(data, dask.array.Array):
-            mine = list(data.blocks.ravel())[rank::size]
-            if mine:
-                finite = [dask.array.isfinite(b) for b in mine]
-                vals = dask.compute(*[dask.array.where(f, b, np.inf).min() for f, b in zip(finite, mine)],
-                                    *[dask.array.where(f, b, -np.inf).max() for f, b in zip(finite, mine)])
-                dmin, dmax = float(min(vals[:len(mine)])), float(max(vals[len(mine):]))
-        elif rank == 0:
-            arr = np.asarray(data)
-            fin = arr[np.isfinite(arr)]
-            if fin.size:
-                dmin, dmax = float(fin.min()), float(fin.max())
-    except Exception:
+            blocks = list(data.blocks.ravel())[rank::size]
+        else:
+            blocks = [data] if rank == 0 else []
+        for block in blocks:  # one block in memory at a time, reduced without a copy
+            x = np.asarray(block.compute() if isinstance(block, dask.array.Array) else block)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", RuntimeWarning)  # an all-NaN block
+                lo, hi = np.nanmin(x), np.nanmax(x)
+            if not (np.isfinite(lo) and np.isfinite(hi)):  # +-inf, or no finite value at all
+                x = x[np.isfinite(x)]
+                if not x.size:
+                    continue
+                lo, hi = x.min(), x.max()
+            dmin, dmax = min(dmin, float(lo)), max(dmax, float(hi))
+    except Exception as e:
         failed = 1
+        click.echo(f"[range] WARNING rank {rank}: reading the field failed ({e!r})", err=True)
     if comm is not None:
         failed = comm.allreduce(failed, op=MPI.MAX)
         dmin, dmax = comm.allreduce(dmin, op=MPI.MIN), comm.allreduce(dmax, op=MPI.MAX)
+    if failed and rank == 0:
+        click.echo("[range] WARNING: no full-field value range: FixedScaleOffset is left out, and EBCC and "
+                   "--phys-tolerance run without it.")
     if failed or not (np.isfinite(dmin) and np.isfinite(dmax)) or dmax <= dmin:
         return None
     return (dmin, dmax)
@@ -1119,20 +1131,15 @@ def _gradient_rel_l1(orig: np.ndarray, decoded: np.ndarray, axes=None) -> float:
 # 6. PERSISTENCE
 # =============================================================================
 
-def persist_with_codec_pipeline(da, store, component: str, codec_kwargs: dict,
-                                inner_chunks=None, shards=None, verify: bool = True, q99_abs=None):
+def persist_with_codec_pipeline(da, store, component: str, codec_kwargs: dict, inner_chunks, shards,
+                                verify: bool = True, q99_abs=None):
     """
     Write dask-backed `da` into `store` at `component` via dask.array.to_zarr.
     Returns (compression_ratio, errors, euclidean_distance); the last two are
-    None unless `verify` re-reads the store.  One dask task writes one shard
-    (or one chunk when sharding is skipped).
+    None unless `verify` re-reads the store.  One dask task writes one shard,
+    or one chunk when `shards` is None (unsharded).
     """
     assert isinstance(da.data, dask.array.Array), "expects a dask-backed xr.DataArray"
-    if inner_chunks is None or shards is None:
-        auto_inner, auto_shard = compute_chunk_and_shard_shape(da.shape, da.dtype, dims=tuple(da.dims))
-        inner_chunks = auto_inner if inner_chunks is None else inner_chunks
-        shards = auto_shard if shards is None else shards
-
     write_unit = shards if shards is not None else inner_chunks
     zarr_kwargs = dict(zarr_format=3, dimension_names=tuple(da.dims), chunks=inner_chunks, **codec_kwargs)
     if shards is not None:
@@ -1197,16 +1204,9 @@ def compute_errors_distances(da_compressed, da, q99_abs=None):
 # =============================================================================
 
 def detect_node_topology(comm=None):
-    """(node_comm, ranks_on_node, local_rank) via MPI-3 shared-memory split,
-    with a hostname fallback for old MPI implementations."""
+    """(node_comm, ranks_on_node, local_rank): the ranks sharing this rank's node."""
     comm = comm or MPI.COMM_WORLD
-    try:
-        node_comm = comm.Split_type(MPI.COMM_TYPE_SHARED, key=comm.Get_rank())
-    except Exception:
-        import socket
-        names = comm.allgather(socket.gethostname())
-        color = {n: i for i, n in enumerate(sorted(set(names)))}
-        node_comm = comm.Split(color[socket.gethostname()], key=comm.Get_rank())
+    node_comm = comm.Split_type(MPI.COMM_TYPE_SHARED, key=comm.Get_rank())
     return node_comm, node_comm.Get_size(), node_comm.Get_rank()
 
 
@@ -1282,7 +1282,7 @@ class Timer:
 def print_profile_summary():
     if not _TIMINGS or MPI.COMM_WORLD.Get_rank() != 0:
         return
-    print("\n=== Timing Summary (rank 0; ranks balanced via deterministic shuffle) ===")
+    print("\n=== Timing Summary (rank 0) ===")
     print("Sum of Total = seconds inside the timed sections (excludes the sample build,")
     print("dask graph setup and result-write overhead).\n")
     width = max(len(label) for label in _TIMINGS)

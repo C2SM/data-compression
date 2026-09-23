@@ -20,8 +20,8 @@ Sections
   8. Analysis & plotting
   9. UI support                 (the streamlit and Qt front-ends)
 """
-import copy
 import csv
+import hashlib
 import importlib.metadata
 import itertools
 import json
@@ -32,6 +32,7 @@ import shutil
 import sys
 import time
 import traceback
+import zlib
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -78,13 +79,6 @@ def add_options(options):
             f = opt(f)
         return f
     return decorator
-
-
-def alias(command, name: str):
-    """A hidden second name for a command."""
-    cmd = copy.copy(command)
-    cmd.name, cmd.hidden = name, True
-    return cmd
 
 
 def require_single_process(command: str) -> None:
@@ -187,6 +181,7 @@ def promote_staged(merged_path: str, var: str) -> None:
     array."""
     target = Path(merged_path) / var
     if target.exists():
+        drop_consolidated_metadata(merged_path)  # it would describe the replaced array until the next consolidation
         shutil.rmtree(target)
     os.replace(staging_path(merged_path) / var, target)
     remove_staged(merged_path)
@@ -219,7 +214,9 @@ def drop_consolidated_metadata(merged_path: str) -> bool:
         if "consolidated_metadata" not in meta:
             return False
         meta.pop("consolidated_metadata")
-        root.write_text(json.dumps(meta, indent=2))
+        tmp = root.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(meta, indent=2))
+        os.replace(tmp, root)  # readers may have the store open
         return True
     except Exception as e:
         click.echo(f"[store] WARNING: could not drop the consolidated metadata of {merged_path}: {e}")
@@ -257,39 +254,11 @@ def json_errors(errors) -> dict:
 # 2. WRITE THREADS & MEMORY GUARDS
 # =============================================================================
 
-def apply_codec_threads(codec_threads: int, rank: int = 0) -> None:
-    """Blosc honours set_nthreads live; OpenMP/MKL read env vars at load time."""
-    if codec_threads is None or int(codec_threads) <= 1:
-        return
-    n = int(codec_threads)
-    mismatched = [(v, os.environ.get(v)) for v in utils.THREAD_ENV_VARS if os.environ.get(v) != str(n)]
-    if mismatched and rank == 0:
-        click.echo(f"[codec-threads] requested {n}; export these in the shell BEFORE running for full effect:")
-        for v, cur in mismatched:
-            click.echo(f"  {v}={'<unset>' if cur is None else cur} -> export {v}={n}")
-    try:
-        import numcodecs.blosc as _blosc
-        _blosc.set_nthreads(n)
-    except Exception as e:
-        if rank == 0:
-            click.echo(f"[codec-threads] WARNING: blosc.set_nthreads failed: {e}")
-
-
-def check_thread_product(threads: int, codec_threads: int, rank: int = 0) -> None:
+def check_thread_count(threads: int) -> None:
     cores = utils.detect_cores_available()
-    product = int(threads) * max(1, int(codec_threads or 1))
-    if product > cores:
-        if rank == 0:
-            click.echo(f"[oversubscription] --threads * --codec-threads = {product} exceeds "
-                       f"the visible cores ({cores}).  Reduce one of the flags.")
+    if int(threads) > cores:
+        click.echo(f"[oversubscription] --threads {threads} exceeds the visible cores ({cores}).")
         abort(1)
-
-
-def configure_threads(threads: int, codec_threads: int, oversubscription_check: bool, rank: int = 0) -> None:
-    apply_codec_threads(codec_threads, rank=rank)
-    check_thread_product(threads, codec_threads, rank=rank)
-    if int(codec_threads or 1) <= 1:
-        utils.check_thread_oversubscription(abort_if_unsafe=oversubscription_check, rank=rank)
 
 
 def single_process_setup(opts) -> None:
@@ -298,7 +267,8 @@ def single_process_setup(opts) -> None:
     reset_memcheck_state()
     if opts.threads is None:
         opts.threads = utils.detect_cores_available()
-    configure_threads(opts.threads, opts.codec_threads, opts.oversubscription_check)
+    check_thread_count(opts.threads)
+    utils.check_thread_oversubscription(abort_if_unsafe=opts.oversubscription_check)
 
 
 # Per-rank working set in units of the sample: the decoded buffer (1x) plus the
@@ -862,8 +832,8 @@ def shared_sample_window(local_np, shape, dtype, sweep: SweepContext):
         sweep.leaders.Bcast(sample_np, root=0)
     sweep.node_comm.Barrier()
     sample_np.flags.writeable = False
-    probe = sample_np.reshape(-1)[::4099]  # a strided view: no copy of the sample on every rank at once
-    h = float(np.nansum(probe, dtype=np.float64)) + float(probe.size)
+    probe = np.ascontiguousarray(sample_np.reshape(-1)[::4099])  # 1/4099 of the sample on every rank
+    h = zlib.crc32(probe.view(np.uint8))  # exact whatever NaN/Inf the sample holds
     if sweep.comm.allreduce(h, MPI.MIN) != sweep.comm.allreduce(h, MPI.MAX):
         if sweep.rank == 0:
             click.echo("[shared-sample] FATAL: the sample differs between ranks after the fill.")
@@ -915,6 +885,7 @@ def sweep_recorded_rows(var, sample_np, q99_abs, fso_range, opts, sweep: SweepCo
             "dtype": str(sample_np.dtype), "full_field_range": fso_range,
             "sampling_policy": opts.sampling_policy, "vertical_floor": opts.vertical_floor,
             "inner_chunk_mib": opts.inner_chunk_mib, "spatial_split": opts.spatial_split,
+            "sample_digest": hashlib.blake2b(memoryview(sample_np).cast("B"), digest_size=16).hexdigest(),
             "env": env_versions()}, default=str))
         state_path = where / f"sweep_state_{var}.json"
         previous = read_json(state_path, "resume")
@@ -975,9 +946,9 @@ def sweep_config_space(compressors, filters, serializers, max_evals, rank, dtype
     entries, reason = utils.ebcc_sweep_entries(filters, serializers, dtype, all_finite)
     if reason and rank == 0:
         click.echo(f"[ebcc] skipping EBCC combos: {reason}.")
-    config_space += entries
-    perm = np.random.default_rng(seed=len(config_space) & 0xFFFFFFFF).permutation(len(config_space))
-    return [config_space[i] for i in perm]
+    # EBCC first: its combos are the slowest, and a node that claims one last runs long after the others
+    perm = np.random.default_rng(seed=(len(config_space) + len(entries)) & 0xFFFFFFFF).permutation(len(config_space))
+    return entries + [config_space[i] for i in perm]
 
 
 def config_space_table(config_space) -> pd.DataFrame:
@@ -990,8 +961,8 @@ def config_space_table(config_space) -> pd.DataFrame:
 def sweep_banner(var, spaces, config_space, n_pending, sample_np, opts, sweep: SweepContext, n_vars: int):
     compressors, filters, serializers = spaces
     ranks, num_loops = sweep.ranks_on_node, len(config_space)
-    trailer = (f" (only {min(sweep.size, num_loops)} will run concurrently; {num_loops} combos total)"
-               if num_loops < sweep.size else "")
+    trailer = (f" (only {n_pending} will run concurrently; {n_pending} of {num_loops} combos to evaluate)"
+               if 0 < n_pending < sweep.size else "")
     click.echo(f"[topology] {sweep.n_nodes} node(s) x {ranks} rank(s)/node = {sweep.size} parallel evaluations, "
                f"one shared sample per node{trailer}.")
     steady = node_steady_estimate_bytes(sample_np.nbytes, ranks, opts.inner_chunk_mib)
@@ -1102,13 +1073,13 @@ def sweep_run_rank(config_space, pending, var, opts, sweep: SweepContext, evalua
     claim, win = node_counter(sweep)
 
     failures = []
-    FLUSH_EVERY = 10
-    with open(partial_path, mode, newline="") as pf, open(failures_path, "w", newline="") as ff:
+    # line-buffered: a walltime kill loses at most the combo in flight
+    with open(partial_path, mode, newline="", buffering=1) as pf, \
+            open(failures_path, "w", newline="", buffering=1) as ff:
         pw, fw = csv.writer(pf), csv.writer(ff)
         if pf.tell() == 0:
             pw.writerow(PARTIAL_CSV_COLUMNS)
         fw.writerow(["name", "pipeline", "error"])
-        n_rows = n_fail = 0
         while True:
             i = claim()
             if i >= len(share):
@@ -1119,12 +1090,11 @@ def sweep_run_rank(config_space, pending, var, opts, sweep: SweepContext, evalua
             cfg = config_space[share[i]]
             try:
                 r = evaluate_one(cfg)
-            except Exception as e:  # one broken combo never stops the sweep
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except BaseException as e:  # one broken combo never stops the sweep; a Rust panic is a BaseException
                 failures.append((utils.pipeline_name(*cfg), utils.pipeline_json(*cfg), repr(e)))
                 fw.writerow(failures[-1])
-                n_fail += 1
-                if n_fail % FLUSH_EVERY == 0:
-                    ff.flush()
                 continue
             err = r["errors"]
             keep, reasons = gate(err)
@@ -1137,9 +1107,6 @@ def sweep_run_rank(config_space, pending, var, opts, sweep: SweepContext, evalua
                 reasons["pass_q99"], reasons["pass_bounds"], reasons["pass_grad"], reasons["pass_finite"],
                 keep,
             ])
-            n_rows += 1
-            if n_rows % FLUSH_EVERY == 0:
-                pf.flush()
     win.Unlock_all()
     win.Free()
     return failures
@@ -1501,16 +1468,14 @@ def zarr_to_netcdf(opts) -> None:
     """zarr v3 store -> NetCDF4 file, streamed through dask."""
     out_nc = opts.out_nc or str(Path(opts.zarr_path).with_suffix(".nc"))
     threads = utils.detect_cores_available() if opts.threads is None else int(opts.threads)
-    apply_codec_threads(opts.codec_threads)
-    check_thread_product(threads, opts.codec_threads)
+    check_thread_count(threads)
 
     with dask.config.set(scheduler="threads", num_workers=threads):
         # consolidated=False: a listing made stale by a later --no-consolidate write would silently
         # drop fields (or describe them with the wrong codecs).
         ds = xr.open_zarr(opts.zarr_path, chunks="auto", consolidated=False)
         logical_bytes = int(ds.nbytes)
-        click.echo(f"[zarr->nc] logical size = {hsize(logical_bytes)} | dask workers = {threads} "
-                   f"| codec-threads = {opts.codec_threads}")
+        click.echo(f"[zarr->nc] logical size = {hsize(logical_bytes)} | dask workers = {threads}")
         if logical_bytes > opts.max_size:
             raise click.ClickException(f"Refusing to write: logical size exceeds --max-size ({hsize(opts.max_size)}).  "
                                        f"Raise --max-size to proceed, or keep the data in .zarr.")
@@ -1709,11 +1674,11 @@ def ui_launcher(user_account=None, time=None, nodes=None, ntasks_per_node=None, 
                 partition=None) -> list:
     """Command prefix: srun with the allocation when a vcluster account is
     given, else nothing."""
-    if user_account:
-        return ["srun", "-A", user_account, "--time", time or "00:15:00", "--nodes", nodes or "1",
-                "--ntasks-per-node", ntasks_per_node or "1", "--uenv=" + (uenv_image or ""),
-                "--view=default", "--partition=" + (partition or "debug")]
-    return []
+    if not user_account:
+        return []
+    cmd = ["srun", "-A", user_account, "--time", time or "00:15:00", "--nodes", nodes or "1",
+           "--ntasks-per-node", ntasks_per_node or "1", "--partition=" + (partition or "debug")]
+    return cmd + (["--uenv=" + uenv_image, "--view=default"] if uenv_image else [])
 
 
 def ui_env() -> dict:

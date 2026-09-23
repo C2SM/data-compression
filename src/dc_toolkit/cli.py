@@ -67,46 +67,44 @@ _CODEC_SPACE_OPTIONS = [
                       "down-cast, encodes at ~1-2 MB/s per core."),
 ]
 _CHUNK_OPTIONS = [
-    click.option("--inner-chunk-mib", type=int, default=16, show_default=True,
+    click.option("--inner-chunk-mib", type=click.IntRange(min=1), default=16, show_default=True,
                  help="Target zarr chunk size in MiB (compress reuses the sweep's value)."),
-    click.option("--max-inner-chunk-mib", type=int, default=256, show_default=True,
+    click.option("--max-inner-chunk-mib", type=click.IntRange(min=1), default=256, show_default=True,
                  help="Warn when --no-spatial-split produces a chunk above this size (MiB)."),
     click.option("--spatial-split/--no-spatial-split", default=True, show_default=True,
                  help="Split spatial dims (horizontal first, vertical last) when one timestep exceeds "
                       "--inner-chunk-mib.  --no-spatial-split keeps one full timestep per chunk instead "
-                      "(sharding still groups chunks up to --shard-mib; see --max-inner-chunk-mib)."),
+                      "(see --max-inner-chunk-mib); compress reuses the sweep's setting."),
 ]
 _CHUNK_OVERRIDE_OPTIONS = [  # compress: None means "the sweep's value from the manifest"
-    click.option("--inner-chunk-mib", type=int, default=None,
+    click.option("--inner-chunk-mib", type=click.IntRange(min=1), default=None,
                  help="Target zarr chunk size in MiB (default: the sweep's value, else 16)."),
-    click.option("--max-inner-chunk-mib", type=int, default=None,
+    click.option("--max-inner-chunk-mib", type=click.IntRange(min=1), default=None,
                  help="Warn above this inner chunk size (MiB) with --no-spatial-split (default: the sweep's, else 256)."),
     click.option("--spatial-split/--no-spatial-split", default=None,
                  help="Split spatial dims when one timestep exceeds --inner-chunk-mib (default: the sweep's, else on)."),
 ]
 _OVERSUBSCRIPTION_OPTION = click.option(
     "--oversubscription-check/--no-oversubscription-check", default=True, show_default=True,
-    help="Abort at startup unless the OMP/BLOSC/MKL thread env vars are pinned to 1 "
-         "(checked with --codec-threads 1 only, where that flag exists).")
-_CODEC_THREAD_OPTIONS = [
-    click.option("--codec-threads", type=int, default=1, show_default=True,
-                 help="Codec-internal threads per call (Blosc set live; OpenMP/MKL/OpenBLAS need "
-                      "shell exports).  threads x codec-threads must not exceed the cores."),
-    _OVERSUBSCRIPTION_OPTION,
-]
+    help="Abort at startup unless " + ", ".join(utils.THREAD_ENV_VARS) + " are all set to 1.")
 _MEMORY_OPTION = click.option(
     "--memory-threshold", type=click.FloatRange(0.05, 0.95), default=0.80, show_default=True,
-    help="Max fraction of the available memory an estimated footprint may use before aborting.")
+    help="Max fraction of memory an estimated footprint may use.  evaluate_combos shrinks its sample until "
+         "one node's footprint fits this fraction of the node's budget (cgroup limit, else RAM) and aborts "
+         "when nothing fits; compress refuses a write whose peak does not fit the available RAM.")
 _PERSIST_OPTIONS = _CHUNK_OVERRIDE_OPTIONS + [
-    click.option("--shard-mib", type=int, default=512, show_default=True,
+    click.option("--shard-mib", type=click.IntRange(min=1), default=512, show_default=True,
                  help="Target shard size in MiB (an integer number of inner chunks).  Sharding is "
                       "skipped when a shard would hold fewer than two chunks."),
-    click.option("--threads", type=int, default=None,
+    click.option("--threads", type=click.IntRange(min=1), default=None,
                  help="Dask workers for the write (default: visible cores).  Peak memory ~ threads x "
                       "(max(source block, shard) + 3 x shard); the memory guard refuses what does not fit."),
-] + _CODEC_THREAD_OPTIONS + [_MEMORY_OPTION]
+    _OVERSUBSCRIPTION_OPTION, _MEMORY_OPTION,
+]
+
+
 def _finite(ctx, param, value):
-    """A NaN bound fails every combo without a word; refuse every non-finite value."""
+    """Refuse NaN and +-inf: a non-finite bound or budget silently rejects or passes every combo."""
     if value is not None and (value != value or abs(value) == float("inf")):
         raise click.BadParameter("must be finite")
     return value
@@ -133,20 +131,23 @@ _VERIFY_OPTIONS = [
               type=click.Path(dir_okay=True, file_okay=False, exists=False),
               help="Output directory (config_space_{var}.csv, per-rank CSVs, results_{var}.parquet, "
                    "manifest_{var}.json).  Created if missing.")
-@click.option("--field-to-compress", default=None, help="Field to sweep (default: every data variable).")
+@click.option("--field-to-compress", default=None,
+              help="Field to sweep (default: every non-empty integer/float32/float64 variable with at least "
+                   "one dim, CF bounds excepted).")
 @click.option("--eval-data-size-limit", default="5GB", callback=utils_cli.size_option_callback, show_default=True,
               help="Budget of the representative sample the combos are scored on (e.g. 5GB, 512MiB).")
 @_OVERSUBSCRIPTION_OPTION
 @utils_cli.add_options(_CHUNK_OPTIONS)
 @_MEMORY_OPTION
-@click.option("--l1-threshold", type=float, required=True,
+@click.option("--l1-threshold", type=click.FloatRange(min=0.0), required=True, callback=_finite,
               help="Relative L1 error budget (e.g. 0.005 = 0.5%).  The anchor for the other gates.")
-@click.option("--l2-threshold", type=float, default=None, help="Relative L2 budget (default: 2 x L1).")
-@click.option("--linf-threshold", type=float, default=None,
+@click.option("--l2-threshold", type=click.FloatRange(min=0.0), default=None, callback=_finite,
+              help="Relative L2 budget (default: 2 x L1).")
+@click.option("--linf-threshold", type=click.FloatRange(min=0.0), default=None, callback=_finite,
               help="Relative Linf (worst cell) budget (default: 10 x L1).")
-@click.option("--bias-threshold", type=float, default=None,
+@click.option("--bias-threshold", type=click.FloatRange(min=0.0), default=None, callback=_finite,
               help="Relative bias budget |mean signed error| / mean|orig| (default: 0.5 x L1).")
-@click.option("--q99-threshold", type=float, default=None,
+@click.option("--q99-threshold", type=click.FloatRange(min=0.0), default=None, callback=_finite,
               help="Relative budget over cells with |value| >= the 99th percentile (default: 2 x L1).  "
                    "Only with --extremes-sensitive.")
 @click.option("--l2-gate/--no-l2-gate", default=True, show_default=True, help="Enable the L2 gate.")
@@ -159,27 +160,28 @@ _VERIFY_OPTIONS = [
 @click.option("--phys-tolerance", type=click.FloatRange(0.0, 1.0), default=0.0, show_default=True, callback=_finite,
               help="Slack for --phys-min/--phys-max as a fraction of the field's value range: a lossy codec "
                    "rings past a bound the field sits on by a hair. Stored in the manifest as an absolute "
-                   "value, so compress and the checker apply the same slack.")
+                   "value, so compress's verify gate applies the same slack.")
 @click.option("--gradient-gate/--no-gradient-gate", default=False, show_default=True,
               help="Enable the spatial-gradient gate (one more pass over the sample per combo; "
                    "for winds, pressure).")
-@click.option("--gradient-threshold", type=float, default=0.1, show_default=True,
+@click.option("--gradient-threshold", type=click.FloatRange(min=0.0), default=0.1, show_default=True, callback=_finite,
               help="Max relative L1 error of the finite-difference field (absolute fraction, not x L1).")
 @click.option("--gradient-shortcircuit/--no-gradient-shortcircuit", default=True, show_default=True,
               help="Only compute the gradient for combos that already pass the cheap gates.")
 @utils_cli.add_options(_CODEC_SPACE_OPTIONS)
 @click.option("--sampling-policy", type=click.Choice(["cascade", "balanced"]), default="cascade",
               show_default=True,
-              help="How an over-budget field is thinned: 'cascade' spends the budget on time steps "
-                   "first (keeping a minimum of vertical levels); 'balanced' treats every axis equally.")
-@click.option("--vertical-floor", type=int, default=None,
+              help="How an over-budget field is thinned (only its time and vertical dims; the others are kept "
+                   "whole): 'cascade' spends the budget on time steps first, keeping a minimum of vertical "
+                   "levels; 'balanced' splits it evenly across the time and vertical dims.")
+@click.option("--vertical-floor", type=click.IntRange(min=1), default=None,
               help="Minimum vertical levels kept by the cascade policy "
                    "(default: max(4, ceil(log2(n_levels)))).")
 @click.option("--resume/--no-resume", default=True, show_default=True,
               help="Skip combos already recorded in config_space_{var}_rank*.csv: their metrics are reused "
-                   "and the gates re-applied with the current thresholds.  A changed sample or chunk "
-                   "setting restarts the field.")
-@click.option("--max-evals", type=int, default=None,
+                   "and the gates re-applied with the current thresholds.  A changed file, sample, chunk "
+                   "setting or library version (recorded in sweep_state_{var}.json) restarts the field.")
+@click.option("--max-evals", type=click.IntRange(min=1), default=None,
               help="Cap the Cartesian product (quick test runs); EBCC combos are always included.")
 @click.pass_context
 def evaluate_combos(ctx, **_):
@@ -207,7 +209,7 @@ def evaluate_combos(ctx, **_):
 
 
 _VERIFY_THRESHOLD_OPTIONS = [
-    click.option(f"--{k}-threshold", type=float, default=None,
+    click.option(f"--{k}-threshold", type=click.FloatRange(min=0.0), default=None, callback=_finite,
                  help=f"Relative {label} budget for the verify gate, overriding the sweep's value in "
                       f"manifest_{{var}}.json (the only way to gate a --pipeline field without a manifest).")
     for k, label in (("l1", "L1"), ("l2", "L2"), ("linf", "Linf"), ("bias", "bias"))
@@ -227,7 +229,9 @@ _VERIFY_THRESHOLD_OPTIONS = [
 @click.option("--stock-codecs-only", is_flag=True, default=False,
               help="Write only pipelines a zarr client without dc_toolkit can decode: when the sweep's best uses a codec "
                    "that needs dc_toolkit's zarr.codecs entry point (numcodecs.zfpy_flat, numcodecs.ebcc_filter), "
-                   "take the best such row of results_{var}.parquet instead.")
+                   "take the best stock row of results_{var}.parquet instead.  A --pipeline with such a codec "
+                   "is refused, a field already stored with one is rewritten even under --skip-existing, and "
+                   "the run fails while the store still holds any such array.")
 @utils_cli.add_options(_PERSIST_OPTIONS)
 @utils_cli.add_options(_VERIFY_OPTIONS)
 @utils_cli.add_options(_VERIFY_THRESHOLD_OPTIONS)
@@ -319,7 +323,7 @@ def compress(ctx, **_):
         elif utils_cli.drop_consolidated_metadata(merged_path):
             click.echo("[compress] dropped the store's consolidated metadata (--no-consolidate): it would "
                        "now describe this run's fields wrongly.  Readers scan the arrays until the next "
-                       "consolidation (dc_toolkit merge_compressed_fields).")
+                       "consolidation (dc_toolkit merge_compressed_fields DATASET WHERE_TO_WRITE).")
     utils_cli.write_json(os.path.join(opts.where_to_write, "batch_manifest.json"), {
         "command": "compress", "dataset_file": os.fspath(opts.dataset_file),
         "where_to_write": os.fspath(opts.where_to_write), "merged_store": merged_path,
@@ -329,19 +333,7 @@ def compress(ctx, **_):
         sys.exit(1)
 
 
-cli.add_command(utils_cli.alias(compress, "compress_fields_from_results"))
-
-
-@cli.command("compress_with_optimal", hidden=True,
-             context_settings={"ignore_unknown_options": True, "allow_extra_args": True})
-@click.argument("args", nargs=-1, type=click.UNPROCESSED)
-def compress_with_optimal(args):
-    """Hidden stub: refuses the call and points to `compress`."""
-    raise click.ClickException("compress_with_optimal is a stub; use `compress DATASET WHERE_TO_WRITE "
-                               "[--vars FIELD --pipeline JSON]`; the sweep's manifest_{var}.json holds the pipeline.")
-
-
-@cli.command("merge_compressed_fields", hidden=True)
+@cli.command("merge_compressed_fields")
 @click.argument("dataset_file", type=click.Path(exists=True, dir_okay=True, file_okay=True))
 @click.argument("compressed_files_location", type=click.Path(dir_okay=True, file_okay=False, exists=False))
 def merge_compressed_fields(dataset_file: str, compressed_files_location: str):
@@ -362,7 +354,7 @@ def merge_compressed_fields(dataset_file: str, compressed_files_location: str):
 
 @cli.command("open_zarr_and_inspect")
 @click.argument("zarr_path", type=click.Path(exists=True, dir_okay=True, file_okay=False))
-@click.option("--head", type=int, default=4, show_default=True,
+@click.option("--head", type=click.IntRange(min=1), default=4, show_default=True,
               help="Elements per dim to preview from each array (0 = metadata only).")
 def open_zarr_and_inspect(zarr_path: str, head: int):
     """Print the group tree, per-array metadata (codecs, sharding, ratio) and a
@@ -398,7 +390,7 @@ def open_zarr_and_inspect(zarr_path: str, head: int):
                    "on disk (the attrs ride along, so readers still decode).")
 @click.option("--decode-times/--no-decode-times", default=False, show_default=True,
               help="Apply CF time decoding at read time.  Off keeps the on-disk numeric form.")
-@click.option("--threads", type=int, default=None, help="Dask workers (default: visible cores).")
+@click.option("--threads", type=click.IntRange(min=1), default=None, help="Dask workers (default: visible cores).")
 @click.pass_context
 def from_nc_to_zarr(ctx, **_):
     """
@@ -416,11 +408,10 @@ def from_nc_to_zarr(ctx, **_):
               help="Output NetCDF file (default: input path with .nc).")
 @click.option("--max-size", default="50GB", callback=utils_cli.size_option_callback, show_default=True,
               help="Refuse to write when the logical output exceeds this size.")
-@click.option("--compression", default="zlib", show_default=True, help="NetCDF variable compression (zlib/none).")
-@click.option("--complevel", default=4, show_default=True, help="zlib compression level.")
-@click.option("--threads", type=int, default=None, help="Dask workers (default: visible cores).")
-@click.option("--codec-threads", type=int, default=1, show_default=True,
-              help="Codec-internal threads per decode call; threads x codec-threads must fit the cores.")
+@click.option("--compression", type=click.Choice(["zlib", "none"], case_sensitive=False), default="zlib",
+              show_default=True, help="NetCDF variable compression.")
+@click.option("--complevel", type=click.IntRange(0, 9), default=4, show_default=True, help="zlib compression level.")
+@click.option("--threads", type=click.IntRange(min=1), default=None, help="Dask workers (default: visible cores).")
 @click.pass_context
 def from_zarr_to_netcdf(ctx, **_):
     """Convert a zarr v3 store to a NetCDF4 file, streamed through dask."""

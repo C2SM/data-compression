@@ -30,12 +30,14 @@ def parse_args():
 
 @st.cache_data
 def load_and_resize_netcdf(file_content, original_name, max_size_bytes=1e7):
-    """Open the upload; above max_size_bytes, keep a leading block of every
-    dimension so the interactive sweep stays quick."""
+    """Open the upload; when its decoded data exceeds max_size_bytes, keep a
+    leading block of every dimension so the interactive sweep stays quick and
+    its shared sample fits a container's /dev/shm."""
     ds = xr.open_dataset(BytesIO(file_content))
-    if len(file_content) > max_size_bytes:
+    nbytes = ds.nbytes  # a compressed file holds far more than its bytes
+    if nbytes > max_size_bytes:
         dims = [d for d in ds.dims if ds.sizes[d] > 1]
-        scale = (max_size_bytes / len(file_content)) ** (1 / max(1, len(dims)))
+        scale = (max_size_bytes / nbytes) ** (1 / max(1, len(dims)))
         ds = ds.isel({d: slice(0, max(1, int(ds.sizes[d] * scale))) for d in dims})
         original_name += "_reduced.nc"
     return ds, original_name
