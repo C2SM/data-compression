@@ -1686,10 +1686,12 @@ def ui_env() -> dict:
 
 
 def ui_mpirun() -> list:
-    """mpirun with one rank per core when an MPI launcher is on the PATH, else
-    nothing (one rank): a sweep's parallelism comes from its ranks."""
+    """mpirun with one rank per physical core when an MPI launcher is on the
+    PATH, else nothing (one rank): a sweep's parallelism comes from its ranks,
+    and Open MPI refuses more ranks than cores."""
     launcher = shutil.which("mpirun") or shutil.which("mpiexec")
-    return [launcher, "-n", str(utils.detect_cores_available())] if launcher else []
+    cores = psutil.cpu_count(logical=False) or utils.detect_cores_available()
+    return [launcher, "-n", str(cores)] if launcher else []
 
 
 def ui_sweep_command(launcher, dataset, out_dir, field, classes: dict, with_lossy: bool, with_ebcc: bool,
