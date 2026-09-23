@@ -1066,7 +1066,12 @@ def node_counter(sweep: SweepContext):
     """claim() -> 0, 1, 2, ... across the ranks of this node, each value once:
     an atomic fetch-and-add on a counter in the node's shared memory, which
     waits on no other process.  Returns (claim, win); free win collectively."""
-    win = MPI.Win.Allocate_shared(8 if sweep.local_rank == 0 else 0, 8, comm=sweep.node_comm)
+    # Without this hint MPICH routes the atomics through the counter's owner,
+    # which answers only when it next calls MPI: every claim would wait for a combo.
+    info = MPI.Info.Create()
+    info.Set("disable_shm_accumulate", "false")
+    win = MPI.Win.Allocate_shared(8 if sweep.local_rank == 0 else 0, 8, info=info, comm=sweep.node_comm)
+    info.Free()
     if sweep.local_rank == 0:
         win.Lock(0, MPI.LOCK_EXCLUSIVE)
         win.Put(np.zeros(1, np.int64), 0)
