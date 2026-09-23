@@ -154,9 +154,169 @@ sections as a laptop user would; note anything that does not match what you saw.
 
 ## 6. Laptop findings (written by Claude Code on the laptop)
 
-_Empty until the laptop tests run. Fill in: environment (4.1); one verdict per test 4.2 to 4.6 with the
-decisive log lines (the `[topology]`, `[memory]`, `[resume]`, `[verify-gate]` and any `FATAL` or traceback);
-what was changed on the branch, if anything, and the commit hashes; open questions for the Santis check._
+Written on 2026-09-23 on the branch at `bffc985` (`02b55d9` plus the two commits that added this file).
+Nothing in sections 1 to 5 turned out wrong; two expectations of section 4 are sharpened in 6.7. Only this
+section changed on the branch: no code, no docs (6.6 lists what should change, for Christos's go).
+
+### 6.1 Environment
+
+| | |
+|---|---|
+| machine | Apple M2 Pro, 12 physical = 12 logical cores (no SMT), 32 GiB; macOS 27.0 (Darwin 27.0.0, arm64) |
+| MPI | Open MPI 5.0.9 (Homebrew), `mpicc` on the PATH; 12 slots: `-n 12` runs as is, `-n 13` is refused ("not enough slots") |
+| Python | 3.14.4 (Homebrew); `python3 -m venv venv && bash install_dc_toolkit.sh` as in intro 1.2 worked first time, every dependency had a 3.14 wheel, only `mpi4py` 4.1.2 built from source |
+| libraries | numcodecs 0.17.0, zarr 3.4.0, numpy 2.5.3, xarray 2026.7.0, dask 2026.8.0, h5py 3.16.0, netCDF4 1.7.4, streamlit 1.64.0 |
+| Docker | Docker Desktop 29.6.1; its VM has 12 CPUs and 11.7 GiB |
+| EBCC | not on the laptop (no cmake); built into the image |
+
+Every run below had the thread pins of intro 1.4, a scratch directory as cwd (the `out/` dirs live there)
+and the bundled TIGGE file by absolute path. No `--oversubscribe` was needed.
+
+### 6.2 The sweep under mpirun: PASS
+
+| step | decisive lines |
+|---|---|
+| `mpirun -n 12`, 300 combos, 6.0 s | `[topology] 1 node(s) x 12 rank(s)/node = 12 parallel evaluations, one shared sample per node.` / `[memory] rank-0 transient peak ~= 0 MiB (building the sample); per-node steady ~= 0 MiB (shared sample) + ~2 MiB (12 ranks x 2.0x decode/encode cache) + ~384 MiB (ranks x 2 x inner_chunk_mib) = 387.1 MiB total.` / 300 rows |
+| `mpirun -n 1`, 2.3 s | `[topology] NOTE: one rank on 12 cores.  A rank evaluates one pipeline at a time; start one rank per core to use them all (mpirun -n 12 dc_toolkit ...).` / `[memory] ... = 32.4 MiB total.` / 300 rows |
+| the comparison | `identical 300` |
+| `compress`, one process | `[verify-gate] t: PASS, production error norms are within the sweep thresholds.` / `[cr-drift] t: PASS (achieved 12.89x vs predicted 12.89x, drift +0.0%)` |
+| second sweep into `out/mpi` | `[resume] 300 of 300 combo(s) of 't' are already recorded; skipping those.` |
+
+The budget source is printed by the memcheck line, which every 12-rank run on this laptop shows before the
+sample line, default `--eval-data-size-limit` included: `[memcheck] auto-shrunk sample budget from 4.7 GiB
+(--eval-data-size-limit) to 1.0 GiB to stay under 0.80 x 32.0 GiB per node (from host total RAM (sysconf))
+with 12 rank(s) per node.` (the model: (0.8 x 32 GiB - 12 x 32 MiB) / 25). Harmless for a field below the
+shrunk budget; see 6.6.
+
+Extras: `mpirun -n 2 dc_toolkit compress ...` aborts with "compress is not meant to run in parallel. Launch
+it with a single process." The full space (17127 combos) on 12 ranks takes 15 to 19 s (the UI runs of 6.4)
+and 22 s on 4 ranks in the container (6.5); the container's table and the laptop's agree on `keep` for all
+17127 rows and on the winner, and differ only in the last bits of the float metrics (Linux/Python 3.13
+against macOS/Python 3.14, e.g. 1251 ratios at 1e-16 relative). On one platform the tables are identical
+across rank counts and between the two UIs.
+
+### 6.3 A sample that does not fit: PASS, with a laptop caveat
+
+- `--memory-threshold 0.05`, `-n 12`: `[memcheck] auto-shrunk sample budget from 4.7 GiB
+  (--eval-data-size-limit) to 50.2 MiB to stay under 0.05 x 32.0 GiB per node (from host total RAM (sysconf))
+  with 12 rank(s) per node.`; the sweep ran (60 rows).
+- The refuse path, `--oversubscribe -n 64` at 0.05: `[memcheck] FATAL: cannot fit any sample with 64 rank(s)
+  per node, inner_chunk_mib=16, node memory budget 32.0 GiB (from host total RAM (sysconf)) at threshold
+  0.05.  Start fewer ranks per node or request more RAM.`, then MPI_ABORT, exit 1. Clean.
+- No bigger netCDF was at hand, so one was made: float32 `t(time=128, lat=1800, lon=3600)`, 3.1 GiB, a
+  smooth field plus noise, uncompressed netCDF4. `-n 12 --eval-data-size-limit 2GiB --compressor-class blosc
+  --max-evals 24`:
+  `[memcheck] auto-shrunk sample budget from 2.0 GiB (--eval-data-size-limit) to 1.0 GiB ...` /
+  `[sample] field is 3.1 GiB > limit 1.0 GiB; policy=cascade; strided time=41/128 | preserved spatial: lat,
+  lon -> 1013.5 MiB.` / `[memory] rank-0 transient peak ~= 2026 MiB (building the sample); per-node steady ~=
+  1013 MiB (shared sample) + ~24323 MiB (12 ranks x 2.0x decode/encode cache) + ~384 MiB (ranks x 2 x
+  inner_chunk_mib) = 25.1 GiB total.` Four runs, 67 to 106 s wall, exit 0, 24 rows, no FATAL.
+  Measured with `ps` RSS every 0.5 s: peak sum over the 12 ranks 25.96 GiB, peak single rank 4.44 GiB
+  (RSS counts the 1 GiB window in every rank, so the sum over-counts by up to 11 GiB). The machine view is
+  the honest one: available RAM fell by 14.7 GiB and swap grew by 1.7 GiB, a footprint of about 16.5 GiB
+  = S + 12 x ~1.3 GiB (the same 16 to 17 GiB in three runs), against the model's 25.1 GiB. The factor 2.0
+  is ~1.5x conservative here, as on Santis.
+  The caveat: the budget is the host's **total** RAM (32 GiB), but only 16 to 20 GiB was free (Docker
+  Desktop, editor, browser). The run that started with 16.4 GiB available pushed 5.9 GiB to swap (macOS
+  swap 2.9 -> 8.8 GiB); the laptop stayed usable and the rows were correct, but the guard cannot see what
+  other applications hold, so "fits under 0.80 x total" does not mean "fits". Reference footprint of the
+  interpreters alone (TIGGE, full space, 12 ranks): sum 3.65 GiB, max 0.41 GiB, 0.3 GiB per rank as
+  PARALLELIZATION.md says.
+- Where the window lives on macOS: Open MPI's `osc/sm` (`osc_sm_backing_directory` empty) creates it in the
+  session directory under `$TMPDIR` and unlinks the file once every rank has attached; only the twelve
+  16 MiB `btl/sm` segments stay visible. There is no `/dev/shm` to size on macOS.
+
+### 6.4 The UIs: PASS
+
+Both UIs start the sweep as `mpirun -n 12 dc_toolkit evaluate_combos ...` (`ui_mpirun`: 12 physical cores)
+and `compress` as one process; 12 `config_space_t_rank*.csv` in `out/` after each sweep; the failures files
+hold their header only.
+
+- `run_local_ui`: the PyQt6 wheel installed on first use in 4 s. The window was driven offscreen
+  (`QT_QPA_PLATFORM=offscreen`, the open and save dialogs replaced by fixed paths, plotly's `show()` muted);
+  the command itself was also launched and showed its window process. Log: `[topology] 1 node(s) x 12
+  rank(s)/node = 12 parallel evaluations, one shared sample per node.`, 17127 combos in 19 s, "15774
+  combinations passed the gates", 15774 pipelines offered; compress with the first, `bz2(level=6) |
+  bitround(keepbits=52) | zfpy_flat(mode=2, rate=8)`: `[verify-gate] t: PASS, production error norms are
+  within the sweep thresholds.`, `[cr-drift] t: no predicted ratio for this pipeline; skipped.`, the store
+  zipped and saved (4669 bytes).
+- `run_web_ui` (headless streamlit, driven in headless Chromium through Playwright): upload of the TIGGE
+  file, field `t`, "Evaluate combos": `[sweep] 17127 combos: 17127 from the 33 x 23 x 33 grid (valid
+  pairings) + 0 EBCC; split across 12 rank(s), ~1428 per rank.`, 16 s, "15774 combinations passed the
+  gates", table and plots; "Compress field" with the offered default: "Wrote t with bz2(level=6) |
+  bitround(keepbits=52) | zfpy_flat(mode=2, rate=8).", the zip downloaded (4669 bytes). The status
+  placeholder shows only the latest line, so the `[topology]` line is visible for a moment; the rank files
+  are the proof.
+
+### 6.5 Docker: PASS; the README's MPI commands need `--shm-size`
+
+- The `Dockerfile` clones `main`, so it cannot build the branch. The image came from a copy with `git clone
+  --branch mpi-shmem-experimental` (the only change): 284 s, 3.28 GB, `python:3.13` -> Python 3.13.15,
+  Debian Open MPI 5.0.7, EBCC built. Inside: `/dev/shm` 64 MB, user root, and
+  `/etc/openmpi/openmpi-mca-params.conf` sets `osc = ^ucx,pt2pt`, so `osc/sm` (priority 100,
+  `osc_sm_backing_directory = /dev/shm`) backs `Win.Allocate_shared`.
+- README "Running with MPI", Mac and Linux form, verbatim with `-n 4` (cwd a scratch copy of
+  `netCDF_files/`): `[topology] 1 node(s) x 4 rank(s)/node = 4 parallel evaluations, one shared sample per
+  node.`, `[memcheck] ... to stay under 0.80 x 11.7 GiB per node (from host total RAM (sysconf)) with 4
+  rank(s) per node.`, 17127 rows in 22 s, the outputs on the host owned by the caller. The Windows form was
+  not run (no Windows).
+- The open question, answered with a 395.5 MiB field (synthetic, 16 steps) mounted into `/mnt/data`,
+  `-n 4`, default `/dev/shm`: the sweep dies at the window. Open MPI prints "It appears as if there is not
+  enough space for /dev/shm/osc_sm.<host>.<id> (the shared-memory backing file) ... Space Requested:
+  414724096 B / Space Available: 66736128 B", `Win.Allocate_shared` raises `MPI_ERR_INTERN`, and the
+  branch's guard fires: `[shared-sample] FATAL: MPI.Win.Allocate_shared failed (MPI_ERR_INTERN: internal
+  error); the node communicator is not a shared-memory one (MPI without COMM_TYPE_SHARED?).`, MPI_ABORT,
+  exit 1, nothing written. With `--shm-size=1g` on the `docker run` line the same command runs: `[memory]
+  ... 395 MiB (shared sample) + ~3164 MiB (4 ranks x 2.0x decode/encode cache) + ~128 MiB (ranks x 2 x
+  inner_chunk_mib) = 3.6 GiB total.`, 8 rows, exit 0. `-n 1` runs the same field with the default
+  `/dev/shm` (`osc/sm` keeps a one-process window in private memory). So the README's examples pass only
+  because the TIGGE sample is 128 KiB: any real field under `mpirun -n >1` needs `--shm-size` of at least
+  the sample size (the working sets are private memory and do not count).
+- `docker run -p 8501:8501 dc-toolkit run_web_ui`, driven from the browser as in 6.4: the sweep starts as
+  root (`OMPI_ALLOW_RUN_AS_ROOT` from `ui_env`) under `mpirun -n 12` (the VM's 12 CPUs): `[sweep] ...
+  split across 12 rank(s), ~1428 per rank.`, 12 rank files in `/opt/data-compression/out`, 13 s, 15774
+  kept, compress and download fine. The UI caps uploads at 10 MB (`load_and_resize_netcdf`), so a UI
+  sweep's window never approaches 64 MB; `/dev/shm` only matters for the CLI in a container.
+
+### 6.6 Read-through: what does not match
+
+1. README, "Running with MPI" (both forms) and the sentence that introduces them: add `--shm-size` (for
+   example `--shm-size=8g`) to the `docker run` lines and say why: inside a container Open MPI keeps the
+   shared sample in `/dev/shm`, 64 MB by default in Docker; give it at least the sample size, or a
+   multi-rank sweep aborts with `[shared-sample] FATAL` (the Open MPI "not enough space" message above it
+   names the two sizes). The single-rank example needs nothing.
+2. `utils_cli.shared_sample_window`: the FATAL hint blames COMM_TYPE_SHARED; in the container the cause was
+   `/dev/shm`. Suggested wording: "... failed ({e}); the node communicator is not a shared-memory one, or
+   /dev/shm is too small for the sample (Docker: --shm-size)."
+3. The docstrings of `compression_analysis_ui_local.py` (line 3) and `compression_analysis_ui_web.py`
+   (line 5) still say the sweep runs as "one local MPI rank"; stale since `02b55d9`.
+4. intro section 3: on a laptop the first line after `[var]` is `[memcheck] auto-shrunk ...`, which the
+   sample output does not show (with 8 ranks and the default 5 GB budget it appears on any machine below
+   about 106 GB of RAM). One sentence there or in section 10 stops readers from worrying. Section 11 could
+   list `[memcheck] FATAL: cannot fit any sample with N rank(s) per node` (too many ranks for the budget).
+5. The budget on a host without a cgroup is total RAM, not free RAM (6.3). Either a sentence in intro
+   section 10 ("the estimate is checked against the machine's total memory; close what you can, or start
+   fewer ranks") or `detect_node_memory_budget` returning the smaller of total and available when no cgroup
+   limit is found. Christos's call; here the swap did no harm.
+6. The `Dockerfile` clones `main`: right after the merge, but a branch cannot be tested from it.
+7. Confirmed as written: intro sections 1 (3.11 or newer: 3.14 works), 1.4, 3 (`[topology]`, `[memory]`,
+   the `NOTE`), 10 (memory, interruptions, `compress` safe to repeat); PARALLELIZATION.md (the rank model,
+   0.3 GiB per interpreter, "the model is conservative", the single-process guard of `compress`); the
+   README's parallelism, UI and Docker sections apart from item 1.
+
+### 6.7 Changes on the branch, corrections, open questions for Santis
+
+- Changed on the branch: this file only (this section). Items 1 and 2 of 6.6 are the fixes the laptop
+  tests call for in the sense of section 5; 3 to 5 are tidy-ups. None was applied without Christos's go.
+- Corrections to section 4: the budget source is named by the `[memcheck]` line, not the `[memory]` line
+  (4.2), and a 1-rank run names no source at all; the FATAL of 4.5 does happen, is caught cleanly, but its
+  hint points elsewhere (item 2).
+- For the Santis check: nothing found on the laptop calls for a re-run there. Every table was identical
+  across rank counts and UIs on one platform; across platforms the metrics differ at 1e-16 with the same
+  gate verdicts and winner. If items 1 to 5 are applied, the smoke covers 2 and 3; 5 touches only the
+  no-cgroup branch of the budget (the cgroup path is untouched).
+- Open: whether the laptop budget should be free rather than total RAM (item 5), and whether the README
+  should recommend a `--shm-size` value or a rule ("at least the sample").
 
 ## 7. The final check on Santis (after the laptop)
 
