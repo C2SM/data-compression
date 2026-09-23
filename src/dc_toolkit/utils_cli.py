@@ -1221,12 +1221,11 @@ def sweep_variable(da, var: str, opts, sweep: SweepContext, n_vars: int) -> None
                    f"relative L1 threshold={sweep.thresholds['l1']:.3e}")
     limit = sweep_sample_limit(var, int(da.nbytes), opts, sweep)
     sample_np, sample_da, fso_range, win = sweep_build_sample(da, limit, opts, sweep)
-    try:
-        _sweep_variable_body(da, var, opts, sweep, n_vars, t0, sample_np, sample_da, fso_range)
-    finally:
-        if win is not None:  # collective: every rank frees the node's window before the next variable
-            del sample_np, sample_da
-            win.Free()
+    _sweep_variable_body(da, var, opts, sweep, n_vars, t0, sample_np, sample_da, fso_range)
+    # Free is collective, so it runs only once the variable completed: after an
+    # error, the exception must reach the abort hook rather than wait here.
+    del sample_np, sample_da
+    win.Free()
 
 
 def _sweep_variable_body(da, var, opts, sweep: SweepContext, n_vars, t0, sample_np, sample_da, fso_range):

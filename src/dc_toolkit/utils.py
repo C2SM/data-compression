@@ -507,7 +507,8 @@ def compressor_space(da, with_lossy=True, compressor_class="all"):
 def filter_space(da, with_lossy=True, filter_class="all", data_range=None):
     """Array->array filters.  Integer dtypes get Delta only.  `data_range`
     must be the FULL field's (min, max) when `da` is a sample: FixedScaleOffset
-    does not clip, so out-of-range production values would corrupt silently."""
+    does not clip, so out-of-range production values would corrupt silently.
+    Without it FixedScaleOffset is left out."""
     classes = [zarrcodecs_nc.Delta]
     if with_lossy:
         classes += [zarrcodecs_nc.BitRound, zarrcodecs_nc.Quantize, zarrcodecs_nc.FixedScaleOffset]
@@ -794,49 +795,45 @@ def valid_digits_for_quantize(da):
 
 def full_field_data_range(da, comm=None):
     """Finite (min, max) over the whole (dask-backed) field, or None if the
-    field is constant / has no finite values.  One pass over the blocks; with
-    `comm` the blocks are split across its ranks (a collective call)."""
+    field is constant, has no finite values or could not be read.  One pass
+    over the blocks; with `comm` the blocks are split across its ranks and the
+    call is collective: every rank reaches the reductions, a failed read
+    included, so all of them return the same answer."""
     data = da.data if hasattr(da, "data") else np.asarray(da)
+    rank, size = (comm.Get_rank(), comm.Get_size()) if comm is not None else (0, 1)
+    dmin, dmax, failed = np.inf, -np.inf, 0
     try:
         if isinstance(data, dask.array.Array):
-            rank, size = (comm.Get_rank(), comm.Get_size()) if comm is not None else (0, 1)
             mine = list(data.blocks.ravel())[rank::size]
-            dmin, dmax = np.inf, -np.inf
             if mine:
                 finite = [dask.array.isfinite(b) for b in mine]
                 vals = dask.compute(*[dask.array.where(f, b, np.inf).min() for f, b in zip(finite, mine)],
                                     *[dask.array.where(f, b, -np.inf).max() for f, b in zip(finite, mine)])
                 dmin, dmax = float(min(vals[:len(mine)])), float(max(vals[len(mine):]))
-            if comm is not None:
-                dmin, dmax = comm.allreduce(dmin, MPI.MIN), comm.allreduce(dmax, MPI.MAX)
-        else:
+        elif rank == 0:
             arr = np.asarray(data)
             fin = arr[np.isfinite(arr)]
-            if fin.size == 0:
-                return None
-            dmin, dmax = float(fin.min()), float(fin.max())
+            if fin.size:
+                dmin, dmax = float(fin.min()), float(fin.max())
     except Exception:
-        return None
-    if not (np.isfinite(dmin) and np.isfinite(dmax)) or dmax <= dmin:
+        failed = 1
+    if comm is not None:
+        failed = comm.allreduce(failed, op=MPI.MAX)
+        dmin, dmax = comm.allreduce(dmin, op=MPI.MIN), comm.allreduce(dmax, op=MPI.MAX)
+    if failed or not (np.isfinite(dmin) and np.isfinite(dmax)) or dmax <= dmin:
         return None
     return (dmin, dmax)
 
 
 def fixed_scale_offset_configs(da, data_range=None):
-    """FixedScaleOffset kwargs mapping [min, max] onto each uint width in
-    _FSO_TARGET_UINTS narrower than the float.  Falls back to `da`'s own range
-    when data_range is None (only valid if `da` is the full field)."""
+    """FixedScaleOffset kwargs mapping the full field's [min, max]
+    (`data_range`) onto each uint width in _FSO_TARGET_UINTS narrower than the
+    float.  Empty without a range: parameters taken from a sample would clip
+    the field's extremes."""
     dtype = da.dtype
-    if not np.issubdtype(dtype, np.floating):
+    if not np.issubdtype(dtype, np.floating) or data_range is None:
         return []
-    if data_range is not None:
-        dmin, dmax = float(data_range[0]), float(data_range[1])
-    else:
-        arr = np.asarray(da.values)
-        finite = arr[np.isfinite(arr)]
-        if finite.size == 0:
-            return []
-        dmin, dmax = float(finite.min()), float(finite.max())
+    dmin, dmax = float(data_range[0]), float(data_range[1])
     span = dmax - dmin
     if not (np.isfinite(dmin) and np.isfinite(dmax)) or span <= 0.0:
         return []
