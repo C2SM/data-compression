@@ -60,9 +60,11 @@ Every rank reads the same sample, and it must exist once per node, not once per 
 4. A node barrier, then every rank wraps the same physical pages in a read-only numpy array, and a checksum across all ranks confirms nobody read the window before it was filled.
 5. The window is freed after the variable, collectively, so a multi-variable sweep never holds two samples.
 
+Under Open MPI on Linux the window is a file in `/dev/shm`, so a container must give that at least the sample size (`docker run --shm-size`); Cray MPICH on Santis does not use it.
+
 Everything downstream reads views of that array: `z[...] = sample_np` hands zarr chunk-shaped views, the error norms slice it chunk by chunk, the gradient metric walks it in slabs. It is read-only for the whole sweep, so sharing it costs nothing and needs no lock.
 
-Work that touches the whole sample happens once, not once per rank: rank 0 computes the q99 cut of the extremes gate and broadcasts the number, and the full-field range for FixedScaleOffset is one pass over the file's blocks split across all ranks. Anything added to the pre-sweep path should follow the same rule; a per-rank pass over the sample multiplies its temporaries by the rank count.
+Work that touches the whole sample happens once, not once per rank: rank 0 computes the q99 cut of the extremes gate and EBCC's check for NaN/Inf and broadcasts the answers, and the full-field range for FixedScaleOffset is one pass over the file's blocks split across all ranks (without that range FixedScaleOffset is left out, never fitted to the sample). Anything added to the pre-sweep path should follow the same rule; a per-rank pass over the sample multiplies its temporaries by the rank count.
 
 ### Why 32 ranks and not 288?
 
@@ -179,7 +181,7 @@ These commands are intentionally simple. They run on a login node or a small int
 
 To keep the parallelism behaving correctly, the toolkit enforces some invariants at startup. Most of the time you do not need to think about them, but they are worth being aware of:
 
-- **One rank per core** for `evaluate_combos`: `--ntasks-per-node` is the number of ranks and of cores you give a node. A single rank on a multi-core machine is legal and prints a note suggesting `mpirun -n <cores>`.
+- **One rank per core** for `evaluate_combos`: `--ntasks-per-node` is the number of ranks and of cores you give a node. A single rank on a multi-core machine is legal and prints a note suggesting `mpirun -n <physical cores>`, the number Open MPI accepts by default.
 - **Codec env vars must be pinned to 1**:
   ```bash
   export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 \
@@ -189,6 +191,7 @@ To keep the parallelism behaving correctly, the toolkit enforces some invariants
   This prevents the codec libraries and BLAS from spawning their own thread pools next to a rank that owns one core (or, in the write commands, next to dask's workers). The toolkit aborts at startup if any of these are unset or non-1 (`--no-oversubscription-check` disables the guard).
 - **`--threads × --codec-threads ≤ physical cores`** is enforced by a built-in product check in the write commands.
 - **Single-rank commands** (`compress`, the store, conversion and plot commands) abort if launched with `mpirun -n >1` or `srun -n >1`; the clustering and UI commands have no MPI guard.
+- **An error on one rank ends the job.** An uncaught exception on any rank of a sweep calls `MPI_Abort`, which stops every rank. No collective call may sit on an error path (an `except` or `finally` block): the failing rank would wait there for ranks that never arrive, and the job would hang until its time limit.
 
 ---
 

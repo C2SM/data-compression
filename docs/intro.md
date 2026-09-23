@@ -39,8 +39,8 @@ any data of your own. Each step takes seconds.
 On Windows, use WSL2 with Ubuntu and follow the Ubuntu column.
 
 You do **not** need a cluster or `srun`. `evaluate_combos` is an MPI program: on a laptop start it with
-`mpirun -n <cores>` (one process per core; the processes share one copy of the sample). Every other command
-is started directly and runs as a single process.
+`mpirun -n <cores>`, one process per physical core (Open MPI refuses more); the processes share one copy of
+the sample. Every other command is started directly and runs as a single process.
 
 ### 1.2 Install the toolkit
 
@@ -176,7 +176,7 @@ mpirun -n 8 dc_toolkit evaluate_combos "$FILE" \
 
 | Part | Meaning |
 |---|---|
-| `mpirun -n 8` | one process per core, here eight; use your machine's core count |
+| `mpirun -n 8` | one process per core, here eight; use your machine's number of physical cores |
 | `"$FILE"` | the file to read: `.nc`, `.grib` or `.zarr`, recognised by its extension |
 | `--where-to-write` | the directory for the results; created if missing |
 | `--field-to-compress t` | sweep only the variable `t`; leave it out to sweep every field of the file |
@@ -199,6 +199,10 @@ Compression Ratio: 12.886 | Relative L1 Error: 3.357e-03 | Euclidean Distance: 1
 Reading it top to bottom: the full search space for this field is 33 compressors × 23 filters × 33
 serializers; pairings that cannot work are removed up front; your laptop evaluates one pipeline per core;
 and the best pipeline within the budget shrinks `t` by a factor of 12.9.
+
+On a laptop the output usually begins with `[memcheck] auto-shrunk sample budget ...`: the default budget of
+5 GB does not fit beside eight working sets in a laptop's memory, so the sweep lowers it. That is expected;
+section 10 explains the memory.
 
 ### What was written
 
@@ -666,7 +670,9 @@ laptop, lower it, for example `--eval-data-size-limit 512MiB`.
 about twice the sample for the pipeline it is evaluating, so memory grows with the number of ranks. The
 `[memory]` line at the start of a sweep shows the estimate. If it does not fit, the toolkit shrinks the
 sample by itself (`[memcheck] auto-shrunk ...`) or refuses to start and tells you what to change. The two
-knobs are `--eval-data-size-limit` and the number of ranks you start (`mpirun -n`).
+knobs are `--eval-data-size-limit` and the number of ranks you start (`mpirun -n`). The estimate is checked
+against the machine's total memory, not what is free at that moment: when other programs hold much of it,
+close them or start fewer ranks, or the sweep will swap.
 
 **Time.** A sweep's duration grows with the sample size and with the number of pipelines. Start with
 `--max-evals` to see whether the numbers make sense, then run the full sweep. Leave your laptop usable by
@@ -698,6 +704,8 @@ retried.
 | `t already in ...; skipping.` | the store already holds the field | add `--no-skip-existing` to overwrite |
 | `[resume] ... starting this field from scratch` | the file, sample, chunking or library versions changed | nothing; the old results no longer apply |
 | `[memcheck] REFUSING to start sweep` | the estimate exceeds your memory | lower `--eval-data-size-limit` or start fewer ranks |
+| `[memcheck] FATAL: cannot fit any sample with N rank(s) per node` | too many ranks for the memory | start fewer ranks (`mpirun -n`) |
+| `[shared-sample] FATAL ... Allocate_shared failed` | the shared memory is smaller than the sample, usually in a container | `docker run --shm-size` of at least the sample size |
 | `[cr-drift] WARNING` | the sample predicted a different ratio than the whole field achieved | informative; a larger sample predicts better |
 | `[var] skipping grid geometry (CF bounds): ...` | helper variables were left out on purpose | nothing; name one with `--field-to-compress` if you really want it |
 | the largest error is bigger than you expected | the budget is relative to the field's magnitude | section 5 |

@@ -257,7 +257,7 @@ docker run -p 8501:8501 dc-toolkit run_web_ui
 
 ### Running with MPI (single-container, exercises the MPI code path)
 
-OpenMPI + Docker requires specific file permission and cache handling. On a single container `evaluate_combos` runs one MPI rank per core the container may use (`-n 4` below); the ranks share one copy of the sample.
+OpenMPI + Docker requires specific file permission and cache handling. On a single container `evaluate_combos` runs one MPI rank per core the container may use (`-n 4` below); the ranks share one copy of the sample. Open MPI keeps that copy in the container's `/dev/shm`, which Docker limits to 64 MB: give it at least the sample size with `--shm-size` (`5g` covers the default `--eval-data-size-limit`), or a sweep of a real field on several ranks aborts with `[shared-sample] FATAL`.
 
 ---
 
@@ -268,6 +268,7 @@ docker run \
   -u $(id -u):$(id -g) \
   -w /mnt/data/docker_saved_files \
   -v $(pwd)/netCDF_files:/mnt/data \
+  --shm-size=5g \
   -e OMP_NUM_THREADS=1 -e MKL_NUM_THREADS=1 -e OPENBLAS_NUM_THREADS=1 \
   -e BLOSC_NTHREADS=1 -e NUMBA_NUM_THREADS=1 \
   -e VECLIB_MAXIMUM_THREADS=1 -e OMP_THREAD_LIMIT=1 \
@@ -282,6 +283,7 @@ docker run \
 * **`-u $(id -u):$(id -g)`**: Runs the container as your local user so outputs aren't locked behind `root` permissions.
 * **`-w /mnt/data/docker_saved_files`**: Sets the Working Directory.
 * **`-v $(pwd)/netCDF_files:/mnt/data`**: Volume mount bridging local and container filesystems.
+* **`--shm-size=5g`**: Room in `/dev/shm` for the sample the ranks share; at least the sample size.
 * **`-e OMP_NUM_THREADS=1 ...`**: Pins codec-internal thread pools to 1: every rank owns one core.
 * **`--entrypoint mpirun`**: Bypasses the default entrypoint to launch via OpenMPI.
 * **`dc-toolkit`**: The image name.
@@ -304,6 +306,7 @@ docker run `
   -e VECLIB_MAXIMUM_THREADS=1 -e OMP_THREAD_LIMIT=1 `
   -w /mnt/data/docker_saved_files `
   -v "${PWD}\netCDF_files:/mnt/data" `
+  --shm-size=5g `
   --entrypoint mpirun `
   dc-toolkit `
   --allow-run-as-root `
@@ -317,6 +320,7 @@ docker run `
 * **`-e OMP_NUM_THREADS=1 ...`**: Pins codec-internal thread pools to 1 (prevents nested oversubscription).
 * **`-w /mnt/data/docker_saved_files`**: Sets the Working Directory inside the container.
 * **`-v "${PWD}\netCDF_files:/mnt/data"`**: Windows equivalent of the volume mount. `${PWD}` dynamically grabs your current PowerShell directory to link your local files to the container.
+* **`--shm-size=5g`**: Room in `/dev/shm` for the sample the ranks share; at least the sample size.
 * **`--entrypoint mpirun`**: Bypasses the default container start command to run OpenMPI.
 * **`dc-toolkit`**: The image name.
 * **`--allow-run-as-root`**: The container defaults to `root` on Windows; this flag bypasses OpenMPI's built-in safety restrictions against running parallel jobs as root.
