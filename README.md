@@ -85,7 +85,7 @@ A combination is identified by its **pipeline**: the zarr JSON of its three code
 | File | What it is |
 |------|------------|
 | `config_space_{var}.csv` | The planned combos in sweep order (name, codec labels, pipeline JSON): the valid `(compressor, filter, serializer)` triples after the pairing rules, `--max-evals` and the EBCC entries, shuffled with a count-dependent seed. |
-| `config_space_{var}_rank{N}.csv` | Per-rank streaming audit trail, flushed every 100 rows (plus `failures_{var}_rank{N}.csv` for combos that raised).  Useful to tail during long sweeps, to inspect after a crash, and read back by `--resume`. |
+| `config_space_{var}_rank{N}.csv` | Per-rank streaming audit trail, flushed every 10 rows (plus `failures_{var}_rank{N}.csv` for combos that raised).  Useful to tail during long sweeps, to inspect after a crash, and read back by `--resume`. |
 | `results_{var}.parquet` | Consolidated results across all ranks: one row per combo with its `name`, codec labels, `pipeline` JSON, ratio, error metrics, the per-gate verdicts and a `keep` column marking the combos that passed every gate.  The canonical file for analysis (`perform_clustering`, `analyze_clustering`) and the fallback of `compress` when a manifest is missing. |
 | `sweep_state_{var}.json` | What the recorded rows were measured on (dataset, sample shape, value range, sampling policy, chunk settings).  `--resume` reuses rows only while it matches; otherwise the field restarts from scratch. |
 | `manifest_{var}.json` | The best kept combo (`best.name`, `best.pipeline`, its ratio, relative L1 error and Euclidean distance), the effective thresholds, the sweep arguments (chunk geometry, codec-space settings, ...), the q99 cut and the environment.  Read by `compress` and `plot_compression_errors`. |
@@ -94,22 +94,21 @@ A combination is identified by its **pipeline**: the zarr JSON of its three code
 
 ### HPC parallelism (SLURM / MPI)
 
-> How every command parallelizes work (the `--bypass-zarr-sync` machinery, the 32-thread cap on a 288-core node, chunks vs shards): [`docs/PARALLELIZATION.md`](docs/PARALLELIZATION.md).
+> How every command parallelizes work (MPI ranks sharing one sample per node, the 32-rank cap on a 288-core node, chunks vs shards): [`docs/PARALLELIZATION.md`](docs/PARALLELIZATION.md).
 
-`evaluate_combos` runs as **one MPI rank per node**, with each rank driving 32 user threads via the `--bypass-zarr-sync` machinery (default on).  Scale out by increasing `--nodes` and keeping `--ntasks-per-node=1`:
+`evaluate_combos` runs as **one MPI rank per core**: the ranks of a node share one copy of the sample through an MPI shared-memory window, and every rank evaluates one pipeline at a time.  Scale out by increasing `--nodes`:
 
 ```bash
-#SBATCH --nodes=8 --ntasks-per-node=1 --cpus-per-task=32
+#SBATCH --nodes=8 --ntasks-per-node=32 --cpus-per-task=1
 
 srun --unbuffered dc_toolkit evaluate_combos input.nc \
     --where-to-write ./out \
     --field-to-compress t \
     --l1-threshold 0.005 \
-    --eval-data-size-limit 5GB \
-    --threads-per-rank 32
+    --eval-data-size-limit 5GB
 ```
 
-One rank per node with 32 threads holds about 65 × the sample (one copy plus each thread's decoded buffers); 32 single-threaded ranks (`--allow-multi-rank-per-node`) each hold their own copy, about 96 × the sample per node: ~1.5× more, not 32×, because the per-thread decoded buffer dominates either way.  `docs/PARALLELIZATION.md` has the arithmetic.  `santis.run` is the production driver; it reads the input location from the environment: `DYAMOND_DATA_ROOT=/path/to/parent sbatch santis.run`, where the parent directory holds the `Data_Dyamond_PostProcessed*` trees.
+A node holds one copy of the sample plus a working set of about twice the sample per rank, about 65 × the sample at 32 ranks; the `[memory]` line prints the estimate and the sweep shrinks the sample when it does not fit.  `docs/PARALLELIZATION.md` has the arithmetic.  `santis.run` is the production driver; it reads the input location from the environment: `DYAMOND_DATA_ROOT=/path/to/parent sbatch santis.run`, where the parent directory holds the `Data_Dyamond_PostProcessed*` trees.
 
 Codec-internal thread pools must be pinned to 1 to avoid nested oversubscription (the tool checks this at startup and aborts by default; `--no-oversubscription-check` disables the guard):
 
@@ -119,7 +118,7 @@ export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 \
        VECLIB_MAXIMUM_THREADS=1 OMP_THREAD_LIMIT=1
 ```
 
-`--codec-threads N` (default 1, on `evaluate_combos`, `compress` and `from_zarr_to_netcdf`) enables codec-internal threading.  Compression here is memory-bandwidth-bound, so codec-internal threads compete with the outer threads for the same bandwidth and gain nothing on this workload; leave it at 1 unless an A/B test says otherwise.
+`--codec-threads N` (default 1, on `compress` and `from_zarr_to_netcdf`) enables codec-internal threading inside those single-process writes.  Compression here is memory-bandwidth-bound, so codec-internal threads gain nothing on this workload; leave it at 1 unless an A/B test says otherwise.
 
 `compress` is a single-process command — launch with `srun -n 1 ...` or plain invocation. Parallelism inside the write comes from dask's threaded scheduler, tuned via `--threads` (default: auto-detected from visible cores), `--inner-chunk-mib` (default: the sweep's value from the manifest, else 16), and `--shard-mib` (default: 512). `--verify/--no-verify` (default on) re-reads the store to compute error norms — skip with `--no-verify` on re-compression runs where the combo is already trusted.
 
@@ -128,7 +127,7 @@ export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 \
 [EBCC](https://github.com/spcl/EBCC) compresses each `(lat, lon)` frame with a JPEG 2000 base layer plus an
 error-bounded residual.  At loose error bounds (0.1 to 1 % of the field's range) it reaches 2 to 4x the ratio of
 zfp; at tight bounds the advantage disappears.  It is **off by default** because it is slow to encode (about
-1 to 2 MB/s per thread, 200x slower than zfp; decoding is 30 to 200 MB/s) and because of its constraints:
+1 to 2 MB/s per core, 200x slower than zfp; decoding is 30 to 200 MB/s) and because of its constraints:
 
 - float fields whose last two dims are a `(lat, lon)` frame (native ICON grids do not qualify); float64 is
   down-cast to float32 through the `AsType` filter;
@@ -152,7 +151,7 @@ no compressor, no filter (or the `AsType` cast to float32 for float64, which EBC
 pipeline persists like any other (its tile size and error target travel in the pipeline JSON); `compress`
 refuses it up front when the field has `NaN`/`Inf`, is not float32 without the `AsType` filter, or has a
 frame the tile does not divide.  Keep `--eval-data-size-limit` small on EBCC sweeps: a 5 GB sample takes
-about an hour per EBCC combo per thread.
+about an hour per EBCC combo per core.
 
 ## Reading a store without dc_toolkit
 
@@ -192,7 +191,7 @@ The web UI also shows the combinations as a table and exports the plots as HTML;
 plots in the browser.  Outputs go to `./out`; the UIs pin the codec thread variables for the commands they
 launch.
 
-The web UI (streamlit) runs its sweeps as one local process:
+The web UI (streamlit) runs its sweeps under `mpirun`, one rank per core:
 ```
 dc_toolkit run_web_ui
 ```
@@ -205,9 +204,9 @@ dc_toolkit run_web_ui_vcluster \
   --uenv_image "$UENV_NAME" \
   --uploaded_file "PATH_TO_FILE" \
   --time "00:15:00" \
-  --nodes "1" --ntasks-per-node "1"
+  --nodes "1" --ntasks-per-node "32"
 ```
-`evaluate_combos` runs one MPI rank per node (threads provide the intra-node parallelism); a higher `--ntasks-per-node` aborts at startup.
+`evaluate_combos` runs one MPI rank per core; `--ntasks-per-node` is the number of ranks, and cores, per node.
 
 The desktop UI (Qt; installs `PyQt6` on first use) runs locally:
 ```
@@ -248,7 +247,7 @@ docker run \
 * **`dc-toolkit`**: The name of the Docker image to run.
 * **`-c '...'`**: The shell command the container runs:
   * **`mkdir -p docker_saved_files`**: Creates an output directory on your host.
-  * **`dc_toolkit evaluate_combos ...`**: Executes the actual compression tool, using a file inside the container and saving the results (under `--where-to-write`) to your mounted volume.
+  * **`dc_toolkit evaluate_combos ...`**: Executes the actual compression tool with a single rank (the next section runs one rank per core), using a file inside the container and saving the results (under `--where-to-write`) to your mounted volume.
 
 Or for the web UI:
 
@@ -258,7 +257,7 @@ docker run -p 8501:8501 dc-toolkit run_web_ui
 
 ### Running with MPI (single-container, exercises the MPI code path)
 
-OpenMPI + Docker requires specific file permission and cache handling. On a single container `evaluate_combos` runs with **one** MPI rank (`-n 1`): several ranks on one node abort at startup unless `--allow-multi-rank-per-node` is passed, and the parallelism comes from the rank's threads. The `mpirun` launch exercises the MPI code path in CI or smoke tests; for real multi-node speedup use SLURM (see the HPC section above).
+OpenMPI + Docker requires specific file permission and cache handling. On a single container `evaluate_combos` runs one MPI rank per core the container may use (`-n 4` below); the ranks share one copy of the sample.
 
 ---
 
@@ -274,7 +273,7 @@ docker run \
   -e VECLIB_MAXIMUM_THREADS=1 -e OMP_THREAD_LIMIT=1 \
   --entrypoint mpirun \
   dc-toolkit \
-  -n 1 \
+  -n 4 \
   bash -c 'HOME=/tmp/$OMPI_COMM_WORLD_RANK exec dc_toolkit evaluate_combos /opt/data-compression/netCDF_files/tigge_pl_t_q_dx=2_2024_08_02.nc --where-to-write /mnt/data/docker_saved_files --field-to-compress t --l1-threshold 0.005 --eval-data-size-limit 5GB'
 ```
 
@@ -283,12 +282,12 @@ docker run \
 * **`-u $(id -u):$(id -g)`**: Runs the container as your local user so outputs aren't locked behind `root` permissions.
 * **`-w /mnt/data/docker_saved_files`**: Sets the Working Directory.
 * **`-v $(pwd)/netCDF_files:/mnt/data`**: Volume mount bridging local and container filesystems.
-* **`-e OMP_NUM_THREADS=1 ...`**: Pins codec-internal thread pools to 1 so they don't nest against the `ThreadPoolExecutor` inside the rank.
+* **`-e OMP_NUM_THREADS=1 ...`**: Pins codec-internal thread pools to 1: every rank owns one core.
 * **`--entrypoint mpirun`**: Bypasses the default entrypoint to launch via OpenMPI.
 * **`dc-toolkit`**: The image name.
-* **`-n 1`**: One MPI rank per node; on a Docker container that's one rank total. Parallelism inside the rank comes from threads, not from multiple ranks.
+* **`-n 4`**: Four MPI ranks, one per core the container may use; they share one copy of the sample.
 * **`bash -c '...'`**: Executes the dc_toolkit command:
-  * **`HOME=/tmp/$OMPI_COMM_WORLD_RANK`**: A `$HOME` per rank under the writable `/tmp` (`/tmp/0` with `-n 1`), so ranks do not share caches.
+  * **`HOME=/tmp/$OMPI_COMM_WORLD_RANK`**: A `$HOME` per rank under the writable `/tmp` (`/tmp/0`, `/tmp/1`, ...), so ranks do not share caches.
   * **`exec dc_toolkit evaluate_combos ... --where-to-write /mnt/data/docker_saved_files ...`**: Runs the sweep, writing all outputs into the mounted volume.
 
 ---
@@ -308,7 +307,7 @@ docker run `
   --entrypoint mpirun `
   dc-toolkit `
   --allow-run-as-root `
-  -n 1 `
+  -n 4 `
   bash -c "HOME=/tmp/`$OMPI_COMM_WORLD_RANK exec dc_toolkit evaluate_combos /mnt/data/tigge_pl_t_q_dx=2_2024_08_02.nc --where-to-write /mnt/data/docker_saved_files --field-to-compress t --l1-threshold 0.005 --eval-data-size-limit 5GB"
 ```
 
@@ -321,7 +320,7 @@ docker run `
 * **`--entrypoint mpirun`**: Bypasses the default container start command to run OpenMPI.
 * **`dc-toolkit`**: The image name.
 * **`--allow-run-as-root`**: The container defaults to `root` on Windows; this flag bypasses OpenMPI's built-in safety restrictions against running parallel jobs as root.
-* **`-n 1`**: One rank per node; on a Docker container that's one rank total.
+* **`-n 4`**: Four MPI ranks, one per core the container may use.
 * **`bash -c "..."`**: Executes the parallel command. Note double-quotes for PowerShell, with an escaped backtick (` `$ `) in front of the MPI variable to prevent PowerShell from evaluating it on your host before it reaches the container.
 
 ## Slides

@@ -15,16 +15,16 @@ if [[ "${WITH_EBCC:-0}" == "1" ]]; then
   pip install "ebcc[zarr] @ git+https://github.com/spcl/EBCC.git"
 fi
 
-# Thread-pinning is no longer baked into the venv.  Export the codec-internal
-# thread caps manually (e.g. in your sbatch script):
+# Thread pinning is not part of the venv: export the codec-internal thread
+# caps in your shell (e.g. in your sbatch script):
 #
 #   export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 \
 #          BLOSC_NTHREADS=1 NUMBA_NUM_THREADS=1 \
 #          VECLIB_MAXIMUM_THREADS=1 OMP_THREAD_LIMIT=1
 #
 # dc_toolkit's oversubscription-check (on by default) catches any lapse.
-# Use --codec-threads N (where supported) to deliberately allow internal
-# codec threading; --threads * --codec-threads must stay <= physical cores.
+# --codec-threads N on the write commands allows codec-internal threading;
+# --threads * --codec-threads must stay <= physical cores.
 echo "[install] Done.  Remember to export thread-pinning env vars manually:"
 echo "[install]   export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 \\"
 echo "[install]          BLOSC_NTHREADS=1 NUMBA_NUM_THREADS=1 \\"

@@ -38,8 +38,9 @@ any data of your own. Each step takes seconds.
 
 On Windows, use WSL2 with Ubuntu and follow the Ubuntu column.
 
-You do **not** need a cluster, `srun` or `mpirun`: on a laptop every command below is started directly and
-runs as a single process that uses all your cores through threads.
+You do **not** need a cluster or `srun`. `evaluate_combos` is an MPI program: on a laptop start it with
+`mpirun -n <cores>` (one process per core; the processes share one copy of the sample). Every other command
+is started directly and runs as a single process.
 
 ### 1.2 Install the toolkit
 
@@ -71,8 +72,9 @@ export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 BLOSC_NTHREADS
        NUMBA_NUM_THREADS=1 VECLIB_MAXIMUM_THREADS=1 OMP_THREAD_LIMIT=1
 ```
 
-The toolkit runs one combination per core. If the compression libraries also started their own threads, the
-two levels would fight over the same cores, so the toolkit refuses to start until they are pinned to 1:
+The sweep runs one process per core, each evaluating one pipeline at a time. If the compression libraries
+also started their own threads, they would fight over the same cores, so the toolkit refuses to start until
+they are pinned to 1:
 
 ```text
 [oversubscription-check] WARNING: codec-internal thread variables not pinned to 1:
@@ -165,7 +167,7 @@ expect; section 5 shows why.
 ## 3. Your first sweep: `evaluate_combos`
 
 ```bash
-dc_toolkit evaluate_combos "$FILE" \
+mpirun -n 8 dc_toolkit evaluate_combos "$FILE" \
     --where-to-write "$OUT/sweep" \
     --field-to-compress t \
     --l1-threshold 0.005 \
@@ -174,6 +176,7 @@ dc_toolkit evaluate_combos "$FILE" \
 
 | Part | Meaning |
 |---|---|
+| `mpirun -n 8` | one process per core, here eight; use your machine's core count |
 | `"$FILE"` | the file to read: `.nc`, `.grib` or `.zarr`, recognised by its extension |
 | `--where-to-write` | the directory for the results; created if missing |
 | `--field-to-compress t` | sweep only the variable `t`; leave it out to sweep every field of the file |
@@ -185,7 +188,7 @@ The interesting lines of the output:
 ```text
 [combo-filter] skipped 7920 unsupported filter/serializer pairing(s) (FixedScaleOffset->ZFPY, BitRound->ZFPY below the mantissa width).
 [max-evals] capping config space at 300 (of 17127 possible).
-[topology] 1 node(s) x 1 rank(s)/node x 8 thread(s)/rank = 8 parallel evaluations (8 visible core(s) per rank).
+[topology] 1 node(s) x 8 rank(s)/node = 8 parallel evaluations, one shared sample per node.
 [memory] ... = 258.1 MiB total.
 [sweep] 300 combos: 300 from the 33 x 23 x 33 grid (valid pairings, after --max-evals) + 0 EBCC; ...
 [sweep] consolidated the per-rank CSVs -> .../sweep/results_t.parquet (300 row(s)).
@@ -318,7 +321,7 @@ field, and always look at the decoded data once before you trust a setting.
 So tighten the budget and run the same command again:
 
 ```bash
-dc_toolkit evaluate_combos "$FILE" --where-to-write "$OUT/sweep" --field-to-compress t \
+mpirun -n 8 dc_toolkit evaluate_combos "$FILE" --where-to-write "$OUT/sweep" --field-to-compress t \
     --l1-threshold 0.0001 --max-evals 300
 ```
 
@@ -348,7 +351,7 @@ Run the comparison again: the largest error is now 0.09 K.
 `--max-evals` was only there for a fast first look. Drop it to search the entire space:
 
 ```bash
-dc_toolkit evaluate_combos "$FILE" --where-to-write "$OUT/full" --field-to-compress t --l1-threshold 0.0001
+mpirun -n 8 dc_toolkit evaluate_combos "$FILE" --where-to-write "$OUT/full" --field-to-compress t --l1-threshold 0.0001
 ```
 
 ```text
@@ -366,7 +369,7 @@ Drop `--field-to-compress` as well and every field of the file is swept, one aft
 its own results and manifest; `compress` then writes them all into one store:
 
 ```bash
-dc_toolkit evaluate_combos "$FILE" --where-to-write "$OUT/both" --l1-threshold 0.0005 --max-evals 300
+mpirun -n 8 dc_toolkit evaluate_combos "$FILE" --where-to-write "$OUT/both" --l1-threshold 0.0005 --max-evals 300
 dc_toolkit compress "$FILE" "$OUT/both"
 ```
 
@@ -528,7 +531,7 @@ pip install -e ".[ebcc]"          # inside the venv; about ten minutes
 ### Add EBCC to a sweep
 
 ```bash
-dc_toolkit evaluate_combos "$FILE" --where-to-write "$OUT/sweep_ebcc" --field-to-compress t \
+mpirun -n 8 dc_toolkit evaluate_combos "$FILE" --where-to-write "$OUT/sweep_ebcc" --field-to-compress t \
     --l1-threshold 0.0005 --max-evals 300 --with-ebcc
 ```
 
@@ -546,7 +549,7 @@ regular pipeline at the same budget reaches 9.3 in a full sweep.
 ### Sweep EBCC alone
 
 ```bash
-dc_toolkit evaluate_combos "$FILE" --where-to-write "$OUT/ebcc_only" --field-to-compress t \
+mpirun -n 8 dc_toolkit evaluate_combos "$FILE" --where-to-write "$OUT/ebcc_only" --field-to-compress t \
     --l1-threshold 0.0005 --serializer-class ebcc
 dc_toolkit compress "$FILE" "$OUT/ebcc_only"
 ```
@@ -605,7 +608,7 @@ open anywhere.
 **Only lossless.** `--without-lossy` removes every lossy filter and serializer:
 
 ```bash
-dc_toolkit evaluate_combos "$FILE" --where-to-write "$OUT/lossless" --field-to-compress t \
+mpirun -n 8 dc_toolkit evaluate_combos "$FILE" --where-to-write "$OUT/lossless" --field-to-compress t \
     --l1-threshold 0.0001 --without-lossy
 ```
 
@@ -659,14 +662,15 @@ everything already, so nothing is re-run. An array that was written earlier with
 `--eval-data-size-limit` (default `5GB`). A field smaller than that is evaluated in full. For big files on a
 laptop, lower it, for example `--eval-data-size-limit 512MiB`.
 
-**Memory.** Every thread works on its own copy of the sample, so memory grows with the number of threads.
-The `[memory]` line at the start of a sweep shows the estimate. If it does not fit, the toolkit shrinks the
+**Memory.** The processes of one machine share a single copy of the sample; each adds a working set of
+about twice the sample for the pipeline it is evaluating, so memory grows with the number of ranks. The
+`[memory]` line at the start of a sweep shows the estimate. If it does not fit, the toolkit shrinks the
 sample by itself (`[memcheck] auto-shrunk ...`) or refuses to start and tells you what to change. The two
-knobs are `--eval-data-size-limit` and `--threads-per-rank` (default: all cores).
+knobs are `--eval-data-size-limit` and the number of ranks you start (`mpirun -n`).
 
 **Time.** A sweep's duration grows with the sample size and with the number of pipelines. Start with
 `--max-evals` to see whether the numbers make sense, then run the full sweep. Leave your laptop usable by
-asking for fewer threads, for example `--threads-per-rank 4`.
+starting fewer ranks, for example `mpirun -n 4`.
 
 **Interruptions.** Closing the lid or pressing Ctrl-C loses nothing: run the same command again and the
 sweep continues where it stopped (`[resume] N of M combo(s) ... already recorded`). It starts over only when
@@ -693,7 +697,7 @@ retried.
 | `[verify-gate] ... no thresholds ...; verification advisory only` | `--pipeline` without a budget | add `--l1-threshold` if you want the check enforced |
 | `t already in ...; skipping.` | the store already holds the field | add `--no-skip-existing` to overwrite |
 | `[resume] ... starting this field from scratch` | the file, sample, chunking or library versions changed | nothing; the old results no longer apply |
-| `[memcheck] REFUSING to start sweep` | the estimate exceeds your memory | lower `--eval-data-size-limit` or `--threads-per-rank` |
+| `[memcheck] REFUSING to start sweep` | the estimate exceeds your memory | lower `--eval-data-size-limit` or start fewer ranks |
 | `[cr-drift] WARNING` | the sample predicted a different ratio than the whole field achieved | informative; a larger sample predicts better |
 | `[var] skipping grid geometry (CF bounds): ...` | helper variables were left out on purpose | nothing; name one with `--field-to-compress` if you really want it |
 | the largest error is bigger than you expected | the budget is relative to the field's magnitude | section 5 |
@@ -709,7 +713,7 @@ export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 BLOSC_NTHREADS
        NUMBA_NUM_THREADS=1 VECLIB_MAXIMUM_THREADS=1 OMP_THREAD_LIMIT=1
 
 # search, then write
-dc_toolkit evaluate_combos FILE --where-to-write DIR --field-to-compress VAR --l1-threshold 0.0005
+mpirun -n 8 dc_toolkit evaluate_combos FILE --where-to-write DIR --field-to-compress VAR --l1-threshold 0.0005
 dc_toolkit compress FILE DIR
 
 # a quick look first                      ... --max-evals 300
@@ -722,8 +726,8 @@ dc_toolkit compress FILE DIR --vars VAR --pipeline pipeline.json --l1-threshold 
 dc_toolkit compress FILE DIR --vars VAR --pipeline other_sweep/manifest_VAR.json
 
 # EBCC
-dc_toolkit evaluate_combos FILE --where-to-write DIR --field-to-compress VAR --l1-threshold 0.0005 --with-ebcc
-dc_toolkit evaluate_combos FILE --where-to-write DIR --field-to-compress VAR --l1-threshold 0.0005 --serializer-class ebcc
+mpirun -n 8 dc_toolkit evaluate_combos FILE --where-to-write DIR --field-to-compress VAR --l1-threshold 0.0005 --with-ebcc
+mpirun -n 8 dc_toolkit evaluate_combos FILE --where-to-write DIR --field-to-compress VAR --l1-threshold 0.0005 --serializer-class ebcc
 
 # lossless only                           ... --without-lossy
 # a store any Zarr reader opens           dc_toolkit compress FILE DIR --stock-codecs-only
