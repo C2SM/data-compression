@@ -1,5 +1,4 @@
-"""
-dc_toolkit command-line interface: the commands and their options only.
+"""dc_toolkit command-line interface: the commands and their options only.
 The work happens in utils_cli.py (command helpers) and utils.py (library).
 
 Pipeline
@@ -7,6 +6,8 @@ Pipeline
                     -> results_{var}.parquet and manifest_{var}.json (best pipeline)
   compress          persist every swept field (or --vars, or a --pipeline of your
                     own) into {dataset}.zarr and consolidate the store's metadata
+  merge_compressed_fields
+                    consolidate {dataset}.zarr after compress --no-consolidate runs
 
 Sections
   1. Shared options
@@ -53,12 +54,14 @@ _CODEC_SPACE_OPTIONS = [
                  type=click.Choice(["all", "none", "delta", "bitround", "quantize", "fixedscaleoffset", "astype"],
                                    case_sensitive=False),
                  help="Restrict the filters to one class; 'none' = no filter.  Integer fields have Delta as "
-                      "their only filter and fall back to it, with a message, for any class but 'none'; a float "
-                      "field without the class is skipped (an error when it is the --field-to-compress)."),
+                      "their only filter and get it for any class but 'none' (with a message when the class "
+                      "names another filter); a float field the class has no filter for is skipped (an error "
+                      "when it is the --field-to-compress)."),
     click.option("--serializer-class", default="all", show_default=True,
                  type=click.Choice(["all", "none", "pcodec", "zfpy", "ebcc"], case_sensitive=False),
                  help="Restrict the serializers to one class; 'all' includes plain bytes, 'none' is plain bytes "
-                      "alone.  Fields the class cannot take are skipped, as for --filter-class."),
+                      "alone, and --with-ebcc adds EBCC to any class.  Fields the class cannot take are "
+                      "skipped, as for --filter-class."),
     click.option("--with-lossy/--without-lossy", default=True, show_default=True,
                  help="Include lossy filters and serializers in the codec space."),
     click.option("--with-ebcc/--without-ebcc", default=False, show_default=True,
@@ -76,7 +79,7 @@ _CHUNK_OPTIONS = [
                       "--inner-chunk-mib.  --no-spatial-split keeps one full timestep per chunk instead "
                       "(see --max-inner-chunk-mib); compress reuses the sweep's setting."),
 ]
-_CHUNK_OVERRIDE_OPTIONS = [  # compress: None means "the sweep's value from the manifest"
+_CHUNK_OVERRIDE_OPTIONS = [
     click.option("--inner-chunk-mib", type=click.IntRange(min=1), default=None,
                  help="Target zarr chunk size in MiB (default: the sweep's value, else 16)."),
     click.option("--max-inner-chunk-mib", type=click.IntRange(min=1), default=None,
@@ -86,19 +89,21 @@ _CHUNK_OVERRIDE_OPTIONS = [  # compress: None means "the sweep's value from the 
 ]
 _OVERSUBSCRIPTION_OPTION = click.option(
     "--oversubscription-check/--no-oversubscription-check", default=True, show_default=True,
-    help="Abort at startup unless " + ", ".join(utils.THREAD_ENV_VARS) + " are all set to 1.")
+    help="Abort at startup unless " + ", ".join(utils.THREAD_ENV_VARS) + " are all set to 1 "
+         "(--no-oversubscription-check only warns).")
 _MEMORY_OPTION = click.option(
     "--memory-threshold", type=click.FloatRange(0.05, 0.95), default=0.80, show_default=True,
     help="Max fraction of memory an estimated footprint may use.  evaluate_combos shrinks its sample until "
          "one node's footprint fits this fraction of the node's budget (cgroup limit, else RAM) and aborts "
-         "when nothing fits; compress refuses a write whose peak does not fit the available RAM.")
+         "when none fits; compress refuses a write whose peak exceeds this fraction of the available RAM.")
 _PERSIST_OPTIONS = _CHUNK_OVERRIDE_OPTIONS + [
     click.option("--shard-mib", type=click.IntRange(min=1), default=512, show_default=True,
                  help="Target shard size in MiB (an integer number of inner chunks).  Sharding is "
                       "skipped when a shard would hold fewer than two chunks."),
     click.option("--threads", type=click.IntRange(min=1), default=None,
-                 help="Dask workers for the write (default: visible cores).  Peak memory ~ threads x "
-                      "(max(source block, shard) + 3 x shard); the memory guard refuses what does not fit."),
+                 help="Dask workers for the write (default and maximum: the visible cores).  Peak memory ~ "
+                      "threads x (max(source block, shard) + 3 x shard), at most 3 x the field; the memory "
+                      "guard refuses what does not fit."),
     _OVERSUBSCRIPTION_OPTION, _MEMORY_OPTION,
 ]
 
@@ -129,8 +134,8 @@ _VERIFY_OPTIONS = [
 @click.argument("dataset_file", type=click.Path(exists=True, dir_okay=True, file_okay=True))
 @click.option("--where-to-write", "where_to_write", required=True,
               type=click.Path(dir_okay=True, file_okay=False, exists=False),
-              help="Output directory (config_space_{var}.csv, per-rank CSVs, results_{var}.parquet, "
-                   "manifest_{var}.json).  Created if missing.")
+              help="Output directory (config_space_{var}.csv, per-rank CSVs, sweep_state_{var}.json, "
+                   "results_{var}.parquet, manifest_{var}.json).  Created if missing.")
 @click.option("--field-to-compress", default=None,
               help="Field to sweep (default: every non-empty integer/float32/float64 variable with at least "
                    "one dim, CF bounds excepted).")
@@ -175,18 +180,19 @@ _VERIFY_OPTIONS = [
                    "whole): 'cascade' spends the budget on time steps first, keeping a minimum of vertical "
                    "levels; 'balanced' splits it evenly across the time and vertical dims.")
 @click.option("--vertical-floor", type=click.IntRange(min=1), default=None,
-              help="Minimum vertical levels kept by the cascade policy "
+              help="Minimum vertical levels kept by the cascade policy, capped at the level count and at "
+                   "the square root of the number of horizontal slabs the budget holds "
                    "(default: max(4, ceil(log2(n_levels)))).")
 @click.option("--resume/--no-resume", default=True, show_default=True,
               help="Skip combos already recorded in config_space_{var}_rank*.csv: their metrics are reused "
-                   "and the gates re-applied with the current thresholds.  A changed file, sample, chunk "
-                   "setting or library version (recorded in sweep_state_{var}.json) restarts the field.")
+                   "and the gates re-applied with the current thresholds.  A change to what "
+                   "sweep_state_{var}.json records (file, sample, sampling and chunk settings, library "
+                   "versions, EBCC's env vars) restarts the field.")
 @click.option("--max-evals", type=click.IntRange(min=1), default=None,
               help="Cap the Cartesian product (quick test runs); EBCC combos are always included.")
 @click.pass_context
 def evaluate_combos(ctx, **_):
-    """
-    Sweep compressor x filter x serializer combinations on a representative
+    """Sweep compressor x filter x serializer combinations on a representative
     sample of each field, gate them on error thresholds, and record every
     result in results_{var}.parquet and the best pipeline in manifest_{var}.json.
 
@@ -196,12 +202,12 @@ def evaluate_combos(ctx, **_):
     rank per core:
       srun --nodes=N --ntasks-per-node=32 --cpus-per-task=1 dc_toolkit evaluate_combos ...
       mpirun -n 8 dc_toolkit evaluate_combos ...   (a laptop)
-    Everything runs in memory; use `compress` to write the winners.
+    The combos are evaluated in memory; use `compress` to write the winners.
     """
     opts = utils_cli.opts(ctx)
     sweep = utils_cli.sweep_setup(opts)
-    # array.chunk-size must be set before any open() with chunks="auto".
-    with dask.config.set({"array.chunk-size": "512MiB", "scheduler": "synchronous"}):  # one core per rank
+    # array.chunk-size must be set before any open() with chunks="auto"; synchronous: one core per rank.
+    with dask.config.set({"array.chunk-size": "512MiB", "scheduler": "synchronous"}):
         ds = utils.open_dataset(opts.dataset_file, opts.field_to_compress, rank=sweep.rank)
         variables = utils_cli.sweep_variables(ds, opts.field_to_compress, sweep.rank)
         for var in variables:
@@ -231,7 +237,7 @@ _VERIFY_THRESHOLD_OPTIONS = [
                    "that needs dc_toolkit's zarr.codecs entry point (numcodecs.zfpy_flat, numcodecs.ebcc_filter), "
                    "take the best stock row of results_{var}.parquet instead.  A --pipeline with such a codec "
                    "is refused, a field already stored with one is rewritten even under --skip-existing, and "
-                   "the run fails while the store still holds any such array.")
+                   "the run fails while the store still holds any such array (fields outside --vars included).")
 @utils_cli.add_options(_PERSIST_OPTIONS)
 @utils_cli.add_options(_VERIFY_OPTIONS)
 @utils_cli.add_options(_VERIFY_THRESHOLD_OPTIONS)
@@ -244,24 +250,21 @@ _VERIFY_THRESHOLD_OPTIONS = [
               help="Skip fields already present in the store.  A field only appears there once its write "
                    "and gates succeeded, so failed or interrupted fields are retried.")
 @click.option("--continue-on-error/--no-continue-on-error", default=True, show_default=True,
-              help="Log and go on when a field fails (default) instead of stopping at the first failure.  "
+              help="Log and go on when a field fails instead of stopping at the first failure.  "
                    "The exit status is 1 either way when any field failed.")
 @click.option("--consolidate/--no-consolidate", default=True, show_default=True,
               help="Consolidate the store's metadata at the end so readers open it quickly.  "
                    "--no-consolidate drops any earlier consolidated metadata instead, since this run "
-                   "would make it stale.")
+                   "would make it stale; merge_compressed_fields consolidates the store afterwards.")
 @click.pass_context
 def compress(ctx, **_):
-    """
-    Persist fields into {WHERE_TO_WRITE}/{dataset}.zarr, one zarr array per
-    field, with the pipeline evaluate_combos found best for each of them (read
-    from manifest_{var}.json, else the best kept row of results_{var}.parquet),
-    or with the --pipeline you pass.  A field is written under a staging name,
-    re-read and gated, and only then put in place, so the store never holds a
-    failed or half-written field.  The store's metadata is consolidated at the
-    end, batch_manifest.json records every field, and the exit status is 1
-    when any field failed.  Single process; dask threads parallelise each write.
-    """
+    """Persist fields into {WHERE_TO_WRITE}/{dataset}.zarr, one zarr array per
+    field, with the pipeline evaluate_combos found best (manifest_{var}.json,
+    else the best kept row of results_{var}.parquet) or the --pipeline you pass.
+    A field is written into a staging store beside the real one, gated, and
+    only then moved in, so a failed or interrupted write never enters the store.
+    batch_manifest.json records every field; the exit status is 1 when any
+    field failed.  Single process; dask threads parallelise each write."""
     opts = utils_cli.opts(ctx)
     utils_cli.require_single_process("compress")
     click.echo(utils_cli.version_banner("compress"))
@@ -275,7 +278,7 @@ def compress(ctx, **_):
         raise click.ClickException(f"the output store {merged_path} is the input dataset; pick another "
                                    f"WHERE_TO_WRITE.")
     ds = utils.open_dataset(opts.dataset_file)
-    utils_cli.remove_staged(merged_path)  # leftovers of an interrupted run
+    utils_cli.remove_staged(merged_path)
     existing = utils_cli.existing_arrays(merged_path)
 
     results = {var: {"status": "no-pipeline", "reason": reason} for var, reason in dropped.items()}
@@ -337,9 +340,9 @@ def compress(ctx, **_):
 @click.argument("dataset_file", type=click.Path(exists=True, dir_okay=True, file_okay=True))
 @click.argument("compressed_files_location", type=click.Path(dir_okay=True, file_okay=False, exists=False))
 def merge_compressed_fields(dataset_file: str, compressed_files_location: str):
-    """Consolidate metadata on {compressed_files_location}/{dataset}.zarr,
-    after discarding the unfinished write of an interrupted run (what compress
-    does at its end)."""
+    """Consolidate the metadata of {COMPRESSED_FILES_LOCATION}/{dataset}.zarr,
+    as compress does at its end: the step after compress --no-consolidate runs.
+    The unfinished write of an interrupted run is discarded first."""
     utils_cli.require_single_process("merge_compressed_fields")
     merged_path = utils_cli.merged_store_path(compressed_files_location, dataset_file)
     if not Path(merged_path).is_dir():
@@ -355,7 +358,7 @@ def merge_compressed_fields(dataset_file: str, compressed_files_location: str):
 @cli.command("open_zarr_and_inspect")
 @click.argument("zarr_path", type=click.Path(exists=True, dir_okay=True, file_okay=False))
 @click.option("--head", type=click.IntRange(min=1), default=4, show_default=True,
-              help="Elements per dim to preview from each array (0 = metadata only).")
+              help="Elements per dim to preview from each array.")
 def open_zarr_and_inspect(zarr_path: str, head: int):
     """Print the group tree, per-array metadata (codecs, sharding, ratio) and a
     tiny head slice of a zarr v3 store."""
@@ -393,11 +396,9 @@ def open_zarr_and_inspect(zarr_path: str, head: int):
 @click.option("--threads", type=click.IntRange(min=1), default=None, help="Dask workers (default: visible cores).")
 @click.pass_context
 def from_nc_to_zarr(ctx, **_):
-    """
-    Convert a NetCDF file to an UNCOMPRESSED zarr v3 store (no filters, no
+    """Convert a NetCDF file to an UNCOMPRESSED zarr v3 store (no filters, no
     compressors, no sharding; coordinates included; whatever compression the
-    netCDF had is undone), for filesystem-level deduplication experiments.
-    """
+    netCDF had is undone), for filesystem-level deduplication experiments."""
     utils_cli.require_single_process("from_nc_to_zarr")
     utils_cli.nc_to_zarr(utils_cli.opts(ctx))
 
@@ -411,7 +412,8 @@ def from_nc_to_zarr(ctx, **_):
 @click.option("--compression", type=click.Choice(["zlib", "none"], case_sensitive=False), default="zlib",
               show_default=True, help="NetCDF variable compression.")
 @click.option("--complevel", type=click.IntRange(0, 9), default=4, show_default=True, help="zlib compression level.")
-@click.option("--threads", type=click.IntRange(min=1), default=None, help="Dask workers (default: visible cores).")
+@click.option("--threads", type=click.IntRange(min=1), default=None,
+              help="Dask workers (default and maximum: the visible cores).")
 @click.pass_context
 def from_zarr_to_netcdf(ctx, **_):
     """Convert a zarr v3 store to a NetCDF4 file, streamed through dask."""
@@ -427,15 +429,8 @@ def from_zarr_to_netcdf(ctx, **_):
 @click.argument("parquet_file", type=click.Path(exists=True, dir_okay=False))
 @click.argument("l_error", type=click.Choice(utils_cli.L_ERRORS))
 def perform_clustering(parquet_file: str, l_error: str):
-    """
-    Elbow and silhouette scores of KMeans (k = 3..9) on compression ratio vs
-    the chosen error, over the kept rows of a results_{var}.parquet.
-
-    \b
-    Args:
-        parquet_file: results_{var}.parquet written by evaluate_combos
-        l_error:      "L1", "L2" or "LInf"
-    """
+    """Plot the elbow and silhouette scores of KMeans (k = 3..9, at most rows - 1) on compression ratio vs
+    the chosen error, over the kept rows of a results_{var}.parquet from evaluate_combos."""
     df = utils_cli.load_results(parquet_file)
     if len(df) < 4:
         click.echo(f"[perform_clustering] only {len(df)} finite passing combo(s) in {Path(parquet_file).name}; "
@@ -471,11 +466,10 @@ def analyze_clustering(parquet_file: str):
               help="Directory holding manifest_{field}.json from evaluate_combos (default: WHERE_TO_WRITE).")
 @click.pass_context
 def plot_compression_errors(ctx, **_):
-    """
-    Save a 3x3 PDF of compression errors for one (lat, lon) field with one
-    pipeline, including a copy shifted by 180 degrees in longitude to reveal
-    whether the pipeline respects periodicity.
-    """
+    """Save WHERE_TO_WRITE/{field}_compression_errors.pdf: a 3x3 grid of the
+    compression errors of one (lat, lon) field with one pipeline, including a
+    copy shifted by 180 degrees in longitude to reveal whether the pipeline
+    respects periodicity."""
     opts = utils_cli.opts(ctx)
     field = opts.field_to_compress
     utils_cli.require_single_process("plot_compression_errors")
@@ -503,21 +497,25 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 
 @cli.command("run_web_ui")
 def run_web_ui():
-    """Streamlit web UI launched from a local terminal (sweeps run under mpirun, one rank per core)."""
+    """Streamlit web UI launched from a local terminal (sweeps run under mpirun or mpiexec when one is on the
+    PATH, one rank per physical core; else as one process)."""
     subprocess.run(["streamlit", "run", os.path.join(_HERE, "compression_analysis_ui_web.py")])
 
 
 @cli.command("run_web_ui_vcluster")
-@click.option("--user_account", type=str, required=True, help="vCluster account (the sweep runs under srun).")
-@click.option("--uenv_image", type=str, default="", help="vCluster uenv image name")
+@click.option("--user_account", type=str, required=True, help="vCluster account (the commands run under srun).")
+@click.option("--uenv_image", type=str, default="",
+              help="uenv image the commands run in, with its default view (default: srun keeps the calling "
+                   "session's uenv, if any).")
 @click.option("--uploaded_file", type=str, required=True,
               help="netCDF file on the cluster to analyse (the compute nodes must see it).")
-@click.option("--time", type=str, default="00:15:00", help="Allocated time")
-@click.option("--nodes", type=str, default="1", help="Number of nodes")
-@click.option("--ntasks-per-node", type=str, default="32", help="MPI ranks per node (one per core)")
+@click.option("--time", type=str, default="00:15:00", help="Time limit of each srun (default: 00:15:00).")
+@click.option("--nodes", type=str, default="1", help="Nodes of a sweep (default: 1).")
+@click.option("--ntasks-per-node", type=str, default="32",
+              help="MPI ranks per node of a sweep, one per core (default: 32).")
 @click.option("--partition", type=str, default="debug", show_default=True, help="SLURM partition")
 def run_web_ui_vcluster(user_account, uenv_image, uploaded_file, time, nodes, ntasks_per_node, partition):
-    """The same web UI, launching its sweeps with srun on a vcluster."""
+    """The same web UI, launching its commands with srun on a vcluster (compress as one task)."""
     subprocess.run(["streamlit", "run", os.path.join(_HERE, "compression_analysis_ui_web.py"), "--",
                     "--user_account", user_account, "--uenv_image", uenv_image, "--uploaded_file", uploaded_file,
                     "--time", time, "--nodes", nodes, "--ntasks-per-node", ntasks_per_node,

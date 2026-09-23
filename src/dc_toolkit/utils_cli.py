@@ -1,13 +1,6 @@
-"""
-Helpers behind the dc_toolkit commands.  cli.py declares the commands and
-their options and hands the parsed parameters to the functions here as one
-`opts` namespace (attribute names == click parameter names).  Three helpers
-add resolved values to it: sweep_setup sets opts.with_ebcc, sweep_variable
-sets opts.phys_slack, single_process_setup sets opts.threads.
-
-A codec combination is identified by its pipeline dict (utils.pipeline_to_dict):
-the sweep records it in every result row and in manifest_{var}.json, and
-`compress` rebuilds the codecs from it.
+"""Helpers behind the dc_toolkit commands; cli.py passes them its parsed click parameters as one `opts`
+namespace, which sweep_setup, _sweep_variable_body and single_process_setup extend.  A codec combination
+is identified by its pipeline dict (utils.pipeline_to_dict): result rows, manifests and `compress` use it.
 
 Sections
   1. Process, files & CLI plumbing
@@ -59,7 +52,7 @@ hsize = utils.hsize
 
 
 def opts(ctx) -> SimpleNamespace:
-    """The command's parsed click parameters as one namespace."""
+    """The command's click parameters as a namespace; a copy, so helpers may add attributes."""
     return SimpleNamespace(**ctx.params)
 
 
@@ -73,7 +66,7 @@ def size_option_callback(ctx, param, value):
 
 
 def add_options(options):
-    """Apply a list of click options to a command (shared option groups)."""
+    """Apply a shared option group (reversed, so --help lists it in order)."""
     def decorator(f):
         for opt in reversed(options):
             f = opt(f)
@@ -90,8 +83,8 @@ def require_single_process(command: str) -> None:
 
 
 def env_versions() -> dict:
-    """Library versions (and EBCC's tuning env vars) that change the bytes a
-    codec produces; recorded in the manifests and compared by warn_env_drift."""
+    """Versions of the libraries behind the codecs and the sample, plus EBCC's tuning env vars; recorded in
+    the manifests and in sweep_state_{var}.json, where any change voids the recorded rows."""
     env = {"zarr": getattr(zarr, "__version__", None),
            "numpy": getattr(np, "__version__", None),
            "dask": getattr(dask, "__version__", None)}
@@ -115,8 +108,7 @@ def version_banner(command: str) -> str:
 
 
 def warn_env_drift(sweep_env: dict, source: str) -> None:
-    """Warn when the recorded environment differs from the current one (codec
-    output and error norms may differ from what the sweep measured)."""
+    """Warn when the sweep's recorded environment differs from this one: codec output may differ."""
     now = env_versions()
     deltas = [(k, then, now.get(k)) for k, then in sweep_env.items() if then is not None and then != now.get(k)]
     if deltas:
@@ -140,7 +132,7 @@ def close_store(store) -> None:
 
 
 def existing_arrays(merged_path: str) -> set:
-    """Array names in the merged store (empty when there is none)."""
+    """Array names in the merged store; empty when it is missing or cannot be opened."""
     if not Path(merged_path).is_dir():
         return set()
     try:
@@ -153,8 +145,8 @@ def existing_arrays(merged_path: str) -> set:
 
 
 def array_is_stock(merged_path: str, var: str) -> bool:
-    """True when the stored array names no codec that needs dc_toolkit to be read
-    (the inner codecs of a sharded array included)."""
+    """True unless the array's zarr.json names a codec that needs dc_toolkit to be read (the inner codecs
+    of a sharded array included); True also when there is no readable zarr.json."""
     try:
         text = (Path(merged_path) / var / "zarr.json").read_text()
     except OSError:
@@ -163,9 +155,7 @@ def array_is_stock(merged_path: str, var: str) -> bool:
 
 
 def staging_path(merged_path: str) -> Path:
-    """The store a field is written into before its gates have passed: a
-    sibling of the real store, so an interrupted run leaves nothing inside it
-    and no reader can ever see a half-written field."""
+    """A sibling store a field is written into until its gates pass: no half-written field enters the merged store."""
     return Path(f"{merged_path}.__staging__")
 
 
@@ -176,21 +166,18 @@ def remove_staged(merged_path: str, var=None) -> None:
 
 
 def promote_staged(merged_path: str, var: str) -> None:
-    """Move the verified field into the store by one directory rename (a zarr v3
-    array does not record its own name), so no reader ever sees a half-written
-    array."""
-    target = Path(merged_path) / var
+    """Rename the verified field into the merged store (a zarr v3 array does not record its own name),
+    replacing an array of the same name, then remove the staging store."""
+    target, aside = Path(merged_path) / var, staging_path(merged_path) / f"{var}.__replaced__"
     if target.exists():
         drop_consolidated_metadata(merged_path)  # it would describe the replaced array until the next consolidation
-        shutil.rmtree(target)
+        os.replace(target, aside)  # two renames, so the old array is whole until the new one is in place
     os.replace(staging_path(merged_path) / var, target)
     remove_staged(merged_path)
 
 
 def consolidate_store(merged_path: str) -> list:
-    """(Re)write the store's consolidated metadata; returns the array names
-    inside.  Staging leftovers of a killed run (its cleanup never ran) are
-    dropped first."""
+    """Drop a killed run's staging leftovers and rewrite the consolidated metadata; returns the array names."""
     leftovers = sorted(p.name for p in staging_path(merged_path).iterdir()) if staging_path(merged_path).is_dir() else []
     if leftovers:
         click.echo(f"[store] discarding the unfinished write(s) of an interrupted run: {', '.join(leftovers)}")
@@ -203,9 +190,8 @@ def consolidate_store(merged_path: str) -> list:
 
 
 def drop_consolidated_metadata(merged_path: str) -> bool:
-    """Remove a store's consolidated metadata (True when there was any), so
-    that readers scan the arrays instead of trusting a listing this run made
-    stale."""
+    """Remove the store's consolidated metadata (True if there was any) so readers scan the arrays instead
+    of trusting a listing this run made stale."""
     root = Path(merged_path) / "zarr.json"
     if not root.is_file():
         return False
@@ -216,7 +202,7 @@ def drop_consolidated_metadata(merged_path: str) -> bool:
         meta.pop("consolidated_metadata")
         tmp = root.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(meta, indent=2))
-        os.replace(tmp, root)  # readers may have the store open
+        os.replace(tmp, root)  # atomic: readers may have the store open
         return True
     except Exception as e:
         click.echo(f"[store] WARNING: could not drop the consolidated metadata of {merged_path}: {e}")
@@ -262,8 +248,8 @@ def check_thread_count(threads: int) -> None:
 
 
 def single_process_setup(opts) -> None:
-    """Thread setup of compress.  Sets opts.threads (the dask worker count:
-    --threads or the visible cores)."""
+    """Set opts.threads (--threads, else the visible cores); abort when it exceeds the visible cores or,
+    with --oversubscription-check, when a thread env var is not 1."""
     reset_memcheck_state()
     if opts.threads is None:
         opts.threads = utils.detect_cores_available()
@@ -271,10 +257,9 @@ def single_process_setup(opts) -> None:
     utils.check_thread_oversubscription(abort_if_unsafe=opts.oversubscription_check)
 
 
-# Per-rank working set in units of the sample: the decoded buffer (1x) plus the
-# encoded MemoryStore (up to 1x) and a filter's copy while encoding, ~2x at a
-# rank's own peak.  The ranks of a node do not peak together (~1.1x measured
-# across the node), so 2.0 leaves headroom under --memory-threshold.
+# Per-rank working set in samples: decoded buffer (1x) + encoded MemoryStore (up to 1x), and a filter's copy
+# while encoding: ~2x at a rank's peak.  A node's ranks do not peak together (node average ~1.1x), so 2.0
+# leaves headroom.
 PER_RANK_WORKING_FACTOR = 2.0
 
 
@@ -293,10 +278,8 @@ def max_sample_bytes_for_ranks(budget_bytes: int, ranks_on_node: int, inner_chun
 
 
 def _cgroup_v2_memory_paths():
-    """The namespaced root (a container's limit), then the cgroup named in
-    /proc/self/cgroup and its ancestors: under SLURM the root is absent and the
-    task's own cgroup reads "max", while the limit sits on an ancestor.  Wherever
-    it sits, the ranks on the node share it."""
+    """The namespaced root (a container's limit), then this process's cgroup and its ancestors: under Slurm
+    the root is absent and the task's own cgroup reads "max", while the limit sits on an ancestor."""
     yield "/sys/fs/cgroup/memory.max"
     try:
         with open("/proc/self/cgroup") as fh:
@@ -310,8 +293,8 @@ def _cgroup_v2_memory_paths():
 
 
 def detect_node_memory_budget() -> tuple[int, str]:
-    """(bytes, source): cgroup v2 limit, else cgroup v1, else host RAM.  The
-    cgroup is what actually OOM-kills a SLURM task; psutil cannot see it."""
+    """(bytes, source) of the memory the node's ranks share: cgroup v2 limit, else cgroup v1, else host RAM.
+    The cgroup is what OOM-kills a Slurm task; psutil cannot see it."""
     for path in _cgroup_v2_memory_paths():
         try:
             with open(path) as fh:
@@ -342,9 +325,7 @@ def detect_node_memory_budget() -> tuple[int, str]:
 
 def check_node_memory_headroom(node_steady_bytes: int, ranks_on_node: int, rank: int,
                                label: str, threshold: float = 0.80) -> None:
-    """Abort if the steady-state footprint of the node (one shared sample plus
-    its ranks' working sets) exceeds the memory budget, which the ranks share
-    whether it is a cgroup limit or host RAM."""
+    """Rank 0 aborts the job if `node_steady_bytes` exceeds `threshold` of the node budget; others return."""
     if rank != 0:
         return
     available, source = detect_node_memory_budget()
@@ -368,13 +349,12 @@ def reset_memcheck_state() -> None:
 
 
 def check_memory_headroom(required_bytes: int, label: str, threshold: float = 0.80) -> None:
-    """Abort if `required_bytes` exceeds `threshold` of currently available
-    host RAM (psutil; does not see cgroup limits)."""
+    """Abort if `required_bytes` exceeds `threshold` of the available host RAM (psutil: blind to cgroups)."""
     global _MEMCHECK_WARNED_HIGH
     if threshold > 0.80 and not _MEMCHECK_WARNED_HIGH:
         if MPI.COMM_WORLD.Get_rank() == 0:
             click.echo(f"[memcheck] WARNING: threshold {threshold:.2f} exceeds the recommended 0.80; "
-                       f"the 1.5-2x rechunk transient may no longer fit.")
+                       f"less memory is left for what the estimates do not count.")
         _MEMCHECK_WARNED_HIGH = True
     try:
         avail = psutil.virtual_memory().available
@@ -392,13 +372,13 @@ def check_memory_headroom(required_bytes: int, label: str, threshold: float = 0.
 # =============================================================================
 # 3. GATES & THRESHOLDS
 # =============================================================================
-# All thresholds are RELATIVE errors.  --l1-threshold is the anchor; the other
-# gates default to multiples of it.  A disabled gate resolves to +inf.
+# Thresholds are RELATIVE errors; the L2, Linf, bias and q99 ones default to multiples of --l1-threshold;
+# off means +inf.
 
 _L2_MULT_DEFAULT = 2.0     # RMS may run ~2x the mean-abs budget
-_LINF_MULT_DEFAULT = 10.0  # single-cell trip-wire
+_LINF_MULT_DEFAULT = 10.0
 _BIAS_MULT_DEFAULT = 0.5   # at most half the budget may be one-directional
-_Q99_MULT_DEFAULT = 2.0    # extreme-tail allowance
+_Q99_MULT_DEFAULT = 2.0
 GATE_KEYS = ("l1", "l2", "linf", "bias", "q99")
 
 
@@ -416,9 +396,8 @@ def derive_thresholds(opts) -> dict:
 
 def evaluate_gates(errors: dict, thr: dict, *, phys_min=None, phys_max=None, phys_slack=0.0,
                    grad_threshold=None, grad_gate=False):
-    """(keep, {gate: passed}) for one metrics dict.  A None metric or +inf
-    limit passes; `phys_slack` is the absolute excursion the bounds allow.
-    Shared by the sweep and the production verify gate."""
+    """(keep, {"pass_<gate>": bool}) for one metrics dict, for the sweep and the verify gate.  A None metric
+    or +inf limit passes; `phys_slack` is the absolute excursion the bounds allow."""
     reasons = {f"pass_{t}": utils.within_limit(errors.get(m), thr.get(t)) for m, t in utils.CHEAP_GATES}
     reasons["pass_q99"] = utils.within_limit(errors.get("Q99_Rel"), thr.get("q99"))
     reasons["pass_finite"] = int(errors.get("N_Corrupt") or 0) == 0
@@ -435,8 +414,7 @@ def evaluate_gates(errors: dict, thr: dict, *, phys_min=None, phys_max=None, phy
 
 
 def evaluate_cr_drift(production_ratio, predicted_ratio, tol):
-    """(ok, drift, direction) with direction in ok/under/over/skip.  Bounds
-    wasted storage: an error gate cannot see a ratio far below the sweep's."""
+    """(ok, drift, ok/under/over/skip): an error gate cannot see a ratio far below the sweep's."""
     if (predicted_ratio is None or production_ratio is None or not math.isfinite(predicted_ratio)
             or predicted_ratio <= 0 or not math.isfinite(production_ratio)):
         return True, None, "skip"
@@ -447,7 +425,7 @@ def evaluate_cr_drift(production_ratio, predicted_ratio, tol):
 
 
 def q99_cut(sample_np: np.ndarray):
-    """99th percentile of |finite values|: the extreme-tail cut for the q99 gate."""
+    """99th percentile of |finite values| (the q99 gate's tail cut); None when no value is finite."""
     finite = sample_np[np.isfinite(sample_np)]
     return float(np.quantile(np.abs(finite), 0.99)) if finite.size else None
 
@@ -457,10 +435,8 @@ def fmt3(x) -> str:
 
 
 def verify_against_manifest(var: str, errors: dict, manifest, overrides=None):
-    """Production verify gate: compare `errors` with the thresholds recorded by
-    the sweep, each replaced by a non-None entry of `overrides` (the compress
-    --*-threshold flags).  Returns (status, detail) with status "pass", "fail"
-    or "no-thresholds"."""
+    """Production verify gate: `errors` against the sweep's recorded thresholds, each overridden by a
+    non-None `overrides` entry.  Returns (status, detail), status "pass", "fail" or "no-thresholds"."""
     man_thr = dict((manifest or {}).get("effective_thresholds", {}) or {})
     man_thr.update({k: v for k, v in (overrides or {}).items() if v is not None})
     thr = {k: (float(man_thr[k]) if man_thr.get(k) is not None else math.inf) for k in GATE_KEYS}
@@ -481,9 +457,8 @@ def verify_against_manifest(var: str, errors: dict, manifest, overrides=None):
 
 
 def verify_gate_verdict(var: str, out: dict, manifest, opts):
-    """Run the production verify gate and print the verdict.  Returns
-    (status, detail): "skipped" (--no-verify), "no-thresholds", "pass",
-    "fail-advisory" (--no-verify-gate) or "fail"."""
+    """Run the verify gate and print the verdict.  Returns (status, detail), status "skipped" (--no-verify),
+    "no-thresholds", "pass", "fail-advisory" (--no-verify-gate) or "fail"."""
     if not opts.verify or out["errors"] is None:
         return "skipped", ""
     overrides = {k: getattr(opts, f"{k}_threshold", None) for k in ("l1", "l2", "linf", "bias")}
@@ -509,15 +484,13 @@ SPACE_KEYS = ("compressor_class", "filter_class", "serializer_class", "with_loss
 
 
 def space_args(opts) -> dict:
-    """The five settings that define the codec space of a sweep."""
+    """The `space_args` dict codec_spaces takes."""
     return {k: getattr(opts, k) for k in SPACE_KEYS}
 
 
 def codec_spaces(sample_da, space_args: dict, fso_range, chunk_shapes=None):
-    """(compressors, filters, serializers) built from the sample.  `fso_range`
-    is the FULL field's (min, max): FixedScaleOffset and EBCC must not be
-    parameterised from a sample that may miss the extremes.  `chunk_shapes`: see
-    utils.serializer_space."""
+    """(compressors, filters, serializers) for the sample.  `fso_range` is the FULL field's (min, max):
+    FixedScaleOffset and EBCC must not be parameterised from a sample that may miss the extremes."""
     try:
         return (utils.compressor_space(sample_da, space_args["with_lossy"], space_args["compressor_class"]),
                 utils.filter_space(sample_da, space_args["with_lossy"], space_args["filter_class"],
@@ -525,19 +498,18 @@ def codec_spaces(sample_da, space_args: dict, fso_range, chunk_shapes=None):
                 utils.serializer_space(sample_da, space_args["with_lossy"], space_args["serializer_class"],
                                        with_ebcc=space_args["with_ebcc"], data_range=fso_range,
                                        chunk_shapes=chunk_shapes))
-    except (ValueError, TypeError) as e:  # unknown class name, or a dtype a codec does not take
+    except (ValueError, TypeError) as e:
         raise click.ClickException(str(e))
 
 
 def parse_pipeline_arg(text: str) -> dict:
-    """--pipeline value: a JSON object, a file holding one (`@path` or a bare
-    path), or a manifest_{var}.json, of which best.pipeline is taken."""
+    """--pipeline: a JSON object, a file holding one (`@path` or a bare path), or a manifest's best.pipeline."""
     if not text.strip():
         raise click.ClickException("--pipeline is empty: give a JSON object or the path of a file holding one")
     try:
         if text.startswith("@"):
             raw = Path(text[1:]).read_text()
-        else:                                    # JSON starts with a bracket, a path does not
+        else:
             raw = text if text.lstrip()[:1] in "{[" else Path(text).read_text()
         d = json.loads(raw)
     except Exception as e:
@@ -545,7 +517,7 @@ def parse_pipeline_arg(text: str) -> dict:
     if not isinstance(d, dict):
         raise click.ClickException("--pipeline must be a JSON object with compressor, filter and serializer")
     if not any(k in d for k in ("compressor", "filter", "serializer")):
-        best = d.get("best")                            # a manifest: take its winner
+        best = d.get("best")
         best = best.get("pipeline") if isinstance(best, dict) else None
         if not isinstance(best, dict):
             raise click.ClickException("--pipeline needs a JSON object with compressor, filter and "
@@ -555,7 +527,7 @@ def parse_pipeline_arg(text: str) -> dict:
 
 
 def pipeline_codecs(pipeline: dict, context: str):
-    """Rebuild (compressor, filt, serializer) from a pipeline dict."""
+    """utils.pipeline_from_dict, raising a ClickException that names `context`."""
     try:
         return utils.pipeline_from_dict(pipeline)
     except Exception as e:
@@ -563,14 +535,14 @@ def pipeline_codecs(pipeline: dict, context: str):
 
 
 def validate_pipeline(combo, da, var: str) -> None:
-    """Refuse pairings the codecs cannot run and EBCC inputs the C library
-    would exit on (wrong dtype, tile not dividing the frame, NaN/Inf)."""
+    """Raise a ClickException for codecs that cannot pair, an AsType filter that would decode to another
+    dtype, or an EBCC input the C library would exit on (wrong dtype, tile not dividing the frame, NaN/Inf)."""
     compressor, filt, serializer = combo
     if not utils.combo_is_valid(filt, serializer, compressor, dtype=da.dtype):
         raise click.ClickException(
             f"{var}: invalid pipeline {utils.pipeline_name(*combo)} (e.g. FixedScaleOffset->ZFPY, "
             f"BitRound->ZFPY below the mantissa width, "
-            f"or EBCC with a filter/compressor).")
+            f"or EBCC with a compressor or a filter other than AsType).")
     if isinstance(filt, utils.zarrcodecs_nc.AsType):  # numcodecs reinterprets the bytes on a mismatch
         decode = filt.codec_config.get("decode_dtype")
         if decode is not None and np.dtype(decode) != da.dtype:
@@ -591,10 +563,8 @@ def validate_pipeline(combo, da, var: str) -> None:
 
 
 def chunk_geometry(opts, manifest):
-    """(geometry, sources) for a persist: each of inner_chunk_mib,
-    max_inner_chunk_mib and spatial_split comes from the CLI flag, else from
-    the sweep's manifest args (so the store matches what the sweep measured),
-    else from the default."""
+    """(geometry, sources): inner_chunk_mib, max_inner_chunk_mib and spatial_split from the CLI flag, else
+    the sweep manifest's args (so the store matches what the sweep measured), else the default."""
     args = (manifest or {}).get("args") or {}
     defaults = {"inner_chunk_mib": 16, "max_inner_chunk_mib": 256, "spatial_split": True}
     geometry, sources = {}, {}
@@ -610,9 +580,8 @@ def chunk_geometry(opts, manifest):
 
 
 def persist_field(da, var: str, merged_path: str, combo, opts, geometry: dict, q99_abs) -> dict:
-    """Write one field with `combo` = (compressor, filt, serializer) into the
-    staging store next to the shared one.  Returns ratio, errors, eucd,
-    geometry and timing."""
+    """Write one field with `combo` into the staging store, creating the merged store if needed; aborts when
+    the write peak does not fit in memory.  Returns ratio, errors, eucd, geometry and timing."""
     serializer = combo[2]
     forced_chunks = utils.ebcc_chunks(serializer, da.shape) if isinstance(serializer, utils.EBCC) else None
     inner_chunks, shards = utils.compute_chunk_and_shard_shape(
@@ -630,8 +599,7 @@ def persist_field(da, var: str, merged_path: str, combo, opts, geometry: dict, q
                  else f"shards={shards}, {hsize(shard_bytes)}"))
     click.echo(f"[persist] {var} -> {merged_path} ({layout})")
 
-    # A write task holds its source dask block, the rechunked write unit, zarr's encode copy
-    # and the encoded bytes; a small field tops out near 3x its size.
+    # Per write task: source block, write unit, zarr's encode copy and encoded bytes; a small field peaks near 3x.
     source_block = itemsize * int(np.prod(da.data.chunksize))
     write_peak = min(int(opts.threads) * (max(source_block, shard_bytes) + 3 * shard_bytes), 3 * int(da.nbytes))
     check_memory_headroom(write_peak, threshold=opts.memory_threshold,
@@ -672,16 +640,16 @@ class SweepContext:
     ranks_on_node: int
     cores_avail: int
     thresholds: dict
-    node_comm: object    # the ranks of this node, ...
-    local_rank: int      # ... this rank's index among them, ...
-    leaders: object      # ... and one rank per node (COMM_NULL elsewhere)
-    node_id: int         # this node's index among ...
-    n_nodes: int         # ... the job's nodes
+    node_comm: object
+    local_rank: int
+    leaders: object      # one rank per node; COMM_NULL on the others
+    node_id: int
+    n_nodes: int
 
 
 def sweep_setup(opts) -> SweepContext:
-    """Topology, zarr's pool, output dir, gate thresholds.  Sets opts.with_ebcc
-    when --serializer-class ebcc implies it."""
+    """Collective.  Sets opts.with_ebcc, installs an excepthook that ends a multi-rank job through MPI Abort,
+    pins zarr's pool to one worker (one core per rank) and creates the output directory."""
     reset_memcheck_state()
     opts.with_ebcc = opts.with_ebcc or opts.serializer_class.lower() == "ebcc"
     if opts.with_ebcc and not opts.with_lossy:
@@ -706,7 +674,7 @@ def sweep_setup(opts) -> SweepContext:
         click.echo(f"[topology] NOTE: one rank on {cores} cores.  A rank evaluates one pipeline at a time; "
                    f"start one rank per core to use them all (mpirun -n {cores} dc_toolkit ...).")
     utils.check_thread_oversubscription(abort_if_unsafe=opts.oversubscription_check, rank=rank, comm=comm)
-    zarr.config.set({"threading.max_workers": 1})  # one core per rank: zarr's own pool must not multiply it
+    zarr.config.set({"threading.max_workers": 1})
     if rank == 0:
         os.makedirs(opts.where_to_write, exist_ok=True)
     comm.Barrier()
@@ -726,11 +694,8 @@ def sweep_setup(opts) -> SweepContext:
 
 
 def sweep_variables(ds, field, rank: int) -> list:
-    """The data variables to sweep: the named field, else every one the codecs
-    can take (non-empty integer/float32/float64 arrays with at least one dim).
-    Datetimes, strings and scalars such as `crs` are skipped, and so are CF
-    bounds (the variables a `bounds` or `climatology` attribute names) unless
-    named: they are grid geometry, which a lossy codec would move."""
+    """The named field, else every non-empty integer/float32/float64 array with a dim, except CF bounds
+    (named by a `bounds` or `climatology` attribute): grid geometry, which a lossy codec would move."""
     bounds = {str(src[a]) for v in ds.variables.values() for src in (v.attrs, v.encoding)
               for a in ("bounds", "climatology") if a in src}
     names = [v for v in ds.data_vars if field in (None, v)]
@@ -750,9 +715,8 @@ def sweep_variables(ds, field, rank: int) -> list:
 
 
 def sweep_sample_limit(var: str, field_bytes: int, opts, sweep: SweepContext) -> int:
-    """Shrink the sample budget so the node's steady state (one shared sample
-    beside its ranks' working sets) fits the node's memory budget, then run
-    the memory guards.  Returns the effective limit."""
+    """Collective.  Shrink the sample budget so one shared sample beside the node's rank working sets fits
+    the node memory budget, then run the memory guards; returns the limit, the same on every rank."""
     ranks, chunk_mib = sweep.ranks_on_node, opts.inner_chunk_mib
     node_budget, source = detect_node_memory_budget()
     max_safe = max_sample_bytes_for_ranks(int(node_budget * opts.memory_threshold), ranks, chunk_mib)
@@ -781,11 +745,9 @@ def sweep_sample_limit(var: str, field_bytes: int, opts, sweep: SweepContext) ->
 
 
 def sweep_build_sample(da, limit: int, opts, sweep: SweepContext):
-    """Rank 0 builds the sample and every node maps one copy of it
-    (shared_sample_window); the full-field FSO range is a collective one-pass
-    scan.  The dim coordinates travel with the sample so every rank classifies
-    the dims the same way.  Returns (sample_np, sample_da, fso_range, win); the
-    caller frees the window, collectively."""
+    """Collective.  Rank 0 builds the sample, each node maps one shared copy (shared_sample_window) and all
+    ranks split the full-field range pass; the dim coords travel along so every rank classifies the dims
+    alike.  Returns (sample_np, sample_da, fso_range, win); the caller frees win, collectively."""
     comm, rank = sweep.comm, sweep.rank
     if rank == 0:
         try:
@@ -800,7 +762,7 @@ def sweep_build_sample(da, limit: int, opts, sweep: SweepContext):
                                dict(local.coords[d].encoding)) for d in local.dims if d in local.coords}}
     else:
         sample_np_local = meta = None
-    fso_range = utils.full_field_data_range(da, comm=comm)  # every rank scans a share of the blocks
+    fso_range = utils.full_field_data_range(da, comm=comm)
     meta = comm.bcast(meta, root=0)
     sample_np, win = shared_sample_window(sample_np_local, meta["shape"], meta["dtype"], sweep)
     del sample_np_local
@@ -810,11 +772,9 @@ def sweep_build_sample(da, limit: int, opts, sweep: SweepContext):
 
 
 def shared_sample_window(local_np, shape, dtype, sweep: SweepContext):
-    """One copy of the sample per node in an MPI-3 shared-memory window: each
-    node's leader allocates it, rank 0 fills its own from `local_np`, the
-    leaders Bcast into theirs, and every rank maps it read-only.  Returns
-    (sample_np, win).  A checksum across all ranks catches a rank reading the
-    window before its fill, which would otherwise surface as wrong metrics."""
+    """Collective.  One copy of the sample per node in an MPI-3 shared-memory window, filled from rank 0's
+    `local_np` through the node leaders and mapped read-only; returns (sample_np, win).  A checksum across
+    all ranks catches a rank reading the window before its fill, which would otherwise give wrong metrics."""
     dtype, count = np.dtype(dtype), int(np.prod(shape))
     try:
         win = MPI.Win.Allocate_shared(count * dtype.itemsize if sweep.local_rank == 0 else 0, dtype.itemsize,
@@ -832,8 +792,8 @@ def shared_sample_window(local_np, shape, dtype, sweep: SweepContext):
         sweep.leaders.Bcast(sample_np, root=0)
     sweep.node_comm.Barrier()
     sample_np.flags.writeable = False
-    probe = np.ascontiguousarray(sample_np.reshape(-1)[::4099])  # 1/4099 of the sample on every rank
-    h = zlib.crc32(probe.view(np.uint8))  # exact whatever NaN/Inf the sample holds
+    probe = np.ascontiguousarray(sample_np.reshape(-1)[::4099])
+    h = zlib.crc32(probe.view(np.uint8))  # over the bytes: exact whatever NaN/Inf the sample holds
     if sweep.comm.allreduce(h, MPI.MIN) != sweep.comm.allreduce(h, MPI.MAX):
         if sweep.rank == 0:
             click.echo("[shared-sample] FATAL: the sample differs between ranks after the fill.")
@@ -845,18 +805,15 @@ _ROW_KEY_COLUMNS = ["pipeline", "ratio", "l1_rel", "l2_rel", "linf_rel", "eucd"]
 
 
 def rank_files(where_to_write, prefix: str, var: str) -> list:
-    """The per-rank files of one variable, matched exactly: a glob on
-    "{prefix}_{var}_rank*" would also match the files of a variable called
-    "{var}_rank0", and would break on a name holding glob characters."""
+    """The per-rank files of one variable, matched exactly: a glob on "{prefix}_{var}_rank*" would also
+    match variable "{var}_rank0" and break on a name holding glob characters."""
     pattern = re.compile(rf"^{re.escape(prefix)}_{re.escape(str(var))}_rank\d+\.csv$")
     return sorted(p for p in Path(where_to_write).iterdir() if pattern.match(p.name))
 
 
 def read_rank_csvs(where_to_write, var: str, quarantine: bool = False) -> pd.DataFrame:
-    """Every readable config_space_{var}_rank*.csv as one frame, without rows
-    that lack a key metric.  A file that cannot be parsed (empty, damaged, other
-    format) is skipped, and renamed to *.unreadable with `quarantine` so that
-    its rank starts a fresh file."""
+    """Every readable config_space_{var}_rank*.csv as one frame, minus rows lacking a key metric.  An
+    unparseable file is skipped, and with `quarantine` renamed to *.unreadable so its rank starts afresh."""
     frames = []
     for path in rank_files(where_to_write, "config_space", var):
         try:
@@ -870,13 +827,11 @@ def read_rank_csvs(where_to_write, var: str, quarantine: bool = False) -> pd.Dat
 
 
 def sweep_recorded_rows(var, sample_np, q99_abs, fso_range, opts, sweep: SweepContext) -> set:
-    """The pipelines whose recorded rows this run reuses (none with
-    --no-resume).  Rank 0 decides and broadcasts, before any rank opens its
-    CSV.  Rows are reusable only when they were measured on the same sample
-    with the same chunking by the same codec build (sweep_state_{var}.json;
-    otherwise, and with --no-resume, the field's per-rank CSVs are removed)
-    and carry every metric the current gates need.  Failed combos are always
-    retried, so the failures files start empty."""
+    """Collective: the pipelines whose recorded rows this run reuses, decided on rank 0 before any rank opens
+    its CSV.  Rows are reused only with --resume, when sweep_state_{var}.json matches this run's dataset,
+    sample, full-field range, sampling and chunk settings and library versions (else, and with --no-resume,
+    the per-rank CSVs are removed), and when they carry every metric the current gates need.  Failed combos
+    are always retried."""
     done = set()
     if sweep.rank == 0:
         where = Path(opts.where_to_write)
@@ -907,12 +862,9 @@ def sweep_recorded_rows(var, sample_np, q99_abs, fso_range, opts, sweep: SweepCo
 
 
 def reusable_rows(prev: pd.DataFrame, q99_abs, opts, thresholds: dict) -> pd.Series:
-    """Rows whose recorded metrics suffice for the current gates.  The q99 and
-    gradient metrics are only computed when their gate is on (the gradient only
-    for rows that pass the cheap gates, unless --no-gradient-shortcircuit), so
-    a row recorded without a metric it now needs is evaluated again.  A field
-    with no finite values has no q99 cut, so no run records that metric and
-    requiring it would re-evaluate the field for ever."""
+    """Rows carrying every metric the current gates need: q99 and gradient are recorded only with their gate
+    on (the gradient, with the shortcircuit, only for rows passing the cheap gates).  A field with no finite
+    value has no q99 cut, so no row records it; requiring it would re-evaluate the field for ever."""
     ok = pd.Series(True, index=prev.index)
     if opts.extremes_sensitive and q99_abs is not None and math.isfinite(q99_abs):
         ok &= prev["q99_rel"].notna()
@@ -927,11 +879,9 @@ def reusable_rows(prev: pd.DataFrame, q99_abs, opts, thresholds: dict) -> pd.Ser
 
 
 def sweep_config_space(compressors, filters, serializers, max_evals, rank, dtype, all_finite: bool) -> list:
-    """The (compressor, filter, serializer) triples to evaluate: the valid part
-    of the Cartesian product (EBCC excluded), cut to its first --max-evals
-    entries (a quick-test knob, not a sample), plus the guarded standalone EBCC
-    triples (never cut; `all_finite`: the sample holds no NaN/Inf), shuffled
-    with a seed that depends only on the count (stable across --resume restarts)."""
+    """Triples to evaluate: the EBCC ones (none unless `all_finite`, never cut), then the valid non-EBCC
+    product cut to --max-evals (a quick-test knob, not a sample) and shuffled so each node's every-n_nodes-th
+    share mixes cheap and expensive codecs; the seed depends only on the count, so --resume keeps the order."""
     regular = [s for s in serializers if not isinstance(s, utils.EBCC)]
     total = len(compressors) * len(filters) * len(regular)
     config_space = [(c, f, s) for c, f, s in itertools.product(compressors, filters, regular)
@@ -952,7 +902,7 @@ def sweep_config_space(compressors, filters, serializers, max_evals, rank, dtype
 
 
 def config_space_table(config_space) -> pd.DataFrame:
-    """One row per planned combo: labels and the pipeline JSON."""
+    """config_space_{var}.csv: labels and pipeline JSON of every planned combo."""
     return pd.DataFrame([{"name": utils.pipeline_name(*cfg), "compressor": utils.codec_label(cfg[0]),
                           "filter": utils.codec_label(cfg[1]), "serializer": utils.codec_label(cfg[2]),
                           "pipeline": utils.pipeline_json(*cfg)} for cfg in config_space])
@@ -984,8 +934,7 @@ def sweep_banner(var, spaces, config_space, n_pending, sample_np, opts, sweep: S
 
 
 def sweep_evaluators(var, sample_np, sample_da, q99_abs, opts, sweep: SweepContext):
-    """Closures for one variable: evaluate_one(cfg) -> result dict and
-    gate(errors) -> (keep, reasons)."""
+    """(evaluate_one(cfg) -> result dict, gate(errors) -> (keep, reasons)) for one variable."""
     grad_axes = tuple(range(1, sample_np.ndim)) if sample_np.ndim > 1 else (0,)
     eval_chunks = utils.compute_chunk_shape_for_eval(sample_np.shape, sample_np.dtype, target_mib=opts.inner_chunk_mib,
                                                      dims=sample_da.dims, allow_spatial_split=opts.spatial_split)
@@ -1016,8 +965,7 @@ def sweep_evaluators(var, sample_np, sample_da, q99_abs, opts, sweep: SweepConte
 
 
 def drop_partial_last_line(path) -> None:
-    """Cut a last line without newline (a row the previous run was writing
-    when it died), so appended rows start on a fresh line."""
+    """Cut a half-written last row (no newline) of a killed run, so appended rows start on a fresh line."""
     with open(path, "rb+") as fh:
         data = fh.read()
         if data and not data.endswith(b"\n"):
@@ -1034,11 +982,11 @@ PARTIAL_CSV_COLUMNS = [
 
 
 def node_counter(sweep: SweepContext):
-    """claim() -> 0, 1, 2, ... across the ranks of this node, each value once:
-    an atomic fetch-and-add on a counter in the node's shared memory, which
-    waits on no other process.  Returns (claim, win); free win collectively."""
-    # Without this hint MPICH routes the atomics through the counter's owner,
-    # which answers only when it next calls MPI: every claim would wait for a combo.
+    """Collective over the node.  Returns (claim, win): claim() hands out 0, 1, 2, ... across the node's
+    ranks, each once, by an atomic fetch-and-add in shared memory that waits on no other process.  win is
+    inside a Lock_all epoch: the caller calls win.Unlock_all(), then win.Free() collectively."""
+    # Without this hint MPICH routes the atomics through the counter's owner, which answers only on its next
+    # MPI call: a claim would wait until the owner finished its combo.
     info = MPI.Info.Create()
     info.Set("disable_shm_accumulate", "false")
     win = MPI.Win.Allocate_shared(8 if sweep.local_rank == 0 else 0, 8, info=info, comm=sweep.node_comm)
@@ -1059,11 +1007,9 @@ def node_counter(sweep: SweepContext):
 
 
 def sweep_run_rank(config_space, pending, var, opts, sweep: SweepContext, evaluate_one, gate) -> list:
-    """Evaluate combos of this node's share of `pending` (indices into
-    config_space) as the node's counter hands them out, streaming every result
-    to config_space_{var}_rank{rank}.csv (and failures to failures_...csv).
-    The verdict columns hold the gates of the run that evaluated the row; the
-    consolidation re-gates.  Returns the failures."""
+    """Collective over the node.  Evaluate this node's share of `pending` (every n_nodes-th, from node_id),
+    one combo per claim, streaming rows and failures to config_space_/failures_{var}_rank{rank}.csv with
+    this run's verdicts (sweep_select_best re-gates).  Returns this rank's (name, pipeline JSON, error) failures."""
     rank = sweep.rank
     partial_path = Path(opts.where_to_write) / f"config_space_{var}_rank{rank}.csv"
     failures_path = Path(opts.where_to_write) / f"failures_{var}_rank{rank}.csv"
@@ -1113,8 +1059,7 @@ def sweep_run_rank(config_space, pending, var, opts, sweep: SweepContext, evalua
 
 
 def sweep_report_failures(failures, var, sweep: SweepContext) -> int:
-    """Gather a few failures per rank onto rank 0 and print them.  Returns the
-    total failure count (rank 0) or None."""
+    """Collective.  Rank 0 prints a few failures per rank and returns the total; None elsewhere."""
     gathered = sweep.comm.gather(failures[:5], root=0)
     total = sweep.comm.reduce(len(failures), op=MPI.SUM, root=0)
     if sweep.rank == 0 and total:
@@ -1131,7 +1076,7 @@ def sweep_report_failures(failures, var, sweep: SweepContext) -> int:
     return total
 
 
-_METRIC_COLUMNS = {  # CSV column -> key of the errors dict the gates read
+_METRIC_COLUMNS = {
     "l1_rel": "Relative_Error_L1", "l2_rel": "Relative_Error_L2", "linf_rel": "Relative_Error_Linf",
     "bias_rel": "Bias_Rel", "q99_rel": "Q99_Rel", "grad_rel": "Grad_Rel",
     "decoded_min": "Decoded_Min", "decoded_max": "Decoded_Max", "n_corrupt": "N_Corrupt",
@@ -1139,9 +1084,7 @@ _METRIC_COLUMNS = {  # CSV column -> key of the errors dict the gates read
 
 
 def regate(df: pd.DataFrame, gate) -> pd.DataFrame:
-    """Recompute the pass_* and keep columns from the recorded metrics with
-    the current gates (rows resumed from an earlier run may carry verdicts of
-    other thresholds)."""
+    """Recompute pass_* and keep with the current gates (resumed rows may carry other thresholds' verdicts)."""
     verdict_columns = [c for c in PARTIAL_CSV_COLUMNS if c.startswith("pass_") or c == "keep"]
     verdicts = []
     for row in df[list(_METRIC_COLUMNS)].itertuples(index=False):
@@ -1154,15 +1097,11 @@ def regate(df: pd.DataFrame, gate) -> pd.DataFrame:
 
 
 def sweep_select_best(where_to_write, var, gate, planned: set):
-    """Consolidate the per-rank CSVs into results_{var}.parquet, restricted to
-    the pipelines of this sweep (`planned`, the JSON keys) and re-gated with
-    the current thresholds, and pick the kept combo with the best ratio FROM
-    DISK (so --resume of a finished field still finds it; ties go to the
-    smaller L1 error, then to the pipeline key).  Returns
-    (best, n_passed, parquet_path); best is a dict with name, pipeline, ratio,
-    l1_rel, eucd, or None."""
+    """Consolidate the per-rank CSVs into results_{var}.parquet, keeping the `planned` pipelines, re-gated,
+    and pick the kept combo with the best ratio (ties: lower L1, then pipeline) FROM DISK, so --resume of a
+    finished field still finds it.  Returns (best {name, pipeline, ratio, l1_rel, eucd} or None, n_passed, path)."""
     consolidated = read_rank_csvs(where_to_write, var)
-    # a combo re-evaluated for a metric a newly enabled gate needs has several rows on the same sample
+    # A combo re-evaluated for a metric its row lacked has several rows; last() merges their non-null values.
     consolidated = consolidated.groupby("pipeline", as_index=False, sort=False).last()
     stale = ~consolidated["pipeline"].isin(planned)
     if stale.any():
@@ -1216,8 +1155,7 @@ def sweep_manifest(var, opts, sweep: SweepContext, *, num_combos, n_passed, tota
 
 
 def sweep_variable(da, var: str, opts, sweep: SweepContext, n_vars: int) -> None:
-    """Sweep one field: sample -> codec space -> this rank's share -> gather
-    -> results, winner and manifest on rank 0."""
+    """Collective: sweep one field; rank 0 writes its results, winner and manifest."""
     rank = sweep.rank
     t0 = time.perf_counter()
     if rank == 0:
@@ -1226,13 +1164,14 @@ def sweep_variable(da, var: str, opts, sweep: SweepContext, n_vars: int) -> None
     limit = sweep_sample_limit(var, int(da.nbytes), opts, sweep)
     sample_np, sample_da, fso_range, win = sweep_build_sample(da, limit, opts, sweep)
     _sweep_variable_body(da, var, opts, sweep, n_vars, t0, sample_np, sample_da, fso_range)
-    # Free is collective, so it runs only once the variable completed: after an
-    # error, the exception must reach the abort hook rather than wait here.
+    # Free is collective: after an error the exception must reach the abort hook rather than wait here.
     del sample_np, sample_da
     win.Free()
 
 
 def _sweep_variable_body(da, var, opts, sweep: SweepContext, n_vars, t0, sample_np, sample_da, fso_range):
+    # Collective, like sweep_variable: every rank runs it, and an early return must be identical on every rank;
+    # sets opts.phys_slack.
     rank = sweep.rank
     span = float(fso_range[1] - fso_range[0]) if fso_range else 0.0
     opts.phys_slack = float(getattr(opts, "phys_tolerance", 0.0) or 0.0) * span   # absolute; the manifest carries it
@@ -1245,9 +1184,9 @@ def _sweep_variable_body(da, var, opts, sweep: SweepContext, n_vars, t0, sample_
     try:
         chunks = [utils.compute_chunk_shape_for_eval(shape, sample_np.dtype, target_mib=opts.inner_chunk_mib,
                                                       dims=sample_da.dims, allow_spatial_split=opts.spatial_split)
-                  for shape in (sample_np.shape, da.shape)]   # the sample's chunk and the store's
+                  for shape in (sample_np.shape, da.shape)]
         spaces = codec_spaces(sample_da, space_args(opts), fso_range, chunk_shapes=chunks)
-    except click.ClickException as e:  # a class this field's dtype does not support; identical on every rank
+    except click.ClickException as e:  # a class with nothing for this field (dtype, frame, range); same on all ranks
         if opts.field_to_compress is not None:
             raise
         if rank == 0:
@@ -1257,7 +1196,7 @@ def _sweep_variable_body(da, var, opts, sweep: SweepContext, n_vars, t0, sample_
     if opts.with_ebcc and rank == 0:
         tile, reason = utils.ebcc_tile(sample_da)
         click.echo(f"[ebcc] {var}: " + (f"tile {tile[0]}x{tile[1]}" if tile else f"not applicable ({reason})"))
-    all_finite = True  # EBCC cannot encode NaN/Inf; rank 0 checks the sample for every rank
+    all_finite = True
     if any(isinstance(s, utils.EBCC) for s in spaces[2]):
         all_finite = sweep.comm.bcast(bool(np.isfinite(sample_np).all()) if rank == 0 else None, root=0)
     config_space = sweep_config_space(*spaces, opts.max_evals, rank, sample_np.dtype, all_finite)
@@ -1298,13 +1237,10 @@ def _sweep_variable_body(da, var, opts, sweep: SweepContext, n_vars, t0, sample_
 # =============================================================================
 
 def compress_candidates(opts):
-    """(candidates, manifests, dropped): what to write, one candidate per
-    variable as {var, name, pipeline, ratio, source}.  With --pipeline every
-    --vars field gets that pipeline; otherwise the best of manifest_{var}.json,
-    falling back to the best kept row of results_{var}.parquet (with
-    --stock-codecs-only, the best row a bare zarr client can decode).  `manifests`
-    holds every readable manifest (thresholds and geometry); `dropped` maps
-    the fields that have no usable pipeline to the reason."""
+    """(candidates, manifests, dropped).  One candidate {var, name, pipeline, ratio, source} per field: with
+    --pipeline, that pipeline for every --vars field; else the manifest best, falling back to the best kept
+    row of results_{var}.parquet (with --stock-codecs-only, the best a bare zarr client can decode).
+    `manifests` holds every readable manifest; `dropped` maps each field without a usable pipeline to why."""
     wtw = Path(opts.where_to_write)
     wanted = {v.strip() for v in opts.vars_filter.split(",") if v.strip()} if opts.vars_filter else None
     manifests, sweep_env = {}, None
@@ -1340,7 +1276,7 @@ def compress_candidates(opts):
             elif not stock or utils.pipeline_is_stock(best["pipeline"]):
                 candidates.append({"var": var, "name": best.get("name", "?"), "pipeline": best["pipeline"],
                                    "ratio": best.get("ratio"), "source": f"manifest_{var}.json"})
-            else:  # the winner needs dc_toolkit to be read: the parquet's best stock row instead
+            else:
                 deferred[var] = best.get("name", "?")
                 click.echo(f"[compress] {var}: the manifest best {best.get('name', '?')} needs dc_toolkit's codec entry "
                            f"point to be read; --stock-codecs-only takes the best stock row of the parquet.")
@@ -1373,12 +1309,8 @@ def compress_candidates(opts):
 
 
 def compress_one(da, var: str, cand: dict, manifest, merged_path: str, opts) -> dict:
-    """Persist one field with its candidate pipeline and run the verify and
-    CR-drift gates.  The field is written into the staging store next to the
-    shared one and renamed into place only after the gates passed, so a failed
-    or interrupted write never counts as done and never replaces an earlier
-    good array.  Returns the entry for batch_manifest.json; gate failures
-    raise RuntimeError."""
+    """Persist one field and promote it into the merged store only if the verify and CR-drift gates pass
+    (else RuntimeError; an existing array stays).  Returns the batch_manifest.json entry."""
     combo = pipeline_codecs(cand["pipeline"], var)
     validate_pipeline(combo, da, var)
     geometry, sources = chunk_geometry(opts, manifest)
@@ -1432,8 +1364,7 @@ def compress_one(da, var: str, cand: dict, manifest, merged_path: str, opts) -> 
 # =============================================================================
 
 def nc_to_zarr(opts) -> None:
-    """NetCDF -> UNCOMPRESSED zarr v3 store (no filters, compressors or
-    sharding; coordinates included), for filesystem-dedup experiments."""
+    """NetCDF -> UNCOMPRESSED zarr v3 store (no filters, compressors, sharding), for filesystem-dedup experiments."""
     if Path(opts.nc_path).suffix.lower() != ".nc":
         raise click.ClickException(f"Expected a .nc file, got {opts.nc_path}.  "
                                    f"Use from_zarr_to_netcdf for the reverse direction.")
@@ -1471,8 +1402,7 @@ def zarr_to_netcdf(opts) -> None:
     check_thread_count(threads)
 
     with dask.config.set(scheduler="threads", num_workers=threads):
-        # consolidated=False: a listing made stale by a later --no-consolidate write would silently
-        # drop fields (or describe them with the wrong codecs).
+        # consolidated=False: a listing a later --no-consolidate write made stale would drop or misdescribe fields
         ds = xr.open_zarr(opts.zarr_path, chunks="auto", consolidated=False)
         logical_bytes = int(ds.nbytes)
         click.echo(f"[zarr->nc] logical size = {hsize(logical_bytes)} | dask workers = {threads}")
@@ -1495,26 +1425,21 @@ def zarr_to_netcdf(opts) -> None:
 # =============================================================================
 # 8. ANALYSIS & PLOTTING
 # =============================================================================
-# results_{var}.parquet has one row per evaluated combo (PARTIAL_CSV_COLUMNS);
-# `keep` marks the rows that passed every gate.  matplotlib / sklearn / plotly
-# / tqdm are imported inside these functions so the sweep and compress
-# commands do not pay for them.
+# matplotlib, plotly, sklearn and tqdm are imported inside these functions: the sweep and compress do not load them.
 
 L_ERRORS = ("L1", "L2", "LInf")
 _L_ERROR_COLUMNS = {"L1": "l1_rel", "L2": "l2_rel", "LInf": "linf_rel"}
 
 
 def kept_rows(df: pd.DataFrame) -> pd.DataFrame:
-    """The rows that passed every gate (the `keep` column survives CSV and
-    parquet round trips as bool or string)."""
+    """Rows that passed every gate (`keep` round-trips through CSV and parquet as bool or string)."""
     if "keep" not in df.columns:
         return df
     return df[df["keep"].astype(str).str.strip().str.lower().isin(("true", "1"))]
 
 
 def best_kept_row(df: pd.DataFrame, stock_only: bool = False):
-    """The kept row with the best ratio (ties: lower L1, then pipeline JSON), or
-    None; `stock_only` keeps to pipelines a bare zarr client can decode."""
+    """Best-ratio kept row (ties: lower L1, then pipeline), or None; `stock_only`: stock codecs only."""
     kept = kept_rows(df)
     if stock_only:
         kept = kept[kept["pipeline"].map(lambda p: utils.pipeline_is_stock(json.loads(p)))]
@@ -1557,8 +1482,7 @@ def elbow_silhouette_plot(df: pd.DataFrame, l_error: str) -> None:
 
 
 def clustering_figure(df: pd.DataFrame):
-    """Interactive KMeans scatter plots of L1 / L2 / LInf vs compression ratio
-    (hover shows the pipeline)."""
+    """Interactive KMeans scatter plots of L1 / L2 / LInf vs ratio; hover shows the pipeline."""
     from sklearn.cluster import KMeans
     import plotly.express as px
     import plotly.graph_objects as go
@@ -1592,8 +1516,7 @@ def clustering_figure(df: pd.DataFrame):
 
 
 def plot_pipeline(field: str, pipeline_arg, manifest_dir: str):
-    """The (compressor, filt, serializer) to plot: --pipeline, else the best of
-    manifest_{field}.json in `manifest_dir`."""
+    """(compressor, filt, serializer) to plot: --pipeline, else the best of manifest_{field}.json."""
     if pipeline_arg is not None:
         return pipeline_codecs(parse_pipeline_arg(pipeline_arg), "--pipeline")
     manifest = read_json(Path(manifest_dir) / f"manifest_{field}.json", "plot")
@@ -1605,9 +1528,8 @@ def plot_pipeline(field: str, pipeline_arg, manifest_dir: str):
 
 
 def error_plot_panels(da, field: str, combo):
-    """Round-trip a (lat, lon) field and its 180-degree-rolled copy through
-    `combo`.  Returns (da, panels): `da` re-cast to float32 when the serializer
-    is EBCC, and the nine (title, data, cmap) panels of the error plot."""
+    """Round-trip a (lat, lon) field and its 180-degree-rolled copy through `combo`.  Returns (da, panels):
+    `da` cast to float32 when the serializer is EBCC, and the nine (title, data, cmap) panels."""
     compressor, filt, serializer = combo
     chunks = "auto"
     if isinstance(serializer, utils.EBCC):  # validate_pipeline already checked dtype/tile/finite
@@ -1659,8 +1581,7 @@ def save_error_plot(field: str, da, panels, path: str) -> None:
 # =============================================================================
 # 9. UI SUPPORT
 # =============================================================================
-# Shared by the streamlit and Qt front-ends: the commands they launch and the
-# results they show.  Class names are those utils._select_classes accepts.
+# Class names are those utils._select_classes accepts.
 
 UI_CLASS_OPTIONS = {  # "astype" is left out: it exists for float64 fields only (EBCC brings its own cast)
     "compressor": ["all", "blosc", "lz4", "zstd", "zlib", "bz2", "lzma", "none"],
@@ -1672,8 +1593,7 @@ UI_DEFAULT_L1 = 0.005
 
 def ui_launcher(user_account=None, time=None, nodes=None, ntasks_per_node=None, uenv_image=None,
                 partition=None) -> list:
-    """Command prefix: srun with the allocation when a vcluster account is
-    given, else nothing."""
+    """srun prefix when a vcluster account is given, else [].  Without uenv_image srun keeps the session's uenv."""
     if not user_account:
         return []
     cmd = ["srun", "-A", user_account, "--time", time or "00:15:00", "--nodes", nodes or "1",
@@ -1682,17 +1602,14 @@ def ui_launcher(user_account=None, time=None, nodes=None, ntasks_per_node=None, 
 
 
 def ui_env() -> dict:
-    """Environment for the launched commands: the codec thread pools pinned
-    to 1, as the oversubscription check demands, and Open MPI allowed to run
-    as root (a container)."""
+    """os.environ with the codec thread pools at 1 (the oversubscription check) and Open MPI allowed as root."""
     return {**os.environ, **{v: "1" for v in utils.THREAD_ENV_VARS},
             "OMPI_ALLOW_RUN_AS_ROOT": "1", "OMPI_ALLOW_RUN_AS_ROOT_CONFIRM": "1"}
 
 
 def ui_mpirun() -> list:
-    """mpirun with one rank per physical core when an MPI launcher is on the
-    PATH, else nothing (one rank): a sweep's parallelism comes from its ranks,
-    and Open MPI refuses more ranks than cores."""
+    """mpirun with one rank per physical core if a launcher is on PATH, else [] (one rank): a sweep's
+    parallelism comes from its ranks, and Open MPI refuses more ranks than cores."""
     launcher = shutil.which("mpirun") or shutil.which("mpiexec")
     return [launcher, "-n", str(utils.detect_physical_cores())] if launcher else []
 
