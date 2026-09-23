@@ -1,17 +1,12 @@
-"""
-Desktop (Qt) UI: open a netCDF file, sweep the codec space on one field
-(one local MPI rank), inspect the results in the browser, write the field
-with a chosen pipeline and save the store as a zip.  Launched by
-`dc_toolkit run_local_ui`.
-"""
+"""Desktop (Qt) UI launched by `dc_toolkit run_local_ui`: open a netCDF file, sweep the codec space on
+one field, inspect the results in the browser, write the field with a chosen pipeline, save the store as a zip."""
 import json
 import os
 import shutil
 import subprocess
 import sys
 
-# PyQt6 is not a declared dependency (it does not build everywhere); install
-# a wheel on first use.
+# PyQt6 is not a declared dependency (it does not build everywhere); pip fetches a wheel if missing.
 subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet", "PyQt6", "--only-binary", ":all:"])
 
 import xarray as xr  # noqa: E402
@@ -26,7 +21,7 @@ OUT_DIR = "out"
 
 
 class CommandThread(QThread):
-    """Run a command in the background, streaming its output lines."""
+    """Run a command in the background: `line` carries each output line, `done` the exit status."""
     line = pyqtSignal(str)
     done = pyqtSignal(int)
 
@@ -45,6 +40,7 @@ class CommandThread(QThread):
 class ScientificSpinBox(QDoubleSpinBox):
     def __init__(self):
         super().__init__(None)
+        # A decimal point '.', as float() reads it, whatever the system locale.
         self.setLocale(QLocale(QLocale.Language.English, QLocale.Country.UnitedStates))
         self.setDecimals(10)
         self.setRange(1e-10, 1.0)
@@ -75,7 +71,7 @@ class CompressionAnalysisUI(QMainWindow):
         self.setWindowTitle("Evaluate and compress netCDF fields")
         self.dataset_path = None
         self.results = None
-        self.swept_field = None  # the field the pipeline list belongs to
+        self.swept_field = None
         self.thread = None
         self.launcher = utils_cli.ui_launcher()
 
@@ -128,7 +124,7 @@ class CompressionAnalysisUI(QMainWindow):
         layout.addWidget(self.compress_button)
 
     def forget_results(self, *_):
-        """Another field or file: the pipeline list no longer applies."""
+        """Drop the results and the pipeline list, which belong to one field of one file."""
         self.swept_field = self.results = None
         self.pipeline_box.clear()
         self.compress_button.setEnabled(False)
@@ -143,7 +139,7 @@ class CompressionAnalysisUI(QMainWindow):
         path, _ = QFileDialog.getOpenFileName(self, "Open netCDF file", "", "NetCDF files (*.nc)")
         if not path:
             return
-        try:  # an unreadable file must not take the window down
+        try:  # an exception left unhandled in a slot aborts a PyQt6 app
             with xr.open_dataset(path) as ds:
                 variables = list(ds.data_vars)
         except Exception as e:

@@ -1,18 +1,12 @@
-"""
-Library behind the ``dc_toolkit`` CLI.
-
-Sections
+"""Library behind the ``dc_toolkit`` CLI.  Sections:
   1. Sizes & dataset I/O
   2. Representative sampling      (which slices of a big field to score)
   3. Chunk & shard sizing         (zarr geometry, shared by eval and persist)
-  4. Codec spaces & pipelines     (compressor x filter x serializer grids; EBCC optional;
-                                   a pipeline's JSON form is its identity in results and manifests)
-  5. Zarr sync bypass             (per-thread event loops for the sweep)
-  6. In-memory evaluation         (encode -> decode -> error metrics)
-  7. Persistence                  (dask -> zarr LocalStore, optional verify)
-  8. MPI, threads & topology
-  9. Progress & timing
-"""
+  4. Codec spaces & pipelines     (compressor x filter x serializer grids, EBCC optional)
+  5. In-memory evaluation         (encode -> decode -> error metrics)
+  6. Persistence                  (dask -> zarr LocalStore, optional verify)
+  7. MPI & topology
+  8. Progress & timing"""
 import asyncio
 import atexit
 import importlib
@@ -22,11 +16,9 @@ import os
 import re
 import struct
 import sys
-import threading
 import time
 import warnings
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor
 from itertools import product
 from pathlib import Path
 from typing import Optional, Tuple
@@ -36,18 +28,18 @@ import dask
 import dask.array
 import humanize
 import numpy as np
+import psutil
 import xarray as xr
 import zarr
 import numcodecs
 import numcodecs.zfpy
 import zfpy
 from mpi4py import MPI
-from zarr.api.asynchronous import create_array as _zarr_async_create_array
+from zarr.core.sync import sync as _zarr_sync
 from zarr.codecs import numcodecs as zarrcodecs_nc
 from zarr.codecs.numcodecs._codecs import _NumcodecsArrayBytesCodec
 from zarr.registry import get_codec_class, register_codec
 
-# EBCC (Error Bounded Climate Compressor) is optional: pip install -e ".[ebcc]".
 os.environ.setdefault("EBCC_LOG_LEVEL", "4")  # the C library logs to stderr; 4 = errors only
 try:
     importlib.import_module("ebcc.zarr_filter")  # registers "ebcc_filter" with numcodecs
@@ -73,15 +65,14 @@ class SampleTooLargeError(Exception):
         self.spatial_dims = spatial_dims
 
 
-# Codec-internal thread pools that must be pinned to 1 under thread-per-combo
-# parallelism (see check_thread_oversubscription).
+# Codec-internal thread counts; check_thread_oversubscription requires 1, since a sweep rank or a
+# compress dask thread owns a core.
 THREAD_ENV_VARS = (
     "OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS",
     "BLOSC_NTHREADS", "NUMBA_NUM_THREADS",
     "VECLIB_MAXIMUM_THREADS", "OMP_THREAD_LIMIT",
 )
-# Environment variables the EBCC C library reads at encode time; they change
-# the bytes it produces, so the sweep manifest records them.
+# Read by the EBCC C library at encode time; they change its output, so the manifest records them.
 EBCC_ENV_VARS = (
     "EBCC_INIT_BASE_ERROR_QUANTILE", "EBCC_ERROR_BOUND_SLACK", "EBCC_DISABLE_MEAN_ADJUSTMENT",
     "EBCC_DISABLE_PURE_BASE_COMPRESSION_FALLBACK",
@@ -90,8 +81,7 @@ EBCC_ENV_VARS = (
 
 
 def abort(code: int = 1) -> None:
-    """Exit the whole job: MPI Abort under multi-rank (sys.exit on one rank
-    would leave the others hanging at the next collective), sys.exit otherwise."""
+    """Exit the job: MPI Abort when multi-rank (a lone sys.exit would hang the others), else sys.exit."""
     if MPI.COMM_WORLD.Get_size() > 1:
         MPI.COMM_WORLD.Abort(code)
     sys.exit(code)
@@ -125,15 +115,13 @@ def hsize(nbytes) -> str:
 
 
 def open_zarr_localstore(path: str, read_only: bool = True):
-    """Open a zarr v3 LocalStore; returns (group, store).  Keep both alive.
-    Reads the arrays' own metadata, so a store whose consolidated metadata is
-    stale (arrays added since) is listed correctly."""
+    """(group, store) of a zarr v3 LocalStore; keep both alive.  Skips (possibly stale) consolidated metadata."""
     store = zarr.storage.LocalStore(path, read_only=read_only)
     return zarr.open_group(store, mode="r" if read_only else "a", use_consolidated=False), store
 
 
 def open_dataset(dataset_file: str, field_to_compress: Optional[str] = None, rank: int = 0):
-    """Lazily open a .nc / .grib / .zarr dataset with a dask backend."""
+    """Lazy dask-backed .nc / .grib / .zarr dataset; aborts on another suffix or a missing field."""
     suffix = Path(dataset_file).suffix.lower()
     if suffix == ".nc":
         ds = xr.open_dataset(dataset_file, chunks="auto")
@@ -169,10 +157,7 @@ def is_lat_lon(da) -> bool:
 # =============================================================================
 # 2. REPRESENTATIVE SAMPLING
 # =============================================================================
-# A field larger than the sample budget is thinned along its time-like and
-# vertical-like dims only; horizontal dims are kept whole so codecs see the
-# real spatial structure.  Dim classification uses CF metadata first and a
-# name heuristic as fallback.
+# Horizontal dims are never thinned, so codecs see the real spatial structure.
 
 _TIME_LIKE_DIM_RE = re.compile(
     r"^(?:time|.*_time|t|step|forecast_reference_time|forecast_period|"
@@ -195,8 +180,7 @@ _VERTICAL_DIM_NAMES = {
 
 
 def _coord_meta(da: xr.DataArray, dim: str) -> dict:
-    """attrs + encoding of the coord backing `dim` (xarray moves decoded CF
-    attrs into .encoding, so both must be checked); {} if no coord."""
+    """attrs + encoding of `dim`'s coord ({} if none): xarray moves decoded CF attrs to .encoding."""
     coord = da.coords.get(dim)
     return {} if coord is None else {**dict(coord.attrs), **dict(coord.encoding)}
 
@@ -232,7 +216,7 @@ def _is_vertical_like_coord(da: xr.DataArray, dim: str) -> bool:
 
 
 def _classify_sample_dims(da: xr.DataArray):
-    """Return (time_dims, vertical_dims, spatial_dims) as lists of (pos, name)."""
+    """(time_dims, vertical_dims, spatial_dims) as lists of (pos, name), by CF metadata, then by name."""
     time_dims, vertical_dims, spatial_dims = [], [], []
     for i, name in enumerate(da.dims):
         if _is_time_like_coord(da, name):
@@ -247,17 +231,10 @@ def _classify_sample_dims(da: xr.DataArray):
 def build_representative_sample(da: xr.DataArray, size_limit_bytes: int, rank: int = 0,
                                 policy: str = "cascade",
                                 vertical_floor: int | None = None) -> xr.DataArray:
-    """
-    Subset of `da` with nbytes <= size_limit_bytes, deterministic and
-    reproducible (evenly spaced indices along time/vertical dims).  A field
-    without time/vertical dims is returned whole, with a warning, even above
-    the budget.
-
-    policy="cascade": spend the budget on time steps first, keeping a
-    budget-aware minimum of vertical levels.  policy="balanced": equal
-    log-space split across all stride dims.  Raises SampleTooLargeError when
-    a single horizontal slab does not fit.
-    """
+    """Deterministic subset of `da` within `size_limit_bytes`: evenly spaced indices along time/
+    vertical dims (without any, the whole field and a warning).  "cascade" spends the budget on
+    time steps first above a budget-aware floor of levels, "balanced" splits it evenly in log
+    space.  Raises SampleTooLargeError when one horizontal slab does not fit."""
     nbytes = int(da.nbytes)
     if nbytes <= size_limit_bytes:
         if rank == 0:
@@ -280,7 +257,7 @@ def build_representative_sample(da: xr.DataArray, size_limit_bytes: int, rank: i
         spatial_names = [d for _, d in spatial_dims]
         msg = (f"variable '{da.name}': one horizontal slab is {hsize(irreducible_bytes)} "
                f"(spatial dims {spatial_names}), above the {hsize(size_limit_bytes)} budget.  "
-               f"Remedies: raise --eval-data-size-limit, reduce --threads-per-rank, "
+               f"Remedies: raise --eval-data-size-limit, start fewer ranks per node, "
                f"or request more RAM (#SBATCH --mem=0).")
         if rank == 0:
             click.echo(f"[sample] FATAL: {msg}")
@@ -354,8 +331,7 @@ def _allocate_stride_plan(da, time_dims, vertical_dims, max_product,
 # =============================================================================
 
 def _shrink_order(shape, dims) -> list:
-    """Axes (excluding 0) in shrink order: horizontal dims first, vertical last,
-    fastest-varying first within each group (hiopy convention)."""
+    """Non-leading axes in shrink order: horizontal, then vertical, fastest first (hiopy convention)."""
     ndim = len(shape)
     if ndim <= 1:
         return []
@@ -370,8 +346,7 @@ def _shrink_order(shape, dims) -> list:
 
 def _compute_inner_chunk_shape(shape, dtype, dims, target_bytes: int,
                                allow_spatial_split: bool = True) -> Tuple[int, ...]:
-    """Pack leading slices up to target_bytes; if one slice is already too
-    big, keep 1 leading index and (optionally) shrink spatial dims."""
+    """Pack leading slices up to target_bytes; an oversized slice keeps 1 index and may shrink spatially."""
     itemsize = int(np.dtype(dtype).itemsize)
     shape = tuple(int(s) for s in shape)
     if not shape:
@@ -405,10 +380,8 @@ def compute_chunk_shape_for_eval(shape, dtype, target_mib: int = 16, dims=None,
 
 def compute_chunk_and_shard_shape(shape, dtype, inner_mib: int = 16, shard_mib: int = 512,
                                   dims=None, allow_spatial_split: bool = True, inner_chunks=None):
-    """(inner_chunk_shape, shard_shape).  shard_shape is None when a shard
-    would hold fewer than two inner chunks: the chunk is at least half the
-    shard target, or the leading axis has fewer than two chunks.
-    `inner_chunks` forces the inner chunk shape (codecs with a fixed frame)."""
+    """(inner_chunk_shape, shard_shape), shard_shape None when a shard would hold fewer than two
+    inner chunks.  `inner_chunks` forces the inner chunk shape (codecs with a fixed frame)."""
     itemsize = int(np.dtype(dtype).itemsize)
     if inner_chunks is not None:
         inner = tuple(int(x) for x in inner_chunks)
@@ -431,12 +404,9 @@ def compute_chunk_and_shard_shape(shape, dtype, inner_mib: int = 16, shard_mib: 
 # =============================================================================
 # 4. CODEC SPACES & PIPELINES
 # =============================================================================
-# The sweep builds three lists of codec objects from the grids below (some
-# parameters depend on the field's dtype and value range).  A combination is
-# identified everywhere by its pipeline dict, the zarr JSON form of its three
-# codecs (see pipeline_to_dict), never by its position in these lists.
+# Result rows, resume state and manifests identify a combination by its pipeline dict
+# (pipeline_to_dict), never by its position in the codec lists built from the grids below.
 
-# Compressors (bytes -> bytes)
 _BLOSC_CNAMES = ("lz4", "lz4hc", "zstd")
 _BLOSC_CLEVELS = (1, 5, 9)
 _BLOSC_SHUFFLES = (0, 1)
@@ -445,15 +415,13 @@ _ZSTD_LEVELS = (6, 12, 22)
 _ZLIB_LEVELS = (3, 6, 9)
 _BZ2_LEVELS = (3, 6, 9)
 _LZMA_PRESETS = (3, 6, 9)
-# Filters (array -> array); the top value of each grid is effectively lossless
+# The top value of each filter grid is effectively lossless.
 _BITROUND_KEEPBITS_F32 = (3, 7, 11, 13, 17, 23)
 _BITROUND_KEEPBITS_F64 = (3, 7, 11, 17, 23, 30, 37, 44, 52)
 _QUANTIZE_DIGITS_F32 = (1, 3, 4, 5, 6, 7)
 _QUANTIZE_DIGITS_F64 = (1, 3, 4, 5, 6, 7, 9, 11, 13, 15)
-# FixedScaleOffset targets.  uint8 excluded: PCodec refuses 8-bit input and
-# ZFPY rejects every FSO output (see combo_is_valid).
+# No uint8: PCodec refuses 8-bit input and ZFPY every FixedScaleOffset output (combo_is_valid).
 _FSO_TARGET_UINTS = ("uint16", "uint32")
-# Serializers (array -> bytes)
 _PCODEC_LEVELS = (6, 8, 10, 12)
 _PCODEC_DELTA_ORDERS = (0, 7)
 _ZFPY_K_GRID = (0, 1, 2, 3)  # rate/precision: 8/16/32/64 bits; accuracy: 0.5/0.25/0.0625/0.0039
@@ -479,12 +447,9 @@ def _select_classes(classes, requested: str, kind: str):
 
 
 def compressor_space(da, with_lossy=True, compressor_class="all"):
-    """Lossless bytes->bytes compressors (`with_lossy` is accepted for
-    signature symmetry only).  Byte shuffling is only available through Blosc's
-    own `shuffle` parameter (a standalone Shuffle codec breaks after a
-    compressing serializer); Blosc gets the field's item size as `typesize`
-    because zarr hands these codecs raw bytes, and shuffling single bytes is a
-    no-op."""
+    """Lossless bytes->bytes compressors (`with_lossy` is unused).  Byte shuffling comes only from
+    Blosc's `shuffle` (a standalone Shuffle breaks after a compressing serializer), with `typesize`
+    set to the item size: zarr passes these codecs raw bytes, and a 1-byte shuffle is a no-op."""
     classes, include_none = _select_classes(
         [zarrcodecs_nc.Blosc, zarrcodecs_nc.LZ4, zarrcodecs_nc.Zstd,
          zarrcodecs_nc.Zlib, zarrcodecs_nc.BZ2, zarrcodecs_nc.LZMA],
@@ -508,14 +473,13 @@ def compressor_space(da, with_lossy=True, compressor_class="all"):
 
 
 def filter_space(da, with_lossy=True, filter_class="all", data_range=None):
-    """Array->array filters.  Integer dtypes get Delta only.  `data_range`
-    must be the FULL field's (min, max) when `da` is a sample: FixedScaleOffset
-    does not clip, so out-of-range production values would corrupt silently."""
+    """Array->array filters; integer dtypes get Delta only.  FixedScaleOffset needs `data_range`, the
+    FULL field's (min, max).  Raises ValueError when the requested class has nothing for this field."""
     classes = [zarrcodecs_nc.Delta]
     if with_lossy:
         classes += [zarrcodecs_nc.BitRound, zarrcodecs_nc.Quantize, zarrcodecs_nc.FixedScaleOffset]
         if np.issubdtype(da.dtype, np.floating) and da.dtype.itemsize > 4:
-            classes.append(zarrcodecs_nc.AsType)  # f64 -> f32 down-cast
+            classes.append(zarrcodecs_nc.AsType)
     if da.dtype.kind in "iu":
         if filter_class.lower() not in ("all", "delta", "none"):
             if MPI.COMM_WORLD.Get_rank() == 0:
@@ -538,32 +502,31 @@ def filter_space(da, with_lossy=True, filter_class="all", data_range=None):
             space += [cls(**cfg) for cfg in fixed_scale_offset_configs(da, data_range=data_range)]
         elif cls is zarrcodecs_nc.AsType:
             space.append(cls(encode_dtype="float32", decode_dtype=str(da.dtype)))
+    if not space:
+        raise ValueError(f"--filter-class {filter_class} has nothing for this field"
+                         + (": FixedScaleOffset needs the full field's value range"
+                            if zarrcodecs_nc.FixedScaleOffset in classes else ""))
     return space
 
 
 # ---- ZFPY: two encoders, because neither rank wins --------------------------
-# zfp codes 4^d blocks, so the rank a chunk is encoded at decides which
-# correlations it can exploit.  The chunk's own rank keeps cross-axis gradients
-# inside a block and wins when the slower axes are correlated; 1-D gives them
-# up and wins when those axes carry little signal, since zfp then spends no
-# bits on noise and leaves the compressor after it more redundancy.  Neither
-# dominates, so the sweep carries both and each field picks its winner.  They
-# need distinct codec names because a pipeline's identity is its codecs' zarr
-# JSON (the resume key, the parquet pipeline column, the manifest's winner).
+# zfp codes 4^d blocks, so the rank a chunk is encoded at decides which correlations it uses:
+# the chunk's own rank keeps cross-axis gradients in a block and wins on correlated slower axes;
+# 1-D wins when those carry little signal (no bits spent on noise, more redundancy left for the
+# compressor).  The sweep carries both, under distinct names: a pipeline's identity is its JSON.
 
 
-# (Comments, not docstrings: zarr's wrapper replaces a codec class's docstring.)
-# ZFPYRank encodes each chunk at its own rank, folded only as far as zfp requires
-# (at most 4-D; per-axis header budget 2**24 at 2-D, 2**16 at 3-D, 2**12 at 4-D,
-# which DYAMOND's cell axis overflows): size-1 axes dropped, then the slowest pair
-# folded until the rank and every axis fit.  Its plain "zfpy" name decodes anywhere.
+# ZFPYRank encodes each chunk at its own rank, folded only as far as zfp requires (at most 4-D;
+# per-axis header budget 2**24 at 2-D, 2**16 at 3-D, 2**12 at 4-D, which DYAMOND's cell axis
+# overflows): size-1 axes dropped, then the slowest pair folded until everything fits.  Its
+# plain "zfpy" name decodes anywhere.  (Comments, not docstrings: zarr replaces codec docstrings.)
 class ZFPYRank(zarrcodecs_nc.ZFPY, codec_name="zfpy"):
     _ZFP_MAX_PER_AXIS = {1: 2**48, 2: 2**24, 3: 2**16, 4: 2**12}
 
     @classmethod
     def encode_shape(cls, shape) -> tuple:
         dims = tuple(d for d in shape if d > 1) or (1,)
-        max_rank = max(cls._ZFP_MAX_PER_AXIS)          # zfp stops at 4-D
+        max_rank = max(cls._ZFP_MAX_PER_AXIS)
         while len(dims) > 1 and (len(dims) > max_rank
                                  or any(d > cls._ZFP_MAX_PER_AXIS[len(dims)] for d in dims)):
             dims = (dims[0] * dims[1],) + dims[2:]     # C-order keeps the fold contiguous
@@ -576,8 +539,7 @@ class ZFPYRank(zarrcodecs_nc.ZFPY, codec_name="zfpy"):
 
 
 class _ZFPYFlatCodec(numcodecs.zfpy.ZFPY):
-    """zfpy under a second numcodecs id: zarr's numcodecs wrapper resolves
-    codec_name against the numcodecs registry."""
+    """zfpy under a second numcodecs id: zarr's wrapper resolves codec_name in that registry."""
 
     codec_id = "zfpy_flat"
 
@@ -597,18 +559,14 @@ register_codec("numcodecs.zfpy_flat", ZFPYFlat)   # in-process reads must not de
 
 
 # ---- EBCC (optional): JPEG 2000 base layer + error-bounded residual ----------
-# Compresses float32 (lat, lon) frames; each chunk must be exactly one tile of
-# the frame.  NaN/Inf or a tile that does not divide the frame make the C
-# library EXIT THE PROCESS, so callers validate before encoding (ebcc_tile,
-# ebcc_sweep_entries for the sweep, utils_cli.validate_pipeline for persist
-# and plots).
-# Maximum absolute error targets as fractions of the FULL field's value range
-# (the paper's 0.1 %..10 % band plus one decade below); EBCC's own floor is
-# range/65535 (uint16 base layer).
+# Compresses float32 (lat, lon) frames, each chunk exactly one tile.  NaN/Inf or a tile that
+# does not divide the frame make the C library EXIT THE PROCESS, so callers validate first
+# (ebcc_tile, ebcc_sweep_entries for the sweep, utils_cli.validate_pipeline for persist, plots).
+# Maximum absolute error targets as fractions of the FULL field's value range (the paper's
+# 0.1 %..10 % band plus one decade below); EBCC's own floor is range/65535 (uint16 base layer).
 _EBCC_ERROR_FRACTIONS = (1e-1, 3e-2, 1e-2, 3e-3, 1e-3, 3e-4, 1e-4)
-# Start of both EBCC rate-control searches (OpenJPEG rate = base_cr/2).  The
-# bisection bracket depends on it, so it shifts the achieved ratio by ~10 %; it
-# is part of the arglist, hence of the pipeline's identity.
+# Start of both rate-control searches (OpenJPEG rate = base_cr/2): it sets the bisection bracket,
+# so it shifts the achieved ratio by ~10 %, and it is part of the arglist, hence the pipeline's identity.
 _EBCC_BASE_CR = 2.0
 # EBCC_MIN/MAX_INTERNAL_IMAGE_DIM in ebcc_codec.h: the C filter exits outside them.
 _EBCC_TILE_MIN, _EBCC_TILE_MAX = 32, 2047
@@ -620,10 +578,9 @@ def _f32(bits) -> float:
 
 
 class EBCC(_NumcodecsArrayBytesCodec, codec_name="ebcc_filter"):
-    """zarr v3 wrapper of ebcc.zarr_filter.EBCCZarrFilter; stored in zarr.json
-    as "numcodecs.ebcc_filter" with EBCC's integer arglist
-    [height, width, f32bits(base_cr), mode, f32bits(target)] where mode is
-    0 none / 1 max_error_target / 2 relative_error_target."""
+    """zarr v3 wrapper of ebcc.zarr_filter.EBCCZarrFilter, "numcodecs.ebcc_filter" in zarr.json with
+    the integer arglist [height, width, f32bits(base_cr), mode, f32bits(target)]; mode 0 none (no
+    target), 1 max_error_target, 2 relative_error_target.  Source only: zarr replaces __doc__."""
 
     def __init__(self, **codec_config):
         if not EBCC_AVAILABLE:
@@ -681,8 +638,7 @@ def _ebcc_tile_size(n: int):
 
 
 def ebcc_tile(da):
-    """((height, width), "") of the EBCC tile for `da`, or (None, reason).
-    The last two dims must be a horizontal (lat, lon) frame of a float field."""
+    """((height, width), "") of the EBCC tile over a float field's last two (lat, lon) dims, or (None, why)."""
     if not EBCC_AVAILABLE:
         return None, "the ebcc package is not installed"
     if da.ndim < 2 or da.dtype.kind != "f":
@@ -703,38 +659,32 @@ def ebcc_chunks(codec: EBCC, shape) -> Tuple[int, ...]:
     return (1,) * (len(shape) - 2) + (codec.height, codec.width)
 
 
-def ebcc_sweep_entries(filters, serializers, sample_np):
-    """Standalone (None, filter, EBCC) sweep triples for every EBCC serializer;
-    the filter is None for float32 and the AsType cast to float32 otherwise
-    (EBCC's own requirement, so it is added even when --filter-class left
-    AsType out of `filters`).  Returns (triples, reason) with triples empty
-    when EBCC cannot run on this sample."""
+def ebcc_sweep_entries(filters, serializers, dtype, all_finite: bool):
+    """(triples, reason): one (None, filter, EBCC) triple per EBCC serializer, the filter None for
+    float32 and else the float32 AsType, which EBCC needs even when --filter-class left it out of
+    `filters`.  Empty, with a reason, when `all_finite` is False (EBCC cannot encode NaN/Inf)."""
     ebccs = [s for s in serializers if isinstance(s, EBCC)]
     if not ebccs:
         return [], ""
-    if not np.isfinite(sample_np).all():
+    if not all_finite:
         return [], "the sample contains NaN/Inf, which EBCC cannot encode"
-    filt = None
-    if sample_np.dtype != np.float32:
+    dtype, filt = np.dtype(dtype), None
+    if dtype != np.float32:
         astype = [f for f in filters if isinstance(f, zarrcodecs_nc.AsType)]
-        filt = astype[0] if astype else zarrcodecs_nc.AsType(encode_dtype="float32",
-                                                             decode_dtype=str(sample_np.dtype))
+        filt = astype[0] if astype else zarrcodecs_nc.AsType(encode_dtype="float32", decode_dtype=str(dtype))
     return [(None, filt, s) for s in ebccs], ""
 
 
 def serializer_space(da, with_lossy=True, serializer_class="all", with_ebcc=False, data_range=None,
                      chunk_shapes=None):
-    """Array->bytes serializers: plain bytes (with 'all' and 'none': a lossy
-    filter in front of a lossless byte compressor is the classic recipe, and
-    8-bit fields have nothing else, since pco refuses them), PCodec, ZFPY when
-    lossy is allowed
-    (floats only: zfp's fixed-rate mode is never exact on integers, and Delta,
-    their only filter, turns its error into a random walk on decode), EBCC when
-    requested AND lossy is allowed, for float (lat, lon) frame stacks.  `data_range` (full-field
-    min, max) scales the EBCC error targets; without it EBCC falls back to
-    targets relative to each tile's own range.  `chunk_shapes`: the chunks ZFPY
-    will meet (the sample's and the store's); ZFPYFlat is planned unless
-    ZFPYRank already encodes every one of them as 1-D."""
+    """Array->bytes serializers; plain bytes with 'all' and 'none' (lossy filter + lossless compressor
+    is the classic recipe, and all an 8-bit field gets: pco refuses those).  ZFPY needs `with_lossy`
+    and floats (fixed-rate zfp is never exact on integers, and Delta, their only filter, turns that
+    into a random walk on decode).  EBCC needs `with_ebcc` (or class 'ebcc'), `with_lossy` and float
+    (lat, lon) frames; `data_range` (full-field min, max) scales its error targets, else they are
+    relative to each tile.  ZFPYFlat is planned when `chunk_shapes` (the sample's and store's chunks)
+    is not given or ZFPYRank encodes one of them at 2-D or more.  Raises ValueError when the space is
+    empty."""
     if serializer_class.lower() == "ebcc":
         with_ebcc = True
     zfp_ok = da.dtype.kind == "f"
@@ -773,8 +723,9 @@ def serializer_space(da, with_lossy=True, serializer_class="all", with_ebcc=Fals
                           EBCC.from_params(*tile, r, mode="relative_error_target")
                           for r in _EBCC_ERROR_FRACTIONS]
     if da.dtype.itemsize == 1:
-        space = [None] + [s for s in space if s is not None and not isinstance(s, zarrcodecs_nc.PCodec)]
-    if not space:  # a named class with nothing for this field: the caller skips or refuses it
+        space = [s for s in space if not isinstance(s, zarrcodecs_nc.PCodec)]
+        why = why or "pcodec does not take 8-bit fields"
+    if not space:
         raise ValueError(f"--serializer-class {serializer_class} has nothing for this field" + (f": {why}" if why else ""))
     return space
 
@@ -795,43 +746,51 @@ def valid_digits_for_quantize(da):
     raise TypeError(f"Unsupported dtype '{da.dtype}'. Quantize only supports float32 and float64.")
 
 
-def full_field_data_range(da):
-    """Finite (min, max) over the whole (dask-backed) field, or None if the
-    field is constant / has no finite values."""
+def full_field_data_range(da, comm=None):
+    """Finite (min, max) over the whole field, or None if it is constant, has no finite value or
+    could not be read (with a warning).  Collective over `comm` when given: its ranks split the
+    blocks and all reach the reductions, a failed read included, so all return the same answer."""
     data = da.data if hasattr(da, "data") else np.asarray(da)
+    rank, size = (comm.Get_rank(), comm.Get_size()) if comm is not None else (0, 1)
+    dmin, dmax, failed = np.inf, -np.inf, 0
     try:
         if isinstance(data, dask.array.Array):
-            finite = dask.array.isfinite(data)
-            dmin = float(dask.array.where(finite, data, np.inf).min().compute())
-            dmax = float(dask.array.where(finite, data, -np.inf).max().compute())
+            blocks = list(data.blocks.ravel())[rank::size]
         else:
-            arr = np.asarray(data)
-            fin = arr[np.isfinite(arr)]
-            if fin.size == 0:
-                return None
-            dmin, dmax = float(fin.min()), float(fin.max())
-    except Exception:
-        return None
-    if not (np.isfinite(dmin) and np.isfinite(dmax)) or dmax <= dmin:
+            blocks = [data] if rank == 0 else []
+        for block in blocks:  # one block in memory at a time, reduced without a copy
+            x = np.asarray(block.compute() if isinstance(block, dask.array.Array) else block)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", RuntimeWarning)  # an all-NaN block
+                lo, hi = np.nanmin(x), np.nanmax(x)
+            if not (np.isfinite(lo) and np.isfinite(hi)):  # +-inf, or no finite value at all
+                x = x[np.isfinite(x)]
+                if not x.size:
+                    continue
+                lo, hi = x.min(), x.max()
+            dmin, dmax = min(dmin, float(lo)), max(dmax, float(hi))
+    except Exception as e:
+        failed = 1
+        click.echo(f"[range] WARNING rank {rank}: reading the field failed ({e!r})", err=True)
+    if comm is not None:
+        failed = comm.allreduce(failed, op=MPI.MAX)
+        dmin, dmax = comm.allreduce(dmin, op=MPI.MIN), comm.allreduce(dmax, op=MPI.MAX)
+    if failed and rank == 0:
+        click.echo("[range] WARNING: no full-field value range: FixedScaleOffset is left out, and EBCC and "
+                   "--phys-tolerance run without it.")
+    if failed or not (np.isfinite(dmin) and np.isfinite(dmax)) or dmax <= dmin:
         return None
     return (dmin, dmax)
 
 
 def fixed_scale_offset_configs(da, data_range=None):
-    """FixedScaleOffset kwargs mapping [min, max] onto each uint width in
-    _FSO_TARGET_UINTS narrower than the float.  Falls back to `da`'s own range
-    when data_range is None (only valid if `da` is the full field)."""
+    """FixedScaleOffset kwargs mapping `data_range`, the full field's [min, max], onto each uint in
+    _FSO_TARGET_UINTS narrower than the float.  Empty without a range: FixedScaleOffset does not
+    clip, so parameters from a sample would silently corrupt values outside the sample's range."""
     dtype = da.dtype
-    if not np.issubdtype(dtype, np.floating):
+    if not np.issubdtype(dtype, np.floating) or data_range is None:
         return []
-    if data_range is not None:
-        dmin, dmax = float(data_range[0]), float(data_range[1])
-    else:
-        arr = np.asarray(da.values)
-        finite = arr[np.isfinite(arr)]
-        if finite.size == 0:
-            return []
-        dmin, dmax = float(finite.min()), float(finite.max())
+    dmin, dmax = float(data_range[0]), float(data_range[1])
     span = dmax - dmin
     if not (np.isfinite(dmin) and np.isfinite(dmax)) or span <= 0.0:
         return []
@@ -845,14 +804,11 @@ def fixed_scale_offset_configs(da, data_range=None):
 
 
 def combo_is_valid(filt, serializer, compressor=None, dtype=None) -> bool:
-    """Reject pairings that crash or corrupt inside the codecs.  FixedScaleOffset
-    emits unsigned ints, which ZFPY (every mode) and 8-bit PCodec refuse.
-    BitRound below the mantissa width emits the integer bit view of the floats;
-    ZFPY accepts it, compresses the bit pattern lossily, and the decode-side
-    reinterpretation corrupts exponents (`dtype`, the field's, enables that
-    check).  EBCC runs alone: a filter before it breaks its error bound
-    (AsType's float32 down-cast excepted) and a compressor after it gains
-    nothing."""
+    """Reject pairings that crash, corrupt or gain nothing: FixedScaleOffset's unsigned ints into ZFPY
+    (every mode), or 8-bit ones into PCodec; BitRound below the mantissa width into ZFPY, which codes
+    its integer bit view lossily so decoding corrupts exponents (checked when `dtype`, the field's, is
+    given); EBCC with a compressor (gains nothing) or a filter other than AsType (breaks its error
+    bound; validate_pipeline checks that the cast is to float32)."""
     if isinstance(serializer, EBCC):
         return compressor is None and (filt is None or isinstance(filt, zarrcodecs_nc.AsType))
     if (isinstance(filt, zarrcodecs_nc.BitRound) and isinstance(serializer, zarrcodecs_nc.ZFPY)
@@ -872,21 +828,17 @@ def combo_is_valid(filt, serializer, compressor=None, dtype=None) -> bool:
 
 
 def codec_pipeline_kwargs(compressor, filt, serializer) -> dict:
-    """zarr.create_array kwargs for one (compressor, filter, serializer) triple.
-    None means none: no filter, no compressor (zarr would otherwise default to
-    Zstd), and the plain bytes serializer."""
+    """zarr.create_array kwargs for a (compressor, filter, serializer) triple; None means none: no
+    filter, no compressor (not zarr's default Zstd), the plain bytes serializer."""
     return {"filters": [filt] if filt is not None else None,
             "compressors": [compressor] if compressor is not None else None,
             "serializer": "auto" if serializer is None else serializer}
 
 
-# Our classes, used when a pipeline is rebuilt from its dict: ZFPYRank must
-# replace zarr's stock ZFPY (same codec name in zarr.json); ZFPYFlat and EBCC
-# have no stock class.
+# Checked before zarr's registry, which returns stock ZFPY for ZFPYRank's "numcodecs.zfpy".
 _CODEC_CLASSES = {"numcodecs.zfpy": ZFPYRank, "numcodecs.zfpy_flat": ZFPYFlat,
                   "numcodecs.ebcc_filter": EBCC}
-# Names a bare zarr client cannot resolve: they exist only through dc_toolkit's
-# zarr.codecs entry point (README, "Reading a store without dc_toolkit").
+# Resolvable only through dc_toolkit's zarr.codecs entry point (README, "Reading a store without dc_toolkit").
 ENTRY_POINT_CODECS = frozenset(("numcodecs.zfpy_flat", "numcodecs.ebcc_filter"))
 
 
@@ -924,8 +876,7 @@ def pipeline_json(compressor, filt, serializer) -> str:
 
 
 def codec_label(codec) -> str:
-    """Short human-readable form: 'blosc(clevel=1, cname=lz4, shuffle=0)' (keys
-    sorted, so the label does not depend on where the codec came from); '-' for None."""
+    """Label like 'zstd(level=6)', keys sorted so it does not depend on the codec's origin; '-' for None."""
     if codec is None:
         return "-"
     if isinstance(codec, EBCC):
@@ -940,85 +891,7 @@ def pipeline_name(compressor, filt, serializer) -> str:
 
 
 # =============================================================================
-# 5. ZARR SYNC BYPASS
-# =============================================================================
-# zarr 3's sync API funnels every call through one process-global event loop,
-# which serialises codec work from concurrent threads.  With the bypass on,
-# each user thread owns a persistent event loop and all loops share one bounded
-# ThreadPoolExecutor, so total OS threads stay at user_threads + shared_workers
-# instead of user_threads * 32.
-
-_thread_local_loops = threading.local()
-_shared_executor = None
-_shared_executor_lock = threading.Lock()
-_thread_loops = []  # every per-thread loop, so that AsyncBypass.close_loops can release them
-
-
-class _SharedExecutor(ThreadPoolExecutor):
-    """Default executor of every per-thread loop.  Closing a loop (a finished
-    worker thread's loop being garbage-collected) shuts its default executor
-    down, which on the shared pool would fail every later submission, so
-    shutdown is a no-op; the interpreter's exit hook still stops the workers."""
-
-    def shutdown(self, wait=True, *, cancel_futures=False):
-        pass
-
-
-def _get_or_create_shared_executor(max_workers: int) -> ThreadPoolExecutor:
-    global _shared_executor
-    with _shared_executor_lock:
-        if _shared_executor is None:
-            _shared_executor = _SharedExecutor(max_workers=max(1, int(max_workers)),
-                                               thread_name_prefix="bypass_codec")
-    return _shared_executor
-
-
-def _get_thread_event_loop() -> asyncio.AbstractEventLoop:
-    loop = getattr(_thread_local_loops, "loop", None)
-    if loop is None or loop.is_closed():
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        if _shared_executor is not None:
-            loop.set_default_executor(_shared_executor)
-        _thread_local_loops.loop = loop
-        with _shared_executor_lock:
-            _thread_loops.append(loop)
-    return loop
-
-
-class AsyncBypass:
-    """Process-wide toggle for the bypass (cli --bypass-zarr-sync)."""
-    enabled: bool = False
-    threads_per_rank: int = 1
-
-    @classmethod
-    def enable(cls, threads_per_rank: int = 1) -> None:
-        cls.enabled = True
-        cls.threads_per_rank = max(1, int(threads_per_rank))
-        _get_or_create_shared_executor(cls.threads_per_rank)
-
-    @classmethod
-    def close_loops(cls) -> None:
-        """Close the loops of worker threads that are gone (a selector and a
-        socket pair each); call after a thread pool has been shut down."""
-        with _shared_executor_lock:
-            loops, _thread_loops[:] = list(_thread_loops), []
-        for loop in loops:
-            if not loop.is_running():
-                loop.close()
-
-    @classmethod
-    def run(cls, coro):
-        """Run a zarr coroutine: on this thread's loop if enabled, otherwise on
-        zarr's global sync loop (identical to the sync API)."""
-        if cls.enabled:
-            return _get_thread_event_loop().run_until_complete(coro)
-        from zarr.core.sync import sync
-        return sync(coro)
-
-
-# =============================================================================
-# 6. IN-MEMORY EVALUATION
+# 5. IN-MEMORY EVALUATION
 # =============================================================================
 
 def _info_bytes(info) -> Tuple[int, int]:
@@ -1042,8 +915,7 @@ def within_limit(value, limit) -> bool:
     return float(value) <= float(limit)
 
 
-# (metric key, threshold key) of the cheap gates that the gradient precheck
-# and utils_cli.evaluate_gates share.
+# (metric, threshold) keys of the cheap gates, shared by the gradient precheck and utils_cli.evaluate_gates.
 CHEAP_GATES = (("Relative_Error_L1", "l1"), ("Relative_Error_L2", "l2"),
                ("Relative_Error_Linf", "linf"), ("Bias_Rel", "bias"))
 
@@ -1055,36 +927,32 @@ def _rel(err, ori) -> float:
     return float(err) / float(ori)
 
 
-# FixedScaleOffset casts NaN fill cells to int and numpy warns; fill cells are
-# masked out of every norm, so the warning is noise.  (A real FSO overflow is
-# silent and guarded by full_field_data_range + the verify gate instead.)
-# Installed once: warnings.catch_warnings() is not thread-safe, and the sweep
-# encodes from many threads.
+# FixedScaleOffset casts NaN fill to int and numpy warns on every chunk; silenced since the norms
+# mask fill out, although those cells decode to finite values that no metric flags.  A real FSO
+# overflow is silent: full_field_data_range and the verify gate guard against it.
 warnings.filterwarnings("ignore", message="invalid value encountered in cast", category=RuntimeWarning)
 
 
-async def _zarr_roundtrip(sample_np, dims, codec_kwargs, chunks):
-    """create + encode + info + decode on a MemoryStore.  Returns (decoded, ratio)."""
+def _zarr_roundtrip(sample_np, dims, codec_kwargs, chunks):
+    """One MemoryStore round trip; returns (decoded, compression ratio)."""
     with Timer("eval.create_array"):
-        z = await _zarr_async_create_array(
-            store=zarr.storage.MemoryStore(), name="_tmp_eval",
-            shape=sample_np.shape, dtype=sample_np.dtype, chunks=chunks,
-            zarr_format=3, dimension_names=tuple(dims), **codec_kwargs)
+        z = zarr.create_array(store=zarr.storage.MemoryStore(), name="_tmp_eval",
+                              shape=sample_np.shape, dtype=sample_np.dtype, chunks=chunks,
+                              zarr_format=3, dimension_names=tuple(dims), **codec_kwargs)
     with Timer("eval.encode"):
-        await z.setitem(Ellipsis, sample_np)
+        z[...] = sample_np
     with Timer("eval.info_complete"):
-        count_bytes, count_bytes_stored = _info_bytes(await z.info_complete())
+        count_bytes, count_bytes_stored = _info_bytes(z.info_complete())
     with Timer("eval.decode"):
-        decoded = await z.getitem(Ellipsis)
-    await z.store.clear()  # free the encoded bytes now; the array object can outlive this call in a GC cycle
+        decoded = z[...]
+    _zarr_sync(z.store.clear())  # free the encoded bytes here: the array object can outlive this call in a GC cycle
     return decoded, count_bytes / count_bytes_stored
 
 
 def _error_sums(sample_np, decoded, chunks, q99_abs):
-    """Chunk-wise accumulators behind evaluate_codec_pipeline's norms, over the
-    cells finite in both arrays: (l1_err, l2_err_sq, linf_err, signed_err,
-    l1_ori, l2_ori_sq, linf_ori, q99_err, q99_ori, n_valid, n_corrupt,
-    decoded_min, decoded_max).  `q99_abs` None skips the tail sums."""
+    """Chunk-wise accumulators over the cells finite in both arrays (n_corrupt: finite in the original
+    only): (l1_err, l2_err_sq, linf_err, signed_err, l1_ori, l2_ori_sq, linf_ori, q99_err, q99_ori,
+    n_valid, n_corrupt, decoded_min, decoded_max); `q99_abs` None skips the tail sums."""
     l1_err = l2_err_sq = linf_err = signed_err = 0.0
     l1_ori = l2_ori_sq = linf_ori = 0.0
     q99_err = q99_ori = 0.0
@@ -1100,8 +968,7 @@ def _error_sums(sample_np, decoded, chunks, q99_abs):
             if nv == 0:
                 continue
             n_valid += nv
-            # Two float64 temporaries per chunk (the boolean index already copied):
-            # e = decoded - orig, then |e| and |orig| in place.
+            # Two float64 temporaries per chunk (the boolean index copied already), then all in place.
             o_abs = orig[valid].astype(np.float64, copy=False)
             e_abs = dec[valid].astype(np.float64, copy=False)
             decoded_min, decoded_max = min(decoded_min, float(e_abs.min())), max(decoded_max, float(e_abs.max()))
@@ -1122,19 +989,11 @@ def _error_sums(sample_np, decoded, chunks, q99_abs):
 def evaluate_codec_pipeline(sample_np: np.ndarray, dims, codec_kwargs: dict, chunks,
                             q99_abs: float | None = None, compute_gradient: bool = False,
                             gradient_axes=None, precheck_thresholds: dict | None = None):
-    """
-    Round-trip `sample_np` through a codec pipeline in memory and score it.
-    Returns (compression_ratio, errors_dict, euclidean_distance).  Thread-safe.
-
-    Cells that are non-finite in the original are fill and excluded from every
-    norm.  Cells finite in the original but non-finite after decode are
-    corruption: excluded from the norms and counted in N_Corrupt.
-
-    The gradient metric is one more pass over the sample, so with
-    `precheck_thresholds` it is skipped for combos that already fail a cheap
-    gate (L1/L2/Linf/bias).
-    """
-    decoded, ratio = AsyncBypass.run(_zarr_roundtrip(sample_np, dims, codec_kwargs, chunks))
+    """Round-trip `sample_np` through a pipeline in memory; returns (compression_ratio, errors_dict,
+    euclidean_distance).  Fill (non-finite in the original) and corruption (finite, then non-finite
+    after decode; counted in N_Corrupt) are left out of every norm.  With `precheck_thresholds`,
+    combos failing a cheap gate skip the gradient metric, one more pass over the sample."""
+    decoded, ratio = _zarr_roundtrip(sample_np, dims, codec_kwargs, chunks)
     want_q99 = q99_abs is not None and math.isfinite(q99_abs)
     with Timer("eval.metrics"):
         (l1_err, l2_err_sq, linf_err, signed_err, l1_ori, l2_ori_sq, linf_ori, q99_err, q99_ori,
@@ -1166,10 +1025,9 @@ def evaluate_codec_pipeline(sample_np: np.ndarray, dims, codec_kwargs: dict, chu
 
 
 def _gradient_rel_l1(orig: np.ndarray, decoded: np.ndarray, axes=None) -> float:
-    """Sum|d(decoded) - d(orig)| / Sum|d(orig)| over finite differences along
-    `axes` (default: every axis but the leading one).  Differences that do not
-    run along the leading axis are taken over blocks of leading indices (about
-    32 MiB of float64 each), so the temporaries do not grow with the sample."""
+    """Sum|d(decoded) - d(orig)| / Sum|d(orig)| over finite differences along `axes` (default: all
+    but the leading one; axis 0 for 1-D), in ~32 MiB float64 blocks of leading indices unless `axes`
+    includes axis 0."""
     if axes is None:
         axes = tuple(range(1, orig.ndim)) if orig.ndim > 1 else (0,)
     axes = tuple(ax % orig.ndim for ax in axes)
@@ -1193,23 +1051,15 @@ def _gradient_rel_l1(orig: np.ndarray, decoded: np.ndarray, axes=None) -> float:
 
 
 # =============================================================================
-# 7. PERSISTENCE
+# 6. PERSISTENCE
 # =============================================================================
 
-def persist_with_codec_pipeline(da, store, component: str, codec_kwargs: dict,
-                                inner_chunks=None, shards=None, verify: bool = True, q99_abs=None):
-    """
-    Write dask-backed `da` into `store` at `component` via dask.array.to_zarr.
-    Returns (compression_ratio, errors, euclidean_distance); the last two are
-    None unless `verify` re-reads the store.  One dask task writes one shard
-    (or one chunk when sharding is skipped).
-    """
+def persist_with_codec_pipeline(da, store, component: str, codec_kwargs: dict, inner_chunks, shards,
+                                verify: bool = True, q99_abs=None):
+    """Write dask-backed `da` to `store` at `component`; returns (compression_ratio, errors,
+    euclidean_distance), the last two None unless `verify` re-reads the store.  One dask task
+    writes one shard (one chunk when unsharded), so no two tasks write the same object."""
     assert isinstance(da.data, dask.array.Array), "expects a dask-backed xr.DataArray"
-    if inner_chunks is None or shards is None:
-        auto_inner, auto_shard = compute_chunk_and_shard_shape(da.shape, da.dtype, dims=tuple(da.dims))
-        inner_chunks = auto_inner if inner_chunks is None else inner_chunks
-        shards = auto_shard if shards is None else shards
-
     write_unit = shards if shards is not None else inner_chunks
     zarr_kwargs = dict(zarr_format=3, dimension_names=tuple(da.dims), chunks=inner_chunks, **codec_kwargs)
     if shards is not None:
@@ -1233,9 +1083,8 @@ def persist_with_codec_pipeline(da, store, component: str, codec_kwargs: dict,
 
 
 def compute_errors_distances(da_compressed, da, q99_abs=None):
-    """Error norms between two dask arrays (one dask.compute), masked like
-    evaluate_codec_pipeline and with the same keys except N_Valid and Grad_Rel.
-    Returns (errors, l2_error)."""
+    """(errors, l2_error) of two dask arrays in one dask.compute, masked like evaluate_codec_pipeline
+    and with its keys except N_Valid and Grad_Rel."""
     da, da_compressed = da.astype(np.float64), da_compressed.astype(np.float64)  # integer squares would wrap
     finite_orig, finite_dec = np.isfinite(da), np.isfinite(da_compressed)
     valid = finite_orig & finite_dec
@@ -1270,25 +1119,20 @@ def compute_errors_distances(da_compressed, da, q99_abs=None):
 
 
 # =============================================================================
-# 8. MPI, THREADS & TOPOLOGY
+# 7. MPI & TOPOLOGY
 # =============================================================================
 
 def detect_node_topology(comm=None):
-    """(node_comm, ranks_on_node, local_rank) via MPI-3 shared-memory split,
-    with a hostname fallback for old MPI implementations."""
+    """Collective over `comm` (default COMM_WORLD): (node_comm, ranks_on_node, local_rank) of this rank's
+    node."""
     comm = comm or MPI.COMM_WORLD
-    try:
-        node_comm = comm.Split_type(MPI.COMM_TYPE_SHARED, key=comm.Get_rank())
-    except Exception:
-        import socket
-        names = comm.allgather(socket.gethostname())
-        color = {n: i for i, n in enumerate(sorted(set(names)))}
-        node_comm = comm.Split(color[socket.gethostname()], key=comm.Get_rank())
+    node_comm = comm.Split_type(MPI.COMM_TYPE_SHARED, key=comm.Get_rank())
     return node_comm, node_comm.Get_size(), node_comm.Get_rank()
 
 
 def detect_cores_available() -> int:
-    """Cores visible to this process (respects cgroups / Slurm cpusets)."""
+    """Logical CPUs in this process's affinity mask (Slurm and cgroup cpusets, not a CPU quota such as
+    docker --cpus), else os.cpu_count()."""
     if hasattr(os, "sched_getaffinity"):
         try:
             return max(1, len(os.sched_getaffinity(0)))
@@ -1297,34 +1141,16 @@ def detect_cores_available() -> int:
     return max(1, os.cpu_count() or 1)
 
 
-def compute_default_threads_per_rank(ranks_on_node: int, cores_available: int | None = None) -> int:
-    cores = detect_cores_available() if cores_available is None else cores_available
-    return max(1, cores // max(1, ranks_on_node))
-
-
-def broadcast_numpy(arr, comm=None, root: int = 0) -> np.ndarray:
-    """Bcast a numpy array from `root` (non-root ranks pass None).  Uses the
-    buffer protocol with the dtype's MPI type, so the 2^31 count limit is in
-    elements, not bytes (~16 GB for float64)."""
-    comm = comm or MPI.COMM_WORLD
-    rank = comm.Get_rank()
-    if rank == root:
-        if arr is None:
-            raise ValueError("broadcast_numpy: root rank must provide a numpy array.")
-        meta = (tuple(arr.shape), str(arr.dtype))
-    else:
-        meta = None
-    shape, dtype_str = comm.bcast(meta, root=root)
-    buf = np.ascontiguousarray(arr) if rank == root else np.empty(shape, dtype=np.dtype(dtype_str))
-    comm.Bcast(buf, root=root)
-    return buf
+def detect_physical_cores() -> int:
+    """Rank count for the launch hint and the UI: the affinity mask capped by the physical cores
+    (Open MPI's default slot count on a whole machine; SMT siblings in a cpuset are not halved)."""
+    avail = detect_cores_available()
+    return max(1, min(avail, psutil.cpu_count(logical=False) or avail))
 
 
 def check_thread_oversubscription(abort_if_unsafe: bool = True, rank: int = 0, comm=None) -> None:
-    """Warn on rank 0, and abort collectively unless `abort_if_unsafe` is off,
-    when any THREAD_ENV_VARS entry is not 1.  Also pins zarr's internal pool
-    when several ranks share a node without the bypass, since each rank would
-    otherwise spawn its own ~32-thread pool."""
+    """Warn on rank 0 when a THREAD_ENV_VARS entry is not 1, then MPI Abort unless `abort_if_unsafe`
+    is off (not a collective: the first rank to call it ends the job)."""
     comm = comm or MPI.COMM_WORLD
     problems = []
     for v in THREAD_ENV_VARS:
@@ -1344,44 +1170,23 @@ def check_thread_oversubscription(abort_if_unsafe: bool = True, rank: int = 0, c
                 click.echo("  Aborting (use --no-oversubscription-check to override).")
         if abort_if_unsafe:
             comm.Abort(1)
-    if not AsyncBypass.enabled:
-        try:
-            node_comm, ranks_on_node, _ = detect_node_topology(comm)
-            node_comm.Free()
-            if ranks_on_node > 1:
-                zarr.config.set({"threading.max_workers": 1})
-        except Exception:
-            pass
 
 
 # =============================================================================
-# 9. PROGRESS & TIMING
+# 8. PROGRESS & TIMING
 # =============================================================================
 
-_PROGRESS_LOCK = threading.Lock()
-_PROGRESS_COUNTERS = defaultdict(int)
+def progress_bar(done: int, total: int, label: str, bar_width: int = 40) -> None:
+    pct = done / max(1, total)
+    bar = "*" * int(bar_width * pct) + "-" * (bar_width - int(bar_width * pct))
+    click.echo(f"[{label}] Progress: |{bar}| {pct*100:6.2f}% ({done}/{total})")
 
 
-def progress_bar(total, print_every=100, bar_width=40, key: str = "default"):
-    """Thread-safe progress line on rank 0; call once per completed unit."""
-    rank = MPI.COMM_WORLD.Get_rank()
-    if rank != 0:
-        return
-    with _PROGRESS_LOCK:
-        _PROGRESS_COUNTERS[key] += 1
-        done = _PROGRESS_COUNTERS[key]
-        if done % print_every == 0 or done == total:
-            pct = done / total
-            bar = "*" * int(bar_width * pct) + "-" * (bar_width - int(bar_width * pct))
-            click.echo(f"[Rank {rank}] Progress: |{bar}| {pct*100:6.2f}% ({done}/{total})")
-
-
-_TIMINGS_LOCK = threading.Lock()
 _TIMINGS = defaultdict(list)
 
 
 class Timer:
-    """`with Timer("label"):` accumulates wall time per label (thread-safe)."""
+    """`with Timer("label"):` accumulates wall time per label."""
 
     def __init__(self, label):
         self.label = label
@@ -1391,16 +1196,15 @@ class Timer:
         return self
 
     def __exit__(self, *args):
-        with _TIMINGS_LOCK:
-            _TIMINGS[self.label].append(time.perf_counter() - self.start)
+        _TIMINGS[self.label].append(time.perf_counter() - self.start)
 
 
 @atexit.register
 def print_profile_summary():
     if not _TIMINGS or MPI.COMM_WORLD.Get_rank() != 0:
         return
-    print("\n=== Timing Summary (rank 0; ranks balanced via deterministic shuffle) ===")
-    print("Sum of Total = thread-seconds inside the timed sections (excludes bcast,")
+    print("\n=== Timing Summary (rank 0) ===")
+    print("Sum of Total = seconds inside the timed sections (excludes the sample build,")
     print("dask graph setup and result-write overhead).\n")
     width = max(len(label) for label in _TIMINGS)
     totals = {label: sum(d) for label, d in _TIMINGS.items()}

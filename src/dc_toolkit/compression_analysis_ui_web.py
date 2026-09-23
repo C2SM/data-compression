@@ -1,11 +1,6 @@
-"""
-Streamlit UI: upload a netCDF file, sweep the codec space on one field, look
-at the results, write the field with a chosen pipeline and download the store.
-
-Launched by `dc_toolkit run_web_ui` (sweeps run as one local MPI rank) or by
-`dc_toolkit run_web_ui_vcluster` (sweeps run under srun; the extra arguments
-select the allocation and name the file on the cluster).
-"""
+"""Streamlit UI: upload a netCDF file, sweep the codec space on one field, look at the results,
+write the field with a chosen pipeline and download the store.  Launched by `dc_toolkit run_web_ui`
+or `run_web_ui_vcluster` (commands under srun; its arguments select the allocation and the file)."""
 import argparse
 import json
 import os
@@ -30,19 +25,20 @@ def parse_args():
 
 @st.cache_data
 def load_and_resize_netcdf(file_content, original_name, max_size_bytes=1e7):
-    """Open the upload; above max_size_bytes, keep a leading block of every
-    dimension so the interactive sweep stays quick."""
+    """(dataset, name) of the upload; decoded data over max_size_bytes is cut to a leading block of every
+    dimension, so the interactive sweep stays quick and its shared sample fits a container's /dev/shm."""
     ds = xr.open_dataset(BytesIO(file_content))
-    if len(file_content) > max_size_bytes:
+    nbytes = ds.nbytes
+    if nbytes > max_size_bytes:
         dims = [d for d in ds.dims if ds.sizes[d] > 1]
-        scale = (max_size_bytes / len(file_content)) ** (1 / max(1, len(dims)))
+        scale = (max_size_bytes / nbytes) ** (1 / max(1, len(dims)))
         ds = ds.isel({d: slice(0, max(1, int(ds.sizes[d] * scale))) for d in dims})
         original_name += "_reduced.nc"
     return ds, original_name
 
 
 def run_streaming(cmd, status):
-    """Run a command, showing its latest output line in a streamlit placeholder."""
+    """Run a command, showing its latest output line in `status`; returns its exit status."""
     with subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
                           env=utils_cli.ui_env()) as proc:
         for line in proc.stdout:
@@ -57,7 +53,7 @@ compress_launcher = utils_cli.ui_launcher(args.user_account, args.time, "1", "1"
                                           args.partition)  # compress is a single-process command
 st.title("Evaluate compressors and compress a netCDF field")
 
-if args.uploaded_file:  # vcluster: the file already lives on the cluster
+if args.uploaded_file:
     dataset_path, ds, source = args.uploaded_file, xr.open_dataset(args.uploaded_file), args.uploaded_file
 else:
     uploaded = st.file_uploader("Choose a netCDF file", type=["nc"])

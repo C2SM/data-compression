@@ -6,26 +6,25 @@
 #
 #   DYAMOND_DATA_ROOT=/path/to/parent sbatch --account=<account> santis.run
 #
-# Topology: 1 MPI rank per node x THREADS threads per rank, --bypass-zarr-sync (the default).
-#   - A combo's metrics run on the user thread, so the user threads are what
-#     scales; one rank per node keeps a single copy of the sample beside them.
-#   - Compression is memory-bandwidth-bound here, so --codec-threads stays 1 and
-#     the codec libraries are pinned to one thread: inner threads would compete
-#     with the outer ones for the same bandwidth.
-#   - A rank holds about (1 + 2 x threads) x the sample (the [memory] line).  The sweep
-#     checks that against the node's memory and shrinks the sample to fit ([memcheck]).
+# Topology: RANKS single-threaded MPI ranks per node, each evaluating one pipeline at a
+# time; the ranks of a node share one copy of the sample (MPI shared-memory window).
+#   - Compression is memory-bandwidth-bound: about 32 ranks saturate a node, and the
+#     codec libraries are pinned to one thread (the exports below), since inner threads
+#     would compete for the same bandwidth.
+#   - A node holds about (1 + 2 x RANKS) x the sample (the [memory] line); the sweep
+#     shrinks the sample until that fits the node's memory ([memcheck]).
 #   docs/PARALLELIZATION.md has the details.
 #
 # Environment knobs:
 #   DYAMOND_DATA_ROOT        parent dir of the Data_Dyamond_PostProcessed* trees (required)
-#   RESULTS_BASE             output root (default ./res_folder_dyamond_<job id>).  Point it at an
-#                            earlier run's directory to continue it: combos recorded on the same
-#                            sample, chunking and codec build are reused and re-gated with the
-#                            current thresholds; anything else restarts the field.
-#   FIELDS_FILE              replaces the list below: one entry per line, same format
+#   RESULTS_BASE             output root (default ./res_folder_dyamond_<job id>); an earlier run's root
+#                            continues it: its combos are reused and re-gated with the current thresholds
+#                            unless the input path, sample, chunking or library versions changed
+#   FIELDS_FILE              replaces the list below: one entry per line, same format (quotes,
+#                            indentation, blank lines and # lines are ignored)
 #   MAX_EVALS=N              cap the codec space (quick test runs)
 #   WITH_EBCC=1              add the EBCC combos (float (lat, lon) fields; needs the ebcc package)
-#   COMPRESS=1               write each swept file with its winner and verify it (one task)
+#   COMPRESS=1               write each swept field with its best pipeline and verify it (one task)
 #   STOCK_CODECS_ONLY=1      with COMPRESS=1: only pipelines a zarr client without dc_toolkit decodes
 #   WALLTIME_SAFEGUARD_MIN   no field starts with fewer minutes left in the job (default 15)
 
@@ -34,8 +33,8 @@
 #SBATCH --view=default
 #SBATCH --partition=normal
 #SBATCH --nodes=8
-#SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=32
+#SBATCH --ntasks-per-node=32
+#SBATCH --cpus-per-task=1
 #SBATCH --time=12:00:00
 #SBATCH --output=out-%j.out
 #SBATCH --error=out-%j.out
@@ -52,9 +51,6 @@ export OMP_NUM_THREADS=1 \
        NUMBA_NUM_THREADS=1 \
        VECLIB_MAXIMUM_THREADS=1 \
        OMP_THREAD_LIMIT=1
-# srun steps do not reliably inherit --cpus-per-task from sbatch, and a rank that
-# sees one core fails the thread check.
-export SRUN_CPUS_PER_TASK=${SLURM_CPUS_PER_TASK:-32}
 
 # ---------------------------------------------------------------------------
 # Tunables
@@ -68,7 +64,7 @@ RESULTS_BASE="${RESULTS_BASE:-./res_folder_dyamond_${SLURM_JOB_ID:-$$}}"
 mkdir -p "$RESULTS_BASE"
 
 DEFAULT_SAMPLE=2GiB     # --eval-data-size-limit of an entry that names none
-DEFAULT_THREADS=32      # --threads-per-rank of an entry that names none
+DEFAULT_RANKS=32        # ranks per node of an entry that names none
 
 EXTRA_FLAGS=()
 MAX_EVALS="${MAX_EVALS:-}"
@@ -82,28 +78,27 @@ COMPRESS_FLAGS=()
 SAFEGUARD_MIN=${WALLTIME_SAFEGUARD_MIN:-15}
 JOB_END=${SLURM_JOB_END_TIME:-}     # epoch seconds; empty outside a job, which disables the safeguard
 
-echo "[santis.run] topology : 1 rank/node x ${SLURM_JOB_NUM_NODES:-?} node(s)"
+echo "[santis.run] topology : up to ${SLURM_NTASKS_PER_NODE:-32} rank(s)/node x ${SLURM_JOB_NUM_NODES:-?} node(s), one shared sample per node"
 echo "[santis.run] data root: $DYAMOND_DATA_ROOT"
 echo "[santis.run] knobs    : MAX_EVALS='${MAX_EVALS}' WITH_EBCC=${WITH_EBCC:-0} COMPRESS=${COMPRESS:-0} STOCK_CODECS_ONLY=${STOCK_CODECS_ONLY:-0}"
 
 # ---------------------------------------------------------------------------
 # Field list
 # ---------------------------------------------------------------------------
-# Format:  RES|STREAM|FILE|IVAR|VAR|L1|SAMPLE|THREADS|GATE FLAGS
-#   IVAR is the variable's name inside FILE (what is swept); VAR names the results
-#   directory RES_STREAM_VAR.  They differ where several products share an in-file
-#   name: SFC_lwflx_dn and TOA_lwflx_dn both hold lwflx_dn.
-#   SAMPLE (--eval-data-size-limit) and THREADS (--threads-per-rank) may be left empty.
-#
-# L1 is a RELATIVE budget (sum|err| / sum|orig|); the L2, Linf and bias gates default
-# to 2x, 10x and 0.5x of it.  The budgets below allow a mean error of 0.5 % of the
-# field's standard deviation (0.005 x std / |mean|), capped at 1 %: heavy-tailed
-# fields reach the cap and carry --extremes-sensitive.
-# GATE FLAGS are passed to evaluate_combos as they are: --phys-min/--phys-max for
-# bounded fields (with --phys-tolerance for one that sits on its bound), --gradient-gate
-# for fields whose gradients matter.
-# SAMPLE and THREADS follow the field's size: 2GiB x 32 for most, 16 threads and a
-# 1-2 GiB sample for the large R02B10 fields, which halves what the threads hold.
+# Format:  RES|STREAM|FILE|IVAR|VAR|L1|SAMPLE|RANKS|GATE FLAGS
+#   IVAR is the variable swept inside FILE; VAR names the results directory
+#   RES_STREAM_VAR.  They differ where products share an in-file name: SFC_lwflx_dn
+#   and TOA_lwflx_dn both hold lwflx_dn.
+#   SAMPLE (--eval-data-size-limit) and RANKS (ranks per node, at most the
+#   --ntasks-per-node above) default to DEFAULT_SAMPLE and DEFAULT_RANKS when empty.
+#   The large R02B10 fields take 1-2 GiB and 16 ranks: half the working sets per node.
+#   L1 is a RELATIVE budget (sum|err| / sum|orig|); the L2, Linf and bias gates default
+#   to 2x, 10x and 0.5x of it.  The budgets below allow a mean error of 0.5 % of the
+#   field's standard deviation (0.005 x std / mean|orig|), capped at 1 %: heavy-tailed
+#   fields reach the cap and carry --extremes-sensitive.
+#   GATE FLAGS go to evaluate_combos as they are: --phys-min/--phys-max for bounded
+#   fields (with --phys-tolerance for one that sits on its bound), --gradient-gate for
+#   fields whose gradients matter.
 LIST=(
     # R02B06, 3-D
     "R02B06|out_1_1|remap_qv_20220225T000000Z.nc|qv|qv|0.01|2GiB|32|--gradient-gate --gradient-threshold 0.1 --gradient-shortcircuit --extremes-sensitive --phys-min 0"
@@ -126,7 +121,6 @@ LIST=(
 )
 if [[ -n "${FIELDS_FILE:-}" ]]; then
     [[ -r "$FIELDS_FILE" ]] || { echo "[santis.run] FIELDS_FILE is not readable: $FIELDS_FILE"; exit 1; }
-    # indentation and quotes are dropped, so the lines of a generated list work as they are
     mapfile -t LIST < <(sed -E 's/^[[:space:]]*"?//; s/"?[[:space:]]*$//' "$FIELDS_FILE" | grep -Ev '^(#|$)')
 fi
 
@@ -162,10 +156,10 @@ for i in "${!LIST[@]}"; do
         break
     fi
 
-    IFS='|' read -r RES_TAG STREAM FNAME IVAR VAR L1_THRESHOLD SAMPLE THREADS GATES <<<"${LIST[$i]}"
-    SAMPLE=${SAMPLE:-$DEFAULT_SAMPLE}; THREADS=${THREADS:-$DEFAULT_THREADS}
+    IFS='|' read -r RES_TAG STREAM FNAME IVAR VAR L1_THRESHOLD SAMPLE RANKS GATES <<<"${LIST[$i]}"
+    SAMPLE=${SAMPLE:-$DEFAULT_SAMPLE}; RANKS=${RANKS:-$DEFAULT_RANKS}
 
-    if [[ -z "$VAR" || ! "$L1_THRESHOLD" =~ ^[0-9.]+([eE][-+]?[0-9]+)?$ ]]; then
+    if [[ -z "$VAR" || ! "$L1_THRESHOLD" =~ ^[0-9.]+([eE][-+]?[0-9]+)?$ || ! "$RANKS" =~ ^[1-9][0-9]*$ ]]; then
         echo "[$((i+1))/$n_total] SKIP malformed entry (RES|STREAM|FILE|IVAR|VAR|L1|...): ${LIST[$i]}"
         n_skip=$((n_skip+1)); PROBLEMS+=("SKIP  ${LIST[$i]}  (malformed)")
         continue
@@ -185,7 +179,7 @@ for i in "${!LIST[@]}"; do
     echo "  input    : $INPUT"
     echo "  field    : $IVAR"
     echo "  l1 thresh: $L1_THRESHOLD"
-    echo "  sample   : $SAMPLE, $THREADS thread(s)/rank"
+    echo "  sample   : $SAMPLE, $RANKS rank(s)/node"
     echo "  gates    : ${GATES:-(defaults)}"
     echo "  outdir   : $OUTDIR"
 
@@ -196,21 +190,24 @@ for i in "${!LIST[@]}"; do
     fi
     mkdir -p "$OUTDIR"
 
-    # $GATES is split on purpose: it holds several flags
-    srun --unbuffered dc_toolkit \
+    # $GATES is unquoted on purpose (several flags).  --ntasks is explicit: the job's
+    # SLURM_NTASKS would otherwise override --ntasks-per-node.
+    srun --unbuffered --nodes="$SLURM_JOB_NUM_NODES" --ntasks=$(( SLURM_JOB_NUM_NODES * RANKS )) \
+         --ntasks-per-node="$RANKS" --cpus-per-task=1 dc_toolkit \
          evaluate_combos \
          "$INPUT" \
          --where-to-write              "$OUTDIR" \
          --field-to-compress           "$IVAR" \
          --l1-threshold                "$L1_THRESHOLD" \
          --eval-data-size-limit        "$SAMPLE" \
-         --threads-per-rank            "$THREADS" \
          $GATES "${EXTRA_FLAGS[@]}" \
          2>&1 | stdbuf -oL -eL tee "$OUTDIR/run.log"
     rc=${PIPESTATUS[0]}; step=sweep
 
     if [[ $rc -eq 0 && "${COMPRESS:-0}" == 1 ]]; then
-        srun --unbuffered --nodes=1 --ntasks=1 dc_toolkit \
+        # One process with a dask thread per visible core; 32 keep the write peak, which
+        # grows with the thread count, well inside the node's memory.
+        srun --unbuffered --nodes=1 --ntasks=1 --cpus-per-task=32 dc_toolkit \
              compress "$INPUT" "$OUTDIR" --vars "$IVAR" "${COMPRESS_FLAGS[@]}" \
              2>&1 | stdbuf -oL -eL tee "$OUTDIR/compress.log"
         rc=${PIPESTATUS[0]}; step=compress
@@ -245,4 +242,4 @@ if (( n_fail + n_skip > 0 )); then
 fi
 echo "======================================================================="
 
-(( n_total > 0 && n_ok == n_total ))   # the exit status: 0 only when every field ran
+(( n_total > 0 && n_ok == n_total ))   # exit status: 0 only when every field succeeded
