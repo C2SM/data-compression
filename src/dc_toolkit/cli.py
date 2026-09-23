@@ -323,10 +323,11 @@ def compress(ctx, **_):
         if opts.consolidate:
             names = utils_cli.consolidate_store(merged_path)
             click.echo(f"[compress] consolidated metadata on {merged_path} ({len(names)} array(s): {', '.join(names)})")
-        elif utils_cli.drop_consolidated_metadata(merged_path):
-            click.echo("[compress] dropped the store's consolidated metadata (--no-consolidate): it would "
-                       "now describe this run's fields wrongly.  Readers scan the arrays until the next "
-                       "consolidation (dc_toolkit merge_compressed_fields DATASET WHERE_TO_WRITE).")
+        else:  # a listing from an earlier run would describe this run's fields wrongly
+            utils_cli.drop_consolidated_metadata(merged_path)
+            click.echo("[compress] --no-consolidate: the store has no consolidated metadata; readers scan the "
+                       "arrays until the next consolidation (dc_toolkit merge_compressed_fields DATASET "
+                       "WHERE_TO_WRITE).")
     utils_cli.write_json(os.path.join(opts.where_to_write, "batch_manifest.json"), {
         "command": "compress", "dataset_file": os.fspath(opts.dataset_file),
         "where_to_write": os.fspath(opts.where_to_write), "merged_store": merged_path,
