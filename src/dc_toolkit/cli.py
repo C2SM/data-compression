@@ -64,7 +64,7 @@ _CODEC_SPACE_OPTIONS = [
     click.option("--with-ebcc/--without-ebcc", default=False, show_default=True,
                  help="Add the EBCC serializer (lossy; needs --with-lossy and the optional ebcc package): "
                       "float (lat, lon) frames only, no compressor and no filter except the AsType "
-                      "down-cast, encodes at ~1-2 MB/s per thread."),
+                      "down-cast, encodes at ~1-2 MB/s per core."),
 ]
 _CHUNK_OPTIONS = [
     click.option("--inner-chunk-mib", type=int, default=16, show_default=True,
@@ -84,13 +84,15 @@ _CHUNK_OVERRIDE_OPTIONS = [  # compress: None means "the sweep's value from the 
     click.option("--spatial-split/--no-spatial-split", default=None,
                  help="Split spatial dims when one timestep exceeds --inner-chunk-mib (default: the sweep's, else on)."),
 ]
+_OVERSUBSCRIPTION_OPTION = click.option(
+    "--oversubscription-check/--no-oversubscription-check", default=True, show_default=True,
+    help="Abort at startup unless the OMP/BLOSC/MKL thread env vars are pinned to 1 "
+         "(checked with --codec-threads 1 only, where that flag exists).")
 _CODEC_THREAD_OPTIONS = [
     click.option("--codec-threads", type=int, default=1, show_default=True,
                  help="Codec-internal threads per call (Blosc set live; OpenMP/MKL/OpenBLAS need "
                       "shell exports).  threads x codec-threads must not exceed the cores."),
-    click.option("--oversubscription-check/--no-oversubscription-check", default=True, show_default=True,
-                 help="Abort at startup unless the OMP/BLOSC/MKL thread env vars are pinned to 1 "
-                      "(checked with --codec-threads 1 only)."),
+    _OVERSUBSCRIPTION_OPTION,
 ]
 _MEMORY_OPTION = click.option(
     "--memory-threshold", type=click.FloatRange(0.05, 0.95), default=0.80, show_default=True,
@@ -134,9 +136,7 @@ _VERIFY_OPTIONS = [
 @click.option("--field-to-compress", default=None, help="Field to sweep (default: every data variable).")
 @click.option("--eval-data-size-limit", default="5GB", callback=utils_cli.size_option_callback, show_default=True,
               help="Budget of the representative sample the combos are scored on (e.g. 5GB, 512MiB).")
-@click.option("--threads-per-rank", type=int, default=None,
-              help="Combos evaluated concurrently per MPI rank (default: cores / ranks-on-node).")
-@utils_cli.add_options(_CODEC_THREAD_OPTIONS)
+@_OVERSUBSCRIPTION_OPTION
 @utils_cli.add_options(_CHUNK_OPTIONS)
 @_MEMORY_OPTION
 @click.option("--l1-threshold", type=float, required=True,
@@ -181,11 +181,6 @@ _VERIFY_OPTIONS = [
                    "setting restarts the field.")
 @click.option("--max-evals", type=int, default=None,
               help="Cap the Cartesian product (quick test runs); EBCC combos are always included.")
-@click.option("--allow-multi-rank-per-node/--no-allow-multi-rank-per-node", default=False, show_default=True,
-              help="Allow several MPI ranks per node.  Each rank holds its own copy of the sample.")
-@click.option("--bypass-zarr-sync/--no-bypass-zarr-sync", default=True, show_default=True,
-              help="Give every thread its own zarr event loop (avoids zarr's global sync loop, which "
-                   "serialises threads).  Required for the 1 rank x N threads topology.")
 @click.pass_context
 def evaluate_combos(ctx, **_):
     """
@@ -194,15 +189,17 @@ def evaluate_combos(ctx, **_):
     result in results_{var}.parquet and the best pipeline in manifest_{var}.json.
 
     \b
-    Parallelism: MPI ranks split the config space; each rank runs
-    --threads-per-rank combos concurrently.  Launch with one rank per node:
-      srun --nodes=N --ntasks-per-node=1 --cpus-per-task=32 dc_toolkit evaluate_combos ...
+    Parallelism: MPI ranks split the config space and evaluate one pipeline at
+    a time each; the ranks of a node share one copy of the sample.  Launch one
+    rank per core:
+      srun --nodes=N --ntasks-per-node=32 --cpus-per-task=1 dc_toolkit evaluate_combos ...
+      mpirun -n 8 dc_toolkit evaluate_combos ...   (a laptop)
     Everything runs in memory; use `compress` to write the winners.
     """
     opts = utils_cli.opts(ctx)
     sweep = utils_cli.sweep_setup(opts)
     # array.chunk-size must be set before any open() with chunks="auto".
-    with dask.config.set({"array.chunk-size": "512MiB", "scheduler": "threads", "num_workers": opts.threads_per_rank}):
+    with dask.config.set({"array.chunk-size": "512MiB", "scheduler": "synchronous"}):  # one core per rank
         ds = utils.open_dataset(opts.dataset_file, opts.field_to_compress, rank=sweep.rank)
         variables = utils_cli.sweep_variables(ds, opts.field_to_compress, sweep.rank)
         for var in variables:
@@ -515,7 +512,7 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 
 @cli.command("run_web_ui")
 def run_web_ui():
-    """Streamlit web UI launched from a local terminal (one local MPI rank)."""
+    """Streamlit web UI launched from a local terminal (sweeps run under mpirun, one rank per core)."""
     subprocess.run(["streamlit", "run", os.path.join(_HERE, "compression_analysis_ui_web.py")])
 
 
@@ -526,7 +523,7 @@ def run_web_ui():
               help="netCDF file on the cluster to analyse (the compute nodes must see it).")
 @click.option("--time", type=str, default="00:15:00", help="Allocated time")
 @click.option("--nodes", type=str, default="1", help="Number of nodes")
-@click.option("--ntasks-per-node", type=str, default="1", help="MPI ranks per node (keep 1)")
+@click.option("--ntasks-per-node", type=str, default="32", help="MPI ranks per node (one per core)")
 @click.option("--partition", type=str, default="debug", show_default=True, help="SLURM partition")
 def run_web_ui_vcluster(user_account, uenv_image, uploaded_file, time, nodes, ntasks_per_node, partition):
     """The same web UI, launching its sweeps with srun on a vcluster."""

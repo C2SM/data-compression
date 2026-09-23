@@ -7,11 +7,10 @@ Sections
   3. Chunk & shard sizing         (zarr geometry, shared by eval and persist)
   4. Codec spaces & pipelines     (compressor x filter x serializer grids; EBCC optional;
                                    a pipeline's JSON form is its identity in results and manifests)
-  5. Zarr sync bypass             (per-thread event loops for the sweep)
-  6. In-memory evaluation         (encode -> decode -> error metrics)
-  7. Persistence                  (dask -> zarr LocalStore, optional verify)
-  8. MPI, threads & topology
-  9. Progress & timing
+  5. In-memory evaluation         (encode -> decode -> error metrics)
+  6. Persistence                  (dask -> zarr LocalStore, optional verify)
+  7. MPI & topology
+  8. Progress & timing
 """
 import asyncio
 import atexit
@@ -22,11 +21,9 @@ import os
 import re
 import struct
 import sys
-import threading
 import time
 import warnings
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor
 from itertools import product
 from pathlib import Path
 from typing import Optional, Tuple
@@ -42,7 +39,7 @@ import numcodecs
 import numcodecs.zfpy
 import zfpy
 from mpi4py import MPI
-from zarr.api.asynchronous import create_array as _zarr_async_create_array
+from zarr.core.sync import sync as _zarr_sync
 from zarr.codecs import numcodecs as zarrcodecs_nc
 from zarr.codecs.numcodecs._codecs import _NumcodecsArrayBytesCodec
 from zarr.registry import get_codec_class, register_codec
@@ -73,8 +70,8 @@ class SampleTooLargeError(Exception):
         self.spatial_dims = spatial_dims
 
 
-# Codec-internal thread pools that must be pinned to 1 under thread-per-combo
-# parallelism (see check_thread_oversubscription).
+# Codec-internal thread pools that must be pinned to 1: every rank owns one
+# core (see check_thread_oversubscription).
 THREAD_ENV_VARS = (
     "OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS",
     "BLOSC_NTHREADS", "NUMBA_NUM_THREADS",
@@ -280,7 +277,7 @@ def build_representative_sample(da: xr.DataArray, size_limit_bytes: int, rank: i
         spatial_names = [d for _, d in spatial_dims]
         msg = (f"variable '{da.name}': one horizontal slab is {hsize(irreducible_bytes)} "
                f"(spatial dims {spatial_names}), above the {hsize(size_limit_bytes)} budget.  "
-               f"Remedies: raise --eval-data-size-limit, reduce --threads-per-rank, "
+               f"Remedies: raise --eval-data-size-limit, start fewer ranks per node, "
                f"or request more RAM (#SBATCH --mem=0).")
         if rank == 0:
             click.echo(f"[sample] FATAL: {msg}")
@@ -795,15 +792,23 @@ def valid_digits_for_quantize(da):
     raise TypeError(f"Unsupported dtype '{da.dtype}'. Quantize only supports float32 and float64.")
 
 
-def full_field_data_range(da):
+def full_field_data_range(da, comm=None):
     """Finite (min, max) over the whole (dask-backed) field, or None if the
-    field is constant / has no finite values."""
+    field is constant / has no finite values.  One pass over the blocks; with
+    `comm` the blocks are split across its ranks (a collective call)."""
     data = da.data if hasattr(da, "data") else np.asarray(da)
     try:
         if isinstance(data, dask.array.Array):
-            finite = dask.array.isfinite(data)
-            dmin = float(dask.array.where(finite, data, np.inf).min().compute())
-            dmax = float(dask.array.where(finite, data, -np.inf).max().compute())
+            rank, size = (comm.Get_rank(), comm.Get_size()) if comm is not None else (0, 1)
+            mine = list(data.blocks.ravel())[rank::size]
+            dmin, dmax = np.inf, -np.inf
+            if mine:
+                finite = [dask.array.isfinite(b) for b in mine]
+                vals = dask.compute(*[dask.array.where(f, b, np.inf).min() for f, b in zip(finite, mine)],
+                                    *[dask.array.where(f, b, -np.inf).max() for f, b in zip(finite, mine)])
+                dmin, dmax = float(min(vals[:len(mine)])), float(max(vals[len(mine):]))
+            if comm is not None:
+                dmin, dmax = comm.allreduce(dmin, MPI.MIN), comm.allreduce(dmax, MPI.MAX)
         else:
             arr = np.asarray(data)
             fin = arr[np.isfinite(arr)]
@@ -940,85 +945,7 @@ def pipeline_name(compressor, filt, serializer) -> str:
 
 
 # =============================================================================
-# 5. ZARR SYNC BYPASS
-# =============================================================================
-# zarr 3's sync API funnels every call through one process-global event loop,
-# which serialises codec work from concurrent threads.  With the bypass on,
-# each user thread owns a persistent event loop and all loops share one bounded
-# ThreadPoolExecutor, so total OS threads stay at user_threads + shared_workers
-# instead of user_threads * 32.
-
-_thread_local_loops = threading.local()
-_shared_executor = None
-_shared_executor_lock = threading.Lock()
-_thread_loops = []  # every per-thread loop, so that AsyncBypass.close_loops can release them
-
-
-class _SharedExecutor(ThreadPoolExecutor):
-    """Default executor of every per-thread loop.  Closing a loop (a finished
-    worker thread's loop being garbage-collected) shuts its default executor
-    down, which on the shared pool would fail every later submission, so
-    shutdown is a no-op; the interpreter's exit hook still stops the workers."""
-
-    def shutdown(self, wait=True, *, cancel_futures=False):
-        pass
-
-
-def _get_or_create_shared_executor(max_workers: int) -> ThreadPoolExecutor:
-    global _shared_executor
-    with _shared_executor_lock:
-        if _shared_executor is None:
-            _shared_executor = _SharedExecutor(max_workers=max(1, int(max_workers)),
-                                               thread_name_prefix="bypass_codec")
-    return _shared_executor
-
-
-def _get_thread_event_loop() -> asyncio.AbstractEventLoop:
-    loop = getattr(_thread_local_loops, "loop", None)
-    if loop is None or loop.is_closed():
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        if _shared_executor is not None:
-            loop.set_default_executor(_shared_executor)
-        _thread_local_loops.loop = loop
-        with _shared_executor_lock:
-            _thread_loops.append(loop)
-    return loop
-
-
-class AsyncBypass:
-    """Process-wide toggle for the bypass (cli --bypass-zarr-sync)."""
-    enabled: bool = False
-    threads_per_rank: int = 1
-
-    @classmethod
-    def enable(cls, threads_per_rank: int = 1) -> None:
-        cls.enabled = True
-        cls.threads_per_rank = max(1, int(threads_per_rank))
-        _get_or_create_shared_executor(cls.threads_per_rank)
-
-    @classmethod
-    def close_loops(cls) -> None:
-        """Close the loops of worker threads that are gone (a selector and a
-        socket pair each); call after a thread pool has been shut down."""
-        with _shared_executor_lock:
-            loops, _thread_loops[:] = list(_thread_loops), []
-        for loop in loops:
-            if not loop.is_running():
-                loop.close()
-
-    @classmethod
-    def run(cls, coro):
-        """Run a zarr coroutine: on this thread's loop if enabled, otherwise on
-        zarr's global sync loop (identical to the sync API)."""
-        if cls.enabled:
-            return _get_thread_event_loop().run_until_complete(coro)
-        from zarr.core.sync import sync
-        return sync(coro)
-
-
-# =============================================================================
-# 6. IN-MEMORY EVALUATION
+# 5. IN-MEMORY EVALUATION
 # =============================================================================
 
 def _info_bytes(info) -> Tuple[int, int]:
@@ -1058,25 +985,23 @@ def _rel(err, ori) -> float:
 # FixedScaleOffset casts NaN fill cells to int and numpy warns; fill cells are
 # masked out of every norm, so the warning is noise.  (A real FSO overflow is
 # silent and guarded by full_field_data_range + the verify gate instead.)
-# Installed once: warnings.catch_warnings() is not thread-safe, and the sweep
-# encodes from many threads.
+# Installed once, at import.
 warnings.filterwarnings("ignore", message="invalid value encountered in cast", category=RuntimeWarning)
 
 
-async def _zarr_roundtrip(sample_np, dims, codec_kwargs, chunks):
+def _zarr_roundtrip(sample_np, dims, codec_kwargs, chunks):
     """create + encode + info + decode on a MemoryStore.  Returns (decoded, ratio)."""
     with Timer("eval.create_array"):
-        z = await _zarr_async_create_array(
-            store=zarr.storage.MemoryStore(), name="_tmp_eval",
-            shape=sample_np.shape, dtype=sample_np.dtype, chunks=chunks,
-            zarr_format=3, dimension_names=tuple(dims), **codec_kwargs)
+        z = zarr.create_array(store=zarr.storage.MemoryStore(), name="_tmp_eval",
+                              shape=sample_np.shape, dtype=sample_np.dtype, chunks=chunks,
+                              zarr_format=3, dimension_names=tuple(dims), **codec_kwargs)
     with Timer("eval.encode"):
-        await z.setitem(Ellipsis, sample_np)
+        z[...] = sample_np
     with Timer("eval.info_complete"):
-        count_bytes, count_bytes_stored = _info_bytes(await z.info_complete())
+        count_bytes, count_bytes_stored = _info_bytes(z.info_complete())
     with Timer("eval.decode"):
-        decoded = await z.getitem(Ellipsis)
-    await z.store.clear()  # free the encoded bytes now; the array object can outlive this call in a GC cycle
+        decoded = z[...]
+    _zarr_sync(z.store.clear())  # free the encoded bytes now; the array object can outlive this call in a GC cycle
     return decoded, count_bytes / count_bytes_stored
 
 
@@ -1124,7 +1049,7 @@ def evaluate_codec_pipeline(sample_np: np.ndarray, dims, codec_kwargs: dict, chu
                             gradient_axes=None, precheck_thresholds: dict | None = None):
     """
     Round-trip `sample_np` through a codec pipeline in memory and score it.
-    Returns (compression_ratio, errors_dict, euclidean_distance).  Thread-safe.
+    Returns (compression_ratio, errors_dict, euclidean_distance).
 
     Cells that are non-finite in the original are fill and excluded from every
     norm.  Cells finite in the original but non-finite after decode are
@@ -1134,7 +1059,7 @@ def evaluate_codec_pipeline(sample_np: np.ndarray, dims, codec_kwargs: dict, chu
     `precheck_thresholds` it is skipped for combos that already fail a cheap
     gate (L1/L2/Linf/bias).
     """
-    decoded, ratio = AsyncBypass.run(_zarr_roundtrip(sample_np, dims, codec_kwargs, chunks))
+    decoded, ratio = _zarr_roundtrip(sample_np, dims, codec_kwargs, chunks)
     want_q99 = q99_abs is not None and math.isfinite(q99_abs)
     with Timer("eval.metrics"):
         (l1_err, l2_err_sq, linf_err, signed_err, l1_ori, l2_ori_sq, linf_ori, q99_err, q99_ori,
@@ -1193,7 +1118,7 @@ def _gradient_rel_l1(orig: np.ndarray, decoded: np.ndarray, axes=None) -> float:
 
 
 # =============================================================================
-# 7. PERSISTENCE
+# 6. PERSISTENCE
 # =============================================================================
 
 def persist_with_codec_pipeline(da, store, component: str, codec_kwargs: dict,
@@ -1270,7 +1195,7 @@ def compute_errors_distances(da_compressed, da, q99_abs=None):
 
 
 # =============================================================================
-# 8. MPI, THREADS & TOPOLOGY
+# 7. MPI & TOPOLOGY
 # =============================================================================
 
 def detect_node_topology(comm=None):
@@ -1297,34 +1222,9 @@ def detect_cores_available() -> int:
     return max(1, os.cpu_count() or 1)
 
 
-def compute_default_threads_per_rank(ranks_on_node: int, cores_available: int | None = None) -> int:
-    cores = detect_cores_available() if cores_available is None else cores_available
-    return max(1, cores // max(1, ranks_on_node))
-
-
-def broadcast_numpy(arr, comm=None, root: int = 0) -> np.ndarray:
-    """Bcast a numpy array from `root` (non-root ranks pass None).  Uses the
-    buffer protocol with the dtype's MPI type, so the 2^31 count limit is in
-    elements, not bytes (~16 GB for float64)."""
-    comm = comm or MPI.COMM_WORLD
-    rank = comm.Get_rank()
-    if rank == root:
-        if arr is None:
-            raise ValueError("broadcast_numpy: root rank must provide a numpy array.")
-        meta = (tuple(arr.shape), str(arr.dtype))
-    else:
-        meta = None
-    shape, dtype_str = comm.bcast(meta, root=root)
-    buf = np.ascontiguousarray(arr) if rank == root else np.empty(shape, dtype=np.dtype(dtype_str))
-    comm.Bcast(buf, root=root)
-    return buf
-
-
 def check_thread_oversubscription(abort_if_unsafe: bool = True, rank: int = 0, comm=None) -> None:
     """Warn on rank 0, and abort collectively unless `abort_if_unsafe` is off,
-    when any THREAD_ENV_VARS entry is not 1.  Also pins zarr's internal pool
-    when several ranks share a node without the bypass, since each rank would
-    otherwise spawn its own ~32-thread pool."""
+    when any THREAD_ENV_VARS entry is not 1."""
     comm = comm or MPI.COMM_WORLD
     problems = []
     for v in THREAD_ENV_VARS:
@@ -1344,44 +1244,33 @@ def check_thread_oversubscription(abort_if_unsafe: bool = True, rank: int = 0, c
                 click.echo("  Aborting (use --no-oversubscription-check to override).")
         if abort_if_unsafe:
             comm.Abort(1)
-    if not AsyncBypass.enabled:
-        try:
-            node_comm, ranks_on_node, _ = detect_node_topology(comm)
-            node_comm.Free()
-            if ranks_on_node > 1:
-                zarr.config.set({"threading.max_workers": 1})
-        except Exception:
-            pass
 
 
 # =============================================================================
-# 9. PROGRESS & TIMING
+# 8. PROGRESS & TIMING
 # =============================================================================
 
-_PROGRESS_LOCK = threading.Lock()
 _PROGRESS_COUNTERS = defaultdict(int)
 
 
 def progress_bar(total, print_every=100, bar_width=40, key: str = "default"):
-    """Thread-safe progress line on rank 0; call once per completed unit."""
+    """Progress line of rank 0's own share; call once per completed unit."""
     rank = MPI.COMM_WORLD.Get_rank()
     if rank != 0:
         return
-    with _PROGRESS_LOCK:
-        _PROGRESS_COUNTERS[key] += 1
-        done = _PROGRESS_COUNTERS[key]
-        if done % print_every == 0 or done == total:
-            pct = done / total
-            bar = "*" * int(bar_width * pct) + "-" * (bar_width - int(bar_width * pct))
-            click.echo(f"[Rank {rank}] Progress: |{bar}| {pct*100:6.2f}% ({done}/{total})")
+    _PROGRESS_COUNTERS[key] += 1
+    done = _PROGRESS_COUNTERS[key]
+    if done % print_every == 0 or done == total:
+        pct = done / total
+        bar = "*" * int(bar_width * pct) + "-" * (bar_width - int(bar_width * pct))
+        click.echo(f"[Rank {rank}] Progress: |{bar}| {pct*100:6.2f}% ({done}/{total})")
 
 
-_TIMINGS_LOCK = threading.Lock()
 _TIMINGS = defaultdict(list)
 
 
 class Timer:
-    """`with Timer("label"):` accumulates wall time per label (thread-safe)."""
+    """`with Timer("label"):` accumulates wall time per label."""
 
     def __init__(self, label):
         self.label = label
@@ -1391,8 +1280,7 @@ class Timer:
         return self
 
     def __exit__(self, *args):
-        with _TIMINGS_LOCK:
-            _TIMINGS[self.label].append(time.perf_counter() - self.start)
+        _TIMINGS[self.label].append(time.perf_counter() - self.start)
 
 
 @atexit.register
@@ -1400,7 +1288,7 @@ def print_profile_summary():
     if not _TIMINGS or MPI.COMM_WORLD.Get_rank() != 0:
         return
     print("\n=== Timing Summary (rank 0; ranks balanced via deterministic shuffle) ===")
-    print("Sum of Total = thread-seconds inside the timed sections (excludes bcast,")
+    print("Sum of Total = seconds inside the timed sections (excludes the sample build,")
     print("dask graph setup and result-write overhead).\n")
     width = max(len(label) for label in _TIMINGS)
     totals = {label: sum(d) for label, d in _TIMINGS.items()}

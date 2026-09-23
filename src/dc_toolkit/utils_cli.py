@@ -2,9 +2,8 @@
 Helpers behind the dc_toolkit commands.  cli.py declares the commands and
 their options and hands the parsed parameters to the functions here as one
 `opts` namespace (attribute names == click parameter names).  Three helpers
-add resolved values to it: sweep_setup sets opts.threads_per_rank and
-opts.with_ebcc, sweep_variable sets opts.phys_slack, single_process_setup
-sets opts.threads.
+add resolved values to it: sweep_setup sets opts.with_ebcc, sweep_variable
+sets opts.phys_slack, single_process_setup sets opts.threads.
 
 A codec combination is identified by its pipeline dict (utils.pipeline_to_dict):
 the sweep records it in every result row and in manifest_{var}.json, and
@@ -12,7 +11,7 @@ the sweep records it in every result row and in manifest_{var}.json, and
 
 Sections
   1. Process, files & CLI plumbing
-  2. Threads & memory guards
+  2. Write threads & memory guards
   3. Gates & thresholds
   4. Pipelines & persistence
   5. Sweep                      (evaluate_combos)
@@ -33,7 +32,6 @@ import shutil
 import sys
 import time
 import traceback
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -256,7 +254,7 @@ def json_errors(errors) -> dict:
 
 
 # =============================================================================
-# 2. THREADS & MEMORY GUARDS
+# 2. WRITE THREADS & MEMORY GUARDS
 # =============================================================================
 
 def apply_codec_threads(codec_threads: int, rank: int = 0) -> None:
@@ -303,25 +301,25 @@ def single_process_setup(opts) -> None:
     configure_threads(opts.threads, opts.codec_threads, opts.oversubscription_check)
 
 
-# Per-thread working set in units of the sample: decoded buffer (1x) + encoded
-# MemoryStore (up to 1x) + a filter's copy while encoding/decoding, 1.9-2.5x at
-# the transient peak; 2.0 because the threads do not peak together and the
-# --memory-threshold headroom absorbs the rest.
-PER_THREAD_WORKING_FACTOR = 2.0
+# Per-rank working set in units of the sample: the decoded buffer (1x) plus the
+# encoded MemoryStore (up to 1x) and a filter's copy while encoding, ~2x at a
+# rank's own peak.  The ranks of a node do not peak together (~1.1x measured
+# across the node), so 2.0 leaves headroom under --memory-threshold.
+PER_RANK_WORKING_FACTOR = 2.0
 
 
-def per_rank_steady_estimate_bytes(sample_bytes: int, threads_per_rank: int, inner_chunk_mib: int) -> int:
-    """sample + threads x PER_THREAD_WORKING_FACTOR x sample + threads x 2 x chunk (float64 temporaries)."""
-    threads = max(1, int(threads_per_rank))
-    return int(sample_bytes + threads * sample_bytes * PER_THREAD_WORKING_FACTOR
-               + threads * 2 * max(1, int(inner_chunk_mib)) * 2**20)
+def node_steady_estimate_bytes(sample_bytes: int, ranks_on_node: int, inner_chunk_mib: int) -> int:
+    """One shared sample + ranks x PER_RANK_WORKING_FACTOR x sample + ranks x 2 x chunk (float64 temporaries)."""
+    ranks = max(1, int(ranks_on_node))
+    return int(sample_bytes + ranks * sample_bytes * PER_RANK_WORKING_FACTOR
+               + ranks * 2 * max(1, int(inner_chunk_mib)) * 2**20)
 
 
-def max_sample_bytes_for_threads(budget_bytes: int, threads_per_rank: int, inner_chunk_mib: int) -> int:
-    """Inverse of per_rank_steady_estimate_bytes; 0 if nothing fits."""
-    threads = max(1, int(threads_per_rank))
-    available = budget_bytes - threads * 2 * max(1, int(inner_chunk_mib)) * 2**20
-    return 0 if available <= 0 else int(available / (1.0 + threads * PER_THREAD_WORKING_FACTOR))
+def max_sample_bytes_for_ranks(budget_bytes: int, ranks_on_node: int, inner_chunk_mib: int) -> int:
+    """Inverse of node_steady_estimate_bytes; 0 if nothing fits."""
+    ranks = max(1, int(ranks_on_node))
+    available = budget_bytes - ranks * 2 * max(1, int(inner_chunk_mib)) * 2**20
+    return 0 if available <= 0 else int(available / (1.0 + ranks * PER_RANK_WORKING_FACTOR))
 
 
 def _cgroup_v2_memory_paths():
@@ -372,21 +370,21 @@ def detect_node_memory_budget() -> tuple[int, str]:
     return psutil.virtual_memory().total, "psutil host total"
 
 
-def check_node_memory_headroom(per_rank_steady_bytes: int, ranks_on_node: int, rank: int,
+def check_node_memory_headroom(node_steady_bytes: int, ranks_on_node: int, rank: int,
                                label: str, threshold: float = 0.80) -> None:
-    """Abort if the steady-state footprint of the ranks on the node exceeds the
-    memory budget, which they share whether it is a cgroup limit or host RAM."""
+    """Abort if the steady-state footprint of the node (one shared sample plus
+    its ranks' working sets) exceeds the memory budget, which the ranks share
+    whether it is a cgroup limit or host RAM."""
     if rank != 0:
         return
     available, source = detect_node_memory_budget()
-    required, scope = max(1, ranks_on_node) * per_rank_steady_bytes, f"per-node ({ranks_on_node} rank(s) x per-rank)"
-    if required > threshold * available:
+    if node_steady_bytes > threshold * available:
         click.echo(
-            f"[memcheck] REFUSING to start sweep: memory requirement {hsize(required)} ({scope}, "
-            f"{hsize(per_rank_steady_bytes)} steady-state per rank) exceeds {int(threshold*100)}% of the "
+            f"[memcheck] REFUSING to start sweep: memory requirement {hsize(node_steady_bytes)} per node "
+            f"(one shared sample + {ranks_on_node} rank(s) x working set) exceeds {int(threshold*100)}% of the "
             f"detected budget {hsize(available)} ({source}).\n"
             f"  Context: {label}\n"
-            f"  Fixes: lower --ntasks-per-node, lower --eval-data-size-limit, request more RAM "
+            f"  Fixes: start fewer ranks per node, lower --eval-data-size-limit, request more RAM "
             f"(#SBATCH --mem=0), or raise --memory-threshold (max 0.95).")
         abort(1)
 
@@ -704,12 +702,14 @@ class SweepContext:
     ranks_on_node: int
     cores_avail: int
     thresholds: dict
+    node_comm: object    # the ranks of this node, ...
+    local_rank: int      # ... this rank's index among them, ...
+    leaders: object      # ... and one rank per node (COMM_NULL elsewhere)
 
 
 def sweep_setup(opts) -> SweepContext:
-    """Topology check, thread count, zarr bypass, output dir, gate thresholds.
-    Sets opts.threads_per_rank to the resolved value and opts.with_ebcc when
-    --serializer-class ebcc implies it."""
+    """Topology, zarr's pool, output dir, gate thresholds.  Sets opts.with_ebcc
+    when --serializer-class ebcc implies it."""
     reset_memcheck_state()
     opts.with_ebcc = opts.with_ebcc or opts.serializer_class.lower() == "ebcc"
     if opts.with_ebcc and not opts.with_lossy:
@@ -724,28 +724,14 @@ def sweep_setup(opts) -> SweepContext:
             sys.stderr.flush()
             comm.Abort(1)
         sys.excepthook = abort_on_error
-    node_comm, ranks_on_node, _ = utils.detect_node_topology(comm)
-    if ranks_on_node > 1 and not opts.allow_multi_rank_per_node:
-        if rank == 0:
-            click.echo(f"[topology] ERROR: detected {ranks_on_node} MPI rank(s) per node.  This toolkit "
-                       f"expects 1 rank per node (threads provide within-node parallelism).\n"
-                       f"  Relaunch with --ntasks-per-node=1, or pass --allow-multi-rank-per-node.")
-        comm.Abort(1)
-    if ranks_on_node > 1 and rank == 0:
-        click.echo(f"[topology] NOTE: {ranks_on_node} MPI rank(s) per node; each holds its own sample copy.")
-    try:
-        node_comm.Free()
-    except Exception:
-        pass
-
+    node_comm, ranks_on_node, local_rank = utils.detect_node_topology(comm)
+    leaders = comm.Split(0 if local_rank == 0 else MPI.UNDEFINED, key=rank)
     cores_avail = utils.detect_cores_available()
-    if opts.threads_per_rank is None:
-        opts.threads_per_rank = utils.compute_default_threads_per_rank(ranks_on_node, cores_avail)
-    if opts.bypass_zarr_sync:
-        utils.AsyncBypass.enable(threads_per_rank=opts.threads_per_rank)
-        if rank == 0:
-            click.echo("[bypass-zarr-sync] enabled.")
-    configure_threads(opts.threads_per_rank, opts.codec_threads, opts.oversubscription_check, rank=rank)
+    if rank == 0 and size == 1 and cores_avail > 1:
+        click.echo(f"[topology] NOTE: one rank on {cores_avail} cores.  A rank evaluates one pipeline at a time; "
+                   f"start one rank per core to use them all (mpirun -n {cores_avail} dc_toolkit ...).")
+    utils.check_thread_oversubscription(abort_if_unsafe=opts.oversubscription_check, rank=rank, comm=comm)
+    zarr.config.set({"threading.max_workers": 1})  # one core per rank: zarr's own pool must not multiply it
     if rank == 0:
         os.makedirs(opts.where_to_write, exist_ok=True)
     comm.Barrier()
@@ -760,7 +746,7 @@ def sweep_setup(opts) -> SweepContext:
                    f"Linf={fmt(thr['linf'])} bias={fmt(thr['bias'])} q99={fmt(thr['q99'])} | "
                    f"bounds=[{opts.phys_min}, {opts.phys_max}]"
                    f"{f' +-{opts.phys_tolerance:g} of range' if getattr(opts, 'phys_tolerance', 0) else ''} | gradient={grad}")
-    return SweepContext(comm, rank, size, ranks_on_node, cores_avail, thr)
+    return SweepContext(comm, rank, size, ranks_on_node, cores_avail, thr, node_comm, local_rank, leaders)
 
 
 def sweep_variables(ds, field, rank: int) -> list:
@@ -788,61 +774,95 @@ def sweep_variables(ds, field, rank: int) -> list:
 
 
 def sweep_sample_limit(var: str, field_bytes: int, opts, sweep: SweepContext) -> int:
-    """Shrink the sample budget so the per-rank steady state fits the node's
-    memory budget, then run the memory guards.  Returns the effective limit."""
-    threads, chunk_mib = opts.threads_per_rank, opts.inner_chunk_mib
+    """Shrink the sample budget so the node's steady state (one shared sample
+    beside its ranks' working sets) fits the node's memory budget, then run
+    the memory guards.  Returns the effective limit."""
+    ranks, chunk_mib = sweep.ranks_on_node, opts.inner_chunk_mib
     node_budget, source = detect_node_memory_budget()
-    effective_budget = node_budget // max(1, sweep.ranks_on_node)
-    max_safe = max_sample_bytes_for_threads(int(effective_budget * opts.memory_threshold), threads, chunk_mib)
+    max_safe = max_sample_bytes_for_ranks(int(node_budget * opts.memory_threshold), ranks, chunk_mib)
     # Rank 0 sizes the sample for everyone, so every rank adopts the smallest node's limit.
     limit = sweep.comm.allreduce(min(int(opts.eval_data_size_limit), max_safe), op=MPI.MIN)
     if limit <= 0:
         if sweep.rank == 0:
-            click.echo(f"[memcheck] FATAL: cannot fit any sample with threads_per_rank={threads}, "
-                       f"inner_chunk_mib={chunk_mib}, per-rank memory budget {hsize(effective_budget)} "
+            click.echo(f"[memcheck] FATAL: cannot fit any sample with {ranks} rank(s) per node, "
+                       f"inner_chunk_mib={chunk_mib}, node memory budget {hsize(node_budget)} "
                        f"(from {source}) at threshold {opts.memory_threshold:.2f}.  "
-                       f"Reduce --threads-per-rank or request more RAM.")
+                       f"Start fewer ranks per node or request more RAM.")
         abort(1)
     if sweep.rank == 0 and limit < int(opts.eval_data_size_limit):
         click.echo(f"[memcheck] auto-shrunk sample budget from {hsize(opts.eval_data_size_limit)} "
                    f"(--eval-data-size-limit) to {hsize(limit)} to stay under {opts.memory_threshold:.2f} x "
-                   f"{hsize(effective_budget)} per rank (from {source}) at {threads} threads.")
+                   f"{hsize(node_budget)} per node (from {source}) with {ranks} rank(s) per node.")
 
     sample_bytes = min(field_bytes, limit)
-    multiplier = 2 if sweep.rank == 0 else 1  # building the sample, dask concatenates its chunks into one array
+    multiplier = 2 if sweep.rank == 0 else 1  # rank 0 holds its build beside the window it fills
     check_memory_headroom(multiplier * sample_bytes, threshold=opts.memory_threshold,
                           label=f"sample for '{var}' on rank {sweep.rank} ({hsize(sample_bytes)})")
-    check_node_memory_headroom(per_rank_steady_estimate_bytes(sample_bytes, threads, chunk_mib),
-                               ranks_on_node=sweep.ranks_on_node, rank=sweep.rank,
-                               label=f"variable '{var}', sample {hsize(sample_bytes)}", threshold=opts.memory_threshold)
+    check_node_memory_headroom(node_steady_estimate_bytes(sample_bytes, ranks, chunk_mib), ranks_on_node=ranks,
+                               rank=sweep.rank, label=f"variable '{var}', sample {hsize(sample_bytes)}",
+                               threshold=opts.memory_threshold)
     return limit
 
 
 def sweep_build_sample(da, limit: int, opts, sweep: SweepContext):
-    """Rank 0 builds the sample and the full-field FSO range; both are
-    broadcast.  The dim coordinates travel with the sample so every rank
-    classifies the dims the same way.  Returns (sample_np, sample_da, fso_range)."""
+    """Rank 0 builds the sample and every node maps one copy of it
+    (shared_sample_window); the full-field FSO range is a collective one-pass
+    scan.  The dim coordinates travel with the sample so every rank classifies
+    the dims the same way.  Returns (sample_np, sample_da, fso_range, win); the
+    caller frees the window, collectively."""
     comm, rank = sweep.comm, sweep.rank
     if rank == 0:
         try:
             local = utils.build_representative_sample(da, limit, rank=rank, policy=opts.sampling_policy,
                                                       vertical_floor=opts.vertical_floor).compute()
         except utils.SampleTooLargeError:
-            comm.Abort(1)  # the other ranks are waiting in the Bcast
+            comm.Abort(1)  # the other ranks are waiting in a collective
         sample_np_local = np.ascontiguousarray(local.values)
         meta = {"dims": tuple(local.dims), "attrs": dict(local.attrs), "name": local.name,
+                "shape": tuple(sample_np_local.shape), "dtype": str(sample_np_local.dtype),
                 "coords": {d: (np.asarray(local.coords[d].values), dict(local.coords[d].attrs),
                                dict(local.coords[d].encoding)) for d in local.dims if d in local.coords}}
-        fso_range = utils.full_field_data_range(da)
     else:
-        sample_np_local = meta = fso_range = None
-    sample_np = utils.broadcast_numpy(sample_np_local, comm=comm, root=0)
+        sample_np_local = meta = None
+    fso_range = utils.full_field_data_range(da, comm=comm)  # every rank scans a share of the blocks
     meta = comm.bcast(meta, root=0)
-    fso_range = comm.bcast(fso_range, root=0)
+    sample_np, win = shared_sample_window(sample_np_local, meta["shape"], meta["dtype"], sweep)
     del sample_np_local
     coords = {d: xr.Variable((d,), v, attrs=a, encoding=e) for d, (v, a, e) in meta["coords"].items()}
     sample_da = xr.DataArray(sample_np, dims=meta["dims"], coords=coords, attrs=meta["attrs"], name=meta["name"])
-    return sample_np, sample_da, fso_range
+    return sample_np, sample_da, fso_range, win
+
+
+def shared_sample_window(local_np, shape, dtype, sweep: SweepContext):
+    """One copy of the sample per node in an MPI-3 shared-memory window: each
+    node's leader allocates it, rank 0 fills its own from `local_np`, the
+    leaders Bcast into theirs, and every rank maps it read-only.  Returns
+    (sample_np, win).  A checksum across all ranks catches a rank reading the
+    window before its fill, which would otherwise surface as wrong metrics."""
+    dtype, count = np.dtype(dtype), int(np.prod(shape))
+    try:
+        win = MPI.Win.Allocate_shared(count * dtype.itemsize if sweep.local_rank == 0 else 0, dtype.itemsize,
+                                      comm=sweep.node_comm)
+    except MPI.Exception as e:
+        if sweep.rank == 0:
+            click.echo(f"[shared-sample] FATAL: MPI.Win.Allocate_shared failed ({e}); the node communicator "
+                       f"is not a shared-memory one (MPI without COMM_TYPE_SHARED?).")
+        sweep.comm.Abort(1)
+    buf, _ = win.Shared_query(0)
+    sample_np = np.frombuffer(buf, dtype=dtype, count=count).reshape(shape)
+    if sweep.local_rank == 0:
+        if sweep.rank == 0:
+            sample_np[...] = local_np
+        sweep.leaders.Bcast(sample_np, root=0)
+    sweep.node_comm.Barrier()
+    sample_np.flags.writeable = False
+    probe = sample_np.reshape(-1)[::4099]  # a strided view: no copy of the sample on every rank at once
+    h = float(np.nansum(probe, dtype=np.float64)) + float(probe.size)
+    if sweep.comm.allreduce(h, MPI.MIN) != sweep.comm.allreduce(h, MPI.MAX):
+        if sweep.rank == 0:
+            click.echo("[shared-sample] FATAL: the sample differs between ranks after the fill.")
+        sweep.comm.Abort(1)
+    return sample_np, win
 
 
 _ROW_KEY_COLUMNS = ["pipeline", "ratio", "l1_rel", "l2_rel", "linf_rel", "eucd"]  # a whole row has all of them
@@ -963,29 +983,28 @@ def config_space_table(config_space) -> pd.DataFrame:
 
 def sweep_banner(var, spaces, config_space, configs_for_rank, sample_np, opts, sweep: SweepContext, n_vars: int):
     compressors, filters, serializers = spaces
-    threads, num_loops = opts.threads_per_rank, len(config_space)
-    n_nodes = sweep.size // sweep.ranks_on_node if sweep.ranks_on_node else 1
-    peak = sweep.size * threads
-    trailer = (f" (only {min(peak, num_loops)} will run concurrently; {num_loops} combos total)"
-               if num_loops < peak else "")
-    click.echo(f"[topology] {n_nodes} node(s) x {sweep.ranks_on_node} rank(s)/node x {threads} "
-               f"thread(s)/rank = {peak} parallel evaluations ({sweep.cores_avail} visible core(s) per rank){trailer}.")
-    steady = per_rank_steady_estimate_bytes(sample_np.nbytes, threads, opts.inner_chunk_mib)
+    ranks, num_loops = sweep.ranks_on_node, len(config_space)
+    n_nodes = sweep.size // ranks if ranks else 1
+    trailer = (f" (only {min(sweep.size, num_loops)} will run concurrently; {num_loops} combos total)"
+               if num_loops < sweep.size else "")
+    click.echo(f"[topology] {n_nodes} node(s) x {ranks} rank(s)/node = {sweep.size} parallel evaluations, "
+               f"one shared sample per node{trailer}.")
+    steady = node_steady_estimate_bytes(sample_np.nbytes, ranks, opts.inner_chunk_mib)
     click.echo(f"[memory] rank-0 transient peak ~= {int(2 * sample_np.nbytes / 2**20)} MiB (building the sample); "
-               f"per-rank steady ~= {int(sample_np.nbytes / 2**20)} MiB (sample) + "
-               f"~{int(threads * PER_THREAD_WORKING_FACTOR * sample_np.nbytes / 2**20)} MiB "
-               f"({threads} threads x {PER_THREAD_WORKING_FACTOR:.1f}x decode/encode cache) + "
-               f"~{threads * max(1, opts.inner_chunk_mib) * 2} MiB (threads x 2 x inner_chunk_mib) "
+               f"per-node steady ~= {int(sample_np.nbytes / 2**20)} MiB (shared sample) + "
+               f"~{int(ranks * PER_RANK_WORKING_FACTOR * sample_np.nbytes / 2**20)} MiB "
+               f"({ranks} ranks x {PER_RANK_WORKING_FACTOR:.1f}x decode/encode cache) + "
+               f"~{ranks * max(1, opts.inner_chunk_mib) * 2} MiB (ranks x 2 x inner_chunk_mib) "
                f"= {hsize(steady)} total.")
     if n_vars > 1:
         click.echo(f"[topology] sweep will iterate {n_vars} variables; one sample Bcast per "
-                   f"variable (~{hsize(sample_np.nbytes)} each over the interconnect).")
+                   f"variable (~{hsize(sample_np.nbytes)} to each node over the interconnect).")
     n_ebcc = sum(isinstance(cfg[2], utils.EBCC) for cfg in config_space)
     n_regular = sum(not isinstance(s, utils.EBCC) for s in serializers)
     cap = f", --max-evals {opts.max_evals}" if opts.max_evals is not None else ""
     click.echo(f"[sweep] {num_loops} combos: {num_loops - n_ebcc} from the {len(compressors)} x {len(filters)} x "
                f"{n_regular} grid (valid pairings{cap}) + {n_ebcc} EBCC; split across "
-               f"{sweep.size} rank(s), ~{len(configs_for_rank)} per rank, running {threads}-wide.")
+               f"{sweep.size} rank(s), ~{len(configs_for_rank)} per rank.")
 
 
 def sweep_evaluators(var, sample_np, sample_da, q99_abs, opts, sweep: SweepContext):
@@ -1040,7 +1059,7 @@ PARTIAL_CSV_COLUMNS = [
 
 def sweep_run_rank(configs, keys, done: set, var, opts, sweep: SweepContext, evaluate_one, gate) -> list:
     """Evaluate this rank's configs (with their pipeline keys) that are not in
-    `done`, in a thread pool, streaming every result to
+    `done`, one at a time, streaming every result to
     config_space_{var}_rank{rank}.csv (and failures to failures_...csv).  The
     verdict columns hold the gates of the run that evaluated the row; the
     consolidation re-gates.  Returns the failures."""
@@ -1050,45 +1069,42 @@ def sweep_run_rank(configs, keys, done: set, var, opts, sweep: SweepContext, eva
     mode = "a" if partial_path.is_file() else "w"
     pending = [cfg for cfg, key in zip(configs, keys) if key not in done]
     total = max(1, len(pending))
+    print_every = max(1, total // 10)
 
     failures = []
-    FLUSH_EVERY = 100
+    FLUSH_EVERY = 10
     with open(partial_path, mode, newline="") as pf, open(failures_path, "w", newline="") as ff:
         pw, fw = csv.writer(pf), csv.writer(ff)
         if pf.tell() == 0:
             pw.writerow(PARTIAL_CSV_COLUMNS)
         fw.writerow(["name", "pipeline", "error"])
         n_rows = n_fail = 0
-        with ThreadPoolExecutor(max_workers=opts.threads_per_rank) as pool:
-            futures = {pool.submit(evaluate_one, cfg): cfg for cfg in pending}
-            for fut in as_completed(futures):
-                cfg = futures[fut]
-                try:
-                    r = fut.result()
-                except Exception as e:  # one broken combo never stops the sweep
-                    failures.append((utils.pipeline_name(*cfg), utils.pipeline_json(*cfg), repr(e)))
-                    fw.writerow(failures[-1])
-                    n_fail += 1
-                    if n_fail % FLUSH_EVERY == 0:
-                        ff.flush()
-                    utils.progress_bar(total, print_every=100, key=str(var))
-                    continue
-                err = r["errors"]
-                keep, reasons = gate(err)
-                pw.writerow([
-                    r["name"], r["compressor"], r["filter"], r["serializer"], r["pipeline"],
-                    r["ratio"], err["Relative_Error_L1"], err["Relative_Error_L2"], err["Relative_Error_Linf"],
-                    err.get("Bias_Rel"), err.get("Q99_Rel"), err.get("Grad_Rel"),
-                    err.get("Decoded_Min"), err.get("Decoded_Max"), err.get("N_Corrupt", 0), r["eucd"],
-                    reasons["pass_l1"], reasons["pass_l2"], reasons["pass_linf"], reasons["pass_bias"],
-                    reasons["pass_q99"], reasons["pass_bounds"], reasons["pass_grad"], reasons["pass_finite"],
-                    keep,
-                ])
-                n_rows += 1
-                if n_rows % FLUSH_EVERY == 0:
-                    pf.flush()
-                utils.progress_bar(total, print_every=100, key=str(var))
-    utils.AsyncBypass.close_loops()  # the pool's threads are gone; release their event loops
+        for cfg in pending:
+            try:
+                r = evaluate_one(cfg)
+            except Exception as e:  # one broken combo never stops the sweep
+                failures.append((utils.pipeline_name(*cfg), utils.pipeline_json(*cfg), repr(e)))
+                fw.writerow(failures[-1])
+                n_fail += 1
+                if n_fail % FLUSH_EVERY == 0:
+                    ff.flush()
+                utils.progress_bar(total, print_every=print_every, key=str(var))
+                continue
+            err = r["errors"]
+            keep, reasons = gate(err)
+            pw.writerow([
+                r["name"], r["compressor"], r["filter"], r["serializer"], r["pipeline"],
+                r["ratio"], err["Relative_Error_L1"], err["Relative_Error_L2"], err["Relative_Error_Linf"],
+                err.get("Bias_Rel"), err.get("Q99_Rel"), err.get("Grad_Rel"),
+                err.get("Decoded_Min"), err.get("Decoded_Max"), err.get("N_Corrupt", 0), r["eucd"],
+                reasons["pass_l1"], reasons["pass_l2"], reasons["pass_linf"], reasons["pass_bias"],
+                reasons["pass_q99"], reasons["pass_bounds"], reasons["pass_grad"], reasons["pass_finite"],
+                keep,
+            ])
+            n_rows += 1
+            if n_rows % FLUSH_EVERY == 0:
+                pf.flush()
+            utils.progress_bar(total, print_every=print_every, key=str(var))
     return failures
 
 
@@ -1162,7 +1178,7 @@ def sweep_select_best(where_to_write, var, gate, planned: set):
 
 
 SWEEP_ARG_KEYS = (
-    "eval_data_size_limit", "threads_per_rank", "codec_threads", "inner_chunk_mib", "max_inner_chunk_mib",
+    "eval_data_size_limit", "inner_chunk_mib", "max_inner_chunk_mib",
     "spatial_split", "compressor_class", "filter_class", "serializer_class", "with_lossy", "with_ebcc",
     "sampling_policy", "vertical_floor", "l1_threshold", "l2_threshold", "linf_threshold", "bias_threshold",
     "q99_threshold", "l2_gate", "linf_gate", "bias_gate", "extremes_sensitive", "phys_min", "phys_max",
@@ -1177,7 +1193,8 @@ def sweep_manifest(var, opts, sweep: SweepContext, *, num_combos, n_passed, tota
         "command": "evaluate_combos",
         "dataset_file": os.fspath(opts.dataset_file), "var": str(var), "where_to_write": os.fspath(opts.where_to_write),
         "args": {k: getattr(opts, k) for k in SWEEP_ARG_KEYS},
-        "topology": {"size": int(sweep.size), "cores_avail": int(sweep.cores_avail)},
+        "topology": {"size": int(sweep.size), "cores_avail": int(sweep.cores_avail),
+                     "ranks_on_node": int(sweep.ranks_on_node)},
         "effective_thresholds": {k: (None if not math.isfinite(v) else float(v)) for k, v in sweep.thresholds.items()},
         "gradient_threshold": float(opts.gradient_threshold) if opts.gradient_gate else None,
         "phys_min": opts.phys_min, "phys_max": opts.phys_max,
@@ -1203,12 +1220,23 @@ def sweep_variable(da, var: str, opts, sweep: SweepContext, n_vars: int) -> None
         click.echo(f"[var] {var} | units={da.attrs.get('units', 'N/A')} | "
                    f"relative L1 threshold={sweep.thresholds['l1']:.3e}")
     limit = sweep_sample_limit(var, int(da.nbytes), opts, sweep)
-    sample_np, sample_da, fso_range = sweep_build_sample(da, limit, opts, sweep)
+    sample_np, sample_da, fso_range, win = sweep_build_sample(da, limit, opts, sweep)
+    try:
+        _sweep_variable_body(da, var, opts, sweep, n_vars, t0, sample_np, sample_da, fso_range)
+    finally:
+        if win is not None:  # collective: every rank frees the node's window before the next variable
+            del sample_np, sample_da
+            win.Free()
+
+
+def _sweep_variable_body(da, var, opts, sweep: SweepContext, n_vars, t0, sample_np, sample_da, fso_range):
+    rank, size = sweep.rank, sweep.size
     span = float(fso_range[1] - fso_range[0]) if fso_range else 0.0
     opts.phys_slack = float(getattr(opts, "phys_tolerance", 0.0) or 0.0) * span   # absolute; the manifest carries it
     if opts.phys_slack and rank == 0:
         click.echo(f"[gates] {var}: bounds slack {opts.phys_slack:g} ({opts.phys_tolerance:g} of the range {span:g})")
-    q99_abs = q99_cut(sample_np) if opts.extremes_sensitive else None
+    # q99_cut holds ~3 sample-sized temporaries: rank 0 computes it, the others receive the float
+    q99_abs = sweep.comm.bcast(q99_cut(sample_np) if rank == 0 else None, root=0) if opts.extremes_sensitive else None
     if opts.extremes_sensitive and rank == 0:
         click.echo(f"[gates] {var}: q99(|value|)={q99_abs} (extreme-tail cut for the q99 gate)")
     try:
@@ -1641,7 +1669,7 @@ UI_DEFAULT_L1 = 0.005
 def ui_launcher(user_account=None, time=None, nodes=None, ntasks_per_node=None, uenv_image=None,
                 partition=None) -> list:
     """Command prefix: srun with the allocation when a vcluster account is
-    given, else nothing (a plain single-process run)."""
+    given, else nothing."""
     if user_account:
         return ["srun", "-A", user_account, "--time", time or "00:15:00", "--nodes", nodes or "1",
                 "--ntasks-per-node", ntasks_per_node or "1", "--uenv=" + (uenv_image or ""),
@@ -1651,13 +1679,22 @@ def ui_launcher(user_account=None, time=None, nodes=None, ntasks_per_node=None, 
 
 def ui_env() -> dict:
     """Environment for the launched commands: the codec thread pools pinned
-    to 1, as the oversubscription check demands."""
-    return {**os.environ, **{v: "1" for v in utils.THREAD_ENV_VARS}}
+    to 1, as the oversubscription check demands, and Open MPI allowed to run
+    as root (a container)."""
+    return {**os.environ, **{v: "1" for v in utils.THREAD_ENV_VARS},
+            "OMPI_ALLOW_RUN_AS_ROOT": "1", "OMPI_ALLOW_RUN_AS_ROOT_CONFIRM": "1"}
+
+
+def ui_mpirun() -> list:
+    """mpirun with one rank per core when an MPI launcher is on the PATH, else
+    nothing (one rank): a sweep's parallelism comes from its ranks."""
+    launcher = shutil.which("mpirun") or shutil.which("mpiexec")
+    return [launcher, "-n", str(utils.detect_cores_available())] if launcher else []
 
 
 def ui_sweep_command(launcher, dataset, out_dir, field, classes: dict, with_lossy: bool, with_ebcc: bool,
                      l1_threshold: float) -> list:
-    return launcher + ["dc_toolkit", "evaluate_combos", dataset, "--where-to-write", out_dir,
+    return (launcher or ui_mpirun()) + ["dc_toolkit", "evaluate_combos", dataset, "--where-to-write", out_dir,
                        "--field-to-compress", field, "--l1-threshold", str(l1_threshold),
                        "--compressor-class", classes["compressor"], "--filter-class", classes["filter"],
                        "--serializer-class", classes["serializer"],
