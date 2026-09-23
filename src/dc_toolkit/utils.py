@@ -1255,20 +1255,10 @@ def check_thread_oversubscription(abort_if_unsafe: bool = True, rank: int = 0, c
 # 8. PROGRESS & TIMING
 # =============================================================================
 
-_PROGRESS_COUNTERS = defaultdict(int)
-
-
-def progress_bar(total, print_every=100, bar_width=40, key: str = "default"):
-    """Progress line of rank 0's own share; call once per completed unit."""
-    rank = MPI.COMM_WORLD.Get_rank()
-    if rank != 0:
-        return
-    _PROGRESS_COUNTERS[key] += 1
-    done = _PROGRESS_COUNTERS[key]
-    if done % print_every == 0 or done == total:
-        pct = done / total
-        bar = "*" * int(bar_width * pct) + "-" * (bar_width - int(bar_width * pct))
-        click.echo(f"[Rank {rank}] Progress: |{bar}| {pct*100:6.2f}% ({done}/{total})")
+def progress_bar(done: int, total: int, label: str, bar_width: int = 40) -> None:
+    pct = done / max(1, total)
+    bar = "*" * int(bar_width * pct) + "-" * (bar_width - int(bar_width * pct))
+    click.echo(f"[{label}] Progress: |{bar}| {pct*100:6.2f}% ({done}/{total})")
 
 
 _TIMINGS = defaultdict(list)

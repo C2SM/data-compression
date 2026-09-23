@@ -34,7 +34,7 @@ Run with N nodes and R ranks per node:
 #SBATCH --nodes=8 --ntasks-per-node=32 --cpus-per-task=1
 ```
 
-The combos are shuffled with a seed derived from their count (so every rank gets a representative mix of cheap and expensive codecs, and `--resume` sees the same order) and then split across the N × R ranks deterministically (rank k takes every (N × R)-th combo starting at k). Each rank evaluates its combos one at a time, independently: no coordination during the sweep, just a final result-gather on rank 0.
+The combos are shuffled with a seed derived from their count (so every node gets a representative mix of cheap and expensive codecs, and `--resume` sees the same order) and split across the N nodes deterministically (node k takes every N-th combo starting at k). Inside a node, the R ranks share a counter in the node's shared memory: a rank that finishes a combo claims the next one with an atomic fetch-and-add, which waits on no other process, so no rank idles while its node has work left. Combo costs differ by an order of magnitude; the counter keeps a rank that drew expensive ones from holding up the node, and each node's share is large enough (about 1,100 combos on 8 nodes) that the shuffle evens out the nodes. The results meet on rank 0 at the end.
 
 Adding more nodes gives a clean linear speedup: two nodes process combos roughly 2× faster than one, eight nodes 8× faster.
 

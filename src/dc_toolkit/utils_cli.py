@@ -705,6 +705,8 @@ class SweepContext:
     node_comm: object    # the ranks of this node, ...
     local_rank: int      # ... this rank's index among them, ...
     leaders: object      # ... and one rank per node (COMM_NULL elsewhere)
+    node_id: int         # this node's index among ...
+    n_nodes: int         # ... the job's nodes
 
 
 def sweep_setup(opts) -> SweepContext:
@@ -726,6 +728,8 @@ def sweep_setup(opts) -> SweepContext:
         sys.excepthook = abort_on_error
     node_comm, ranks_on_node, local_rank = utils.detect_node_topology(comm)
     leaders = comm.Split(0 if local_rank == 0 else MPI.UNDEFINED, key=rank)
+    node_id = node_comm.bcast(leaders.Get_rank() if local_rank == 0 else None, root=0)
+    n_nodes = comm.allreduce(1 if local_rank == 0 else 0)
     cores_avail = utils.detect_cores_available()
     cores = utils.detect_physical_cores() if size == 1 else 1
     if cores > 1:
@@ -747,7 +751,8 @@ def sweep_setup(opts) -> SweepContext:
                    f"Linf={fmt(thr['linf'])} bias={fmt(thr['bias'])} q99={fmt(thr['q99'])} | "
                    f"bounds=[{opts.phys_min}, {opts.phys_max}]"
                    f"{f' +-{opts.phys_tolerance:g} of range' if getattr(opts, 'phys_tolerance', 0) else ''} | gradient={grad}")
-    return SweepContext(comm, rank, size, ranks_on_node, cores_avail, thr, node_comm, local_rank, leaders)
+    return SweepContext(comm, rank, size, ranks_on_node, cores_avail, thr, node_comm, local_rank, leaders,
+                        node_id, n_nodes)
 
 
 def sweep_variables(ds, field, rank: int) -> list:
@@ -982,13 +987,12 @@ def config_space_table(config_space) -> pd.DataFrame:
                           "pipeline": utils.pipeline_json(*cfg)} for cfg in config_space])
 
 
-def sweep_banner(var, spaces, config_space, configs_for_rank, sample_np, opts, sweep: SweepContext, n_vars: int):
+def sweep_banner(var, spaces, config_space, n_pending, sample_np, opts, sweep: SweepContext, n_vars: int):
     compressors, filters, serializers = spaces
     ranks, num_loops = sweep.ranks_on_node, len(config_space)
-    n_nodes = sweep.size // ranks if ranks else 1
     trailer = (f" (only {min(sweep.size, num_loops)} will run concurrently; {num_loops} combos total)"
                if num_loops < sweep.size else "")
-    click.echo(f"[topology] {n_nodes} node(s) x {ranks} rank(s)/node = {sweep.size} parallel evaluations, "
+    click.echo(f"[topology] {sweep.n_nodes} node(s) x {ranks} rank(s)/node = {sweep.size} parallel evaluations, "
                f"one shared sample per node{trailer}.")
     steady = node_steady_estimate_bytes(sample_np.nbytes, ranks, opts.inner_chunk_mib)
     click.echo(f"[memory] rank-0 transient peak ~= {int(2 * sample_np.nbytes / 2**20)} MiB (building the sample); "
@@ -1004,8 +1008,8 @@ def sweep_banner(var, spaces, config_space, configs_for_rank, sample_np, opts, s
     n_regular = sum(not isinstance(s, utils.EBCC) for s in serializers)
     cap = f", --max-evals {opts.max_evals}" if opts.max_evals is not None else ""
     click.echo(f"[sweep] {num_loops} combos: {num_loops - n_ebcc} from the {len(compressors)} x {len(filters)} x "
-               f"{n_regular} grid (valid pairings{cap}) + {n_ebcc} EBCC; split across "
-               f"{sweep.size} rank(s), ~{len(configs_for_rank)} per rank.")
+               f"{n_regular} grid (valid pairings{cap}) + {n_ebcc} EBCC; {n_pending} to evaluate, "
+               f"~{-(-n_pending // sweep.n_nodes)} per node, claimed by its ranks as they free up.")
 
 
 def sweep_evaluators(var, sample_np, sample_da, q99_abs, opts, sweep: SweepContext):
@@ -1058,19 +1062,39 @@ PARTIAL_CSV_COLUMNS = [
 ]
 
 
-def sweep_run_rank(configs, keys, done: set, var, opts, sweep: SweepContext, evaluate_one, gate) -> list:
-    """Evaluate this rank's configs (with their pipeline keys) that are not in
-    `done`, one at a time, streaming every result to
-    config_space_{var}_rank{rank}.csv (and failures to failures_...csv).  The
-    verdict columns hold the gates of the run that evaluated the row; the
+def node_counter(sweep: SweepContext):
+    """claim() -> 0, 1, 2, ... across the ranks of this node, each value once:
+    an atomic fetch-and-add on a counter in the node's shared memory, which
+    waits on no other process.  Returns (claim, win); free win collectively."""
+    win = MPI.Win.Allocate_shared(8 if sweep.local_rank == 0 else 0, 8, comm=sweep.node_comm)
+    if sweep.local_rank == 0:
+        win.Lock(0, MPI.LOCK_EXCLUSIVE)
+        win.Put(np.zeros(1, np.int64), 0)
+        win.Unlock(0)
+    sweep.node_comm.Barrier()
+    one, got = np.ones(1, np.int64), np.empty(1, np.int64)
+    win.Lock_all()
+
+    def claim() -> int:
+        win.Fetch_and_op(one, got, 0, op=MPI.SUM)
+        win.Flush(0)
+        return int(got[0])
+    return claim, win
+
+
+def sweep_run_rank(config_space, pending, var, opts, sweep: SweepContext, evaluate_one, gate) -> list:
+    """Evaluate combos of this node's share of `pending` (indices into
+    config_space) as the node's counter hands them out, streaming every result
+    to config_space_{var}_rank{rank}.csv (and failures to failures_...csv).
+    The verdict columns hold the gates of the run that evaluated the row; the
     consolidation re-gates.  Returns the failures."""
     rank = sweep.rank
     partial_path = Path(opts.where_to_write) / f"config_space_{var}_rank{rank}.csv"
     failures_path = Path(opts.where_to_write) / f"failures_{var}_rank{rank}.csv"
     mode = "a" if partial_path.is_file() else "w"
-    pending = [cfg for cfg, key in zip(configs, keys) if key not in done]
-    total = max(1, len(pending))
-    print_every = max(1, total // 10)
+    share = pending[sweep.node_id::sweep.n_nodes]
+    report_every, next_report = max(1, len(share) // 10), 0
+    claim, win = node_counter(sweep)
 
     failures = []
     FLUSH_EVERY = 10
@@ -1080,7 +1104,14 @@ def sweep_run_rank(configs, keys, done: set, var, opts, sweep: SweepContext, eva
             pw.writerow(PARTIAL_CSV_COLUMNS)
         fw.writerow(["name", "pipeline", "error"])
         n_rows = n_fail = 0
-        for cfg in pending:
+        while True:
+            i = claim()
+            if i >= len(share):
+                break
+            if rank == 0 and i >= next_report:  # rank 0 sees the claims of its whole node
+                utils.progress_bar(i, len(share), "node 0")
+                next_report = i + report_every
+            cfg = config_space[share[i]]
             try:
                 r = evaluate_one(cfg)
             except Exception as e:  # one broken combo never stops the sweep
@@ -1089,7 +1120,6 @@ def sweep_run_rank(configs, keys, done: set, var, opts, sweep: SweepContext, eva
                 n_fail += 1
                 if n_fail % FLUSH_EVERY == 0:
                     ff.flush()
-                utils.progress_bar(total, print_every=print_every, key=str(var))
                 continue
             err = r["errors"]
             keep, reasons = gate(err)
@@ -1105,7 +1135,8 @@ def sweep_run_rank(configs, keys, done: set, var, opts, sweep: SweepContext, eva
             n_rows += 1
             if n_rows % FLUSH_EVERY == 0:
                 pf.flush()
-            utils.progress_bar(total, print_every=print_every, key=str(var))
+    win.Unlock_all()
+    win.Free()
     return failures
 
 
@@ -1215,7 +1246,7 @@ def sweep_manifest(var, opts, sweep: SweepContext, *, num_combos, n_passed, tota
 def sweep_variable(da, var: str, opts, sweep: SweepContext, n_vars: int) -> None:
     """Sweep one field: sample -> codec space -> this rank's share -> gather
     -> results, winner and manifest on rank 0."""
-    rank, size = sweep.rank, sweep.size
+    rank = sweep.rank
     t0 = time.perf_counter()
     if rank == 0:
         click.echo(f"[var] {var} | units={da.attrs.get('units', 'N/A')} | "
@@ -1230,7 +1261,7 @@ def sweep_variable(da, var: str, opts, sweep: SweepContext, n_vars: int) -> None
 
 
 def _sweep_variable_body(da, var, opts, sweep: SweepContext, n_vars, t0, sample_np, sample_da, fso_range):
-    rank, size = sweep.rank, sweep.size
+    rank = sweep.rank
     span = float(fso_range[1] - fso_range[0]) if fso_range else 0.0
     opts.phys_slack = float(getattr(opts, "phys_tolerance", 0.0) or 0.0) * span   # absolute; the manifest carries it
     if opts.phys_slack and rank == 0:
@@ -1259,19 +1290,19 @@ def _sweep_variable_body(da, var, opts, sweep: SweepContext, n_vars, t0, sample_
         all_finite = sweep.comm.bcast(bool(np.isfinite(sample_np).all()) if rank == 0 else None, root=0)
     config_space = sweep_config_space(*spaces, opts.max_evals, rank, sample_np.dtype, all_finite)
     keys = [utils.pipeline_json(*cfg) for cfg in config_space]
-    configs_for_rank = config_space[rank::size]
+    pending = [i for i, key in enumerate(keys) if key not in done]
     if rank == 0:
         if not config_space:
             click.echo(f"[sweep] {var}: the codec space is empty for these classes and this dtype.")
         if done:
             click.echo(f"[resume] {sum(k in done for k in keys)} of {len(keys)} combo(s) of '{var}' are already "
                        f"recorded; skipping those.")
-        sweep_banner(var, spaces, config_space, configs_for_rank, sample_np, opts, sweep, n_vars)
+        sweep_banner(var, spaces, config_space, len(pending), sample_np, opts, sweep, n_vars)
         config_space_table(config_space).to_csv(os.path.join(opts.where_to_write, f"config_space_{var}.csv"),
                                                 index=False)
 
     evaluate_one, gate = sweep_evaluators(var, sample_np, sample_da, q99_abs, opts, sweep)
-    failures = sweep_run_rank(configs_for_rank, keys[rank::size], done, var, opts, sweep, evaluate_one, gate)
+    failures = sweep_run_rank(config_space, pending, var, opts, sweep, evaluate_one, gate)
     total_failures = sweep_report_failures(failures, var, sweep)
     sweep.comm.Barrier()  # every rank's CSV is complete before rank 0 consolidates
     if rank != 0:
