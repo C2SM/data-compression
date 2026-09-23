@@ -148,9 +148,9 @@ sections as a laptop user would; note anything that does not match what you saw.
 - Do not touch `main`. Fixes the laptop tests require (the `--shm-size` note is the likely one) go on
   `mpi-shmem-experimental` with Christos's go; say in section 6 what changed and why. Push the branch
   after committing so Santis can pull it.
-- This file is untracked on purpose (test scaffolding stays out of the repository). Carry it by hand or
-  commit it on the branch temporarily and drop it before the merge; if you commit it, it holds no paths
-  beyond `$SCRATCH` and `$DYAMOND_DATA_ROOT`.
+- This file is committed on the branch as test scaffolding and is dropped before the merge, as the
+  earlier test folders were; it holds no paths beyond `$SCRATCH` and `$DYAMOND_DATA_ROOT`. Commit your
+  section 6 on the branch and push, so that Santis reads it with `git pull`.
 
 ## 6. Laptop findings (written by Claude Code on the laptop)
 
