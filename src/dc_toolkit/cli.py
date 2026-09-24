@@ -121,7 +121,8 @@ _VERIFY_OPTIONS = [
                       "(roughly doubles wall time; skip for trusted re-runs)."),
     click.option("--verify-gate/--no-verify-gate", default=True, show_default=True,
                  help="With --verify, fail a field whose production norms exceed the sweep thresholds "
-                      "or physical bounds in manifest_{var}.json (the gradient gate is sweep-only).  "
+                      "or physical bounds in manifest_{var}.json, or whose round trip changed a cell's "
+                      "finiteness (NaN fill written as data; the gradient gate is sweep-only).  "
                       "--no-verify-gate only warns."),
 ]
 
@@ -141,8 +142,9 @@ _VERIFY_OPTIONS = [
                    "one dim, CF bounds excepted).")
 @click.option("--eval-data-size-limit", default="5GB", callback=utils_cli.size_option_callback, show_default=True,
               help="Budget of the representative sample the combos are scored on (e.g. 5GB, 512MiB): shrunk "
-                   "to fit the node's memory, and raised to the field's smallest sample: 3 time steps and 3 "
-                   "levels (all, where there are fewer), or the whole field when it has neither.")
+                   "to fit the node's memory, and raised to the field's smallest sample: 3 time steps (3 indices "
+                   "across all time-like dims, ensemble members and forecast steps included) and 3 levels, all "
+                   "where there are fewer, or the whole field when it has neither.")
 @_OVERSUBSCRIPTION_OPTION
 @utils_cli.add_options(_CHUNK_OPTIONS)
 @_MEMORY_OPTION
@@ -169,8 +171,9 @@ _VERIFY_OPTIONS = [
                    "rings past a bound the field sits on by a hair. Stored in the manifest as an absolute "
                    "value, so compress's verify gate applies the same slack.")
 @click.option("--gradient-gate/--no-gradient-gate", default=False, show_default=True,
-              help="Enable the spatial-gradient gate: finite differences along the horizontal dims (one more "
-                   "pass over the sample per combo; for winds, pressure).")
+              help="Enable the spatial-gradient gate: finite differences along the horizontal dims, or the "
+                   "non-leading dims of a field without any (one more pass over the sample per combo; for "
+                   "winds, pressure).")
 @click.option("--gradient-threshold", type=click.FloatRange(min=0.0), default=0.1, show_default=True, callback=_finite,
               help="Max relative L1 error of the finite-difference field (absolute fraction, not x L1).")
 @click.option("--gradient-shortcircuit/--no-gradient-shortcircuit", default=True, show_default=True,
@@ -179,7 +182,8 @@ _VERIFY_OPTIONS = [
 @click.option("--sampling-policy", type=click.Choice(["cascade", "balanced"]), default="cascade",
               show_default=True,
               help="How an over-budget field is thinned (only its time and vertical dims; the others are kept "
-                   "whole, and at least 3 time steps and 3 levels are kept): 'cascade' keeps a floor of "
+                   "whole, and at least 3 time steps and 3 levels are kept, as for --eval-data-size-limit): "
+                   "'cascade' keeps a floor of "
                    "levels, then spends the budget on time steps; 'balanced' splits it evenly across the time "
                    "and vertical dims.")
 @click.option("--vertical-floor", type=click.IntRange(min=3), default=None,

@@ -158,8 +158,8 @@ by 0.5 % of their typical magnitude". The other gates are derived from it unless
 | Linf | the **worst single cell** | 10 × L1 |
 | bias | systematic drift (mean signed error) | 0.5 × L1 |
 
-One more gate needs no setting: a pipeline that turns a missing value (`NaN`) into a number, or a number
-into `NaN` or `Inf`, is dropped (the `n_corrupt` count).
+One more gate needs no setting: a pipeline that turns a missing value (`NaN`) of the sample into a number, or
+a number into `NaN` or `Inf`, is dropped (the `n_corrupt` count).
 
 A pipeline is **kept** only if it passes every gate, and the winner is the kept pipeline with the highest
 compression ratio. All errors are relative to the magnitude of the field, which matters more than you might
@@ -657,7 +657,7 @@ stage out". For serializers, `all` includes plain bytes and `none` is plain byte
 |---|---|
 | `--phys-min 0`, `--phys-max 100` | a decoded value outside these bounds is wrong by definition (negative humidity, 101 % cloud cover). `--phys-tolerance 0.0001` allows a hair of overshoot, as a fraction of the field's range, which lossy codecs produce on fields that sit exactly on a bound. |
 | `--extremes-sensitive` | the rare large values are what matters (precipitation, gusts, CAPE): adds a gate on the top 1 % of values (of the non-zero values, for a field that is 0 almost everywhere) |
-| `--gradient-gate` | differences between neighbouring cells matter (wind, pressure): adds a gate on horizontal gradients |
+| `--gradient-gate` | differences between neighbouring cells matter (wind, pressure): adds a gate on horizontal gradients (along the other non-leading dims for a field without horizontal ones) |
 
 **A store that opens anywhere.** Two codecs exist only inside `dc_toolkit`: EBCC, and `zfpy_flat`, a variant
 of zfp that regularly wins sweeps. A store that uses either one cannot be opened by a Zarr reader without
@@ -689,14 +689,15 @@ or attributes (units), so the file has none either.
 **The sample.** The sweep does not run on the whole field but on a representative sample of at most
 `--eval-data-size-limit` (default `5GB`, or less after `[memcheck] auto-shrunk`): whole horizontal fields at
 time steps and levels spread evenly through the file. A field that fits is evaluated in full. A sample keeps
-at least 3 time steps and 3 levels (all, where the field has fewer), so a smaller limit is raised to that
+at least 3 time steps and 3 levels (all, where the field has fewer; ensemble members and forecast steps count
+as time steps), so a smaller limit is raised to that
 (`[sample] raised the sample budget ...`); a field with no time or vertical dimension to thin is its own
 sample. For big files on a laptop, lower the limit, for example `--eval-data-size-limit 512MiB`.
 
 A sample must show how the field varies. When it holds a single value (or none that is finite) while the
 field varies, the sweep skips the field (`[var] skipping ...`, an error for the `--field-to-compress`): raise
-`--eval-data-size-limit`. A field whose finite values are all one number is stored losslessly with Zstd,
-without a search.
+`--eval-data-size-limit`. A field whose finite values are all one number, or that has none, is stored
+losslessly with Zstd, without a search.
 
 **Memory.** The processes of one machine share a single copy of the sample; each adds a working set of about
 twice the sample for the pipeline it is evaluating, so memory grows with the number of ranks. The `[memory]`
@@ -721,9 +722,11 @@ the number of ranks, so resume with the same `mpirun -n`: a different count can 
 the field is larger than the budget), which starts the field over. `--no-resume` forces a fresh start.
 
 **Fields with NaN.** Cells that are NaN in your file (fill values, masked land or sea) are left out of every
-error norm, and a pipeline must give them back as NaN: `fixedscaleoffset` and `zfpy` decode them as numbers,
-so on such a field the sweep drops those pipelines and `compress` refuses them (`pass_finite`). In section
-5's check, use `np.nanmax`.
+error norm, and a pipeline must give them back as NaN: `fixedscaleoffset` and `zfpy` decode them as numbers.
+The sweep drops those pipelines when its sample holds NaN; a field whose NaN lie outside the sample can win
+with one and then fail `compress` (`[verify-gate] FAIL ... (pass_finite)`, nothing is written): sweep it
+again without them (`--filter-class bitround`, `--serializer-class pcodec`, ...). In section 5's check, use
+`np.nanmax`.
 
 **`compress` is safe to repeat.** Fields already in the store are skipped, and a field that failed is
 retried.
@@ -741,7 +744,7 @@ retried.
 | `--with-ebcc needs the ebcc package` | EBCC is not installed | `pip install -e ".[ebcc]"` (section 8) |
 | `--serializer-class ebcc has nothing for this field: ...` | the field is not a float (lat, lon) grid, or no tile fits its frame (section 8) | sweep it without EBCC |
 | `invalid pipeline ... (e.g. FixedScaleOffset->ZFPY, ...)` | one of the pairings section 7 lists as refused | fix that pairing: `bitround` before `zfpy` only with the full mantissa, no `fixedscaleoffset` before `zfpy` (or before 8-bit `pcodec`), EBCC with no compressor and at most the `astype` filter |
-| `[verify-gate] FAIL` and exit status 1 | the written field exceeds the budget | loosen the budget, or choose a more careful pipeline; nothing was left in the store |
+| `[verify-gate] FAIL` and exit status 1 | the written field exceeds the budget, or (`pass_finite`) its pipeline changed missing values | loosen the budget, or choose a more careful pipeline (for `pass_finite`, one without `fixedscaleoffset` and `zfpy`); nothing was left in the store |
 | `[verify-gate] ... no thresholds ...; verification advisory only` | `--pipeline` without a budget | add `--l1-threshold` if you want the check enforced |
 | `t already in ...; skipping.` | the store already holds the field | add `--no-skip-existing` to overwrite |
 | `[resume] ... starting this field from scratch` | the file, sample, chunking, metric definitions or library versions changed | nothing; the recorded results do not match, so the field is measured again |

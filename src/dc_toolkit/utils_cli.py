@@ -425,17 +425,18 @@ def evaluate_cr_drift(production_ratio, predicted_ratio, tol):
 
 
 def q99_cut(sample_np: np.ndarray):
-    """The q99 gate's tail cut: the 99th percentile of |finite values|, or of the non-zero ones when
-    that is 0.  A field that is 0 almost everywhere (cloud ice, hail) would otherwise put every cell in
-    the tail, and its extremes are its largest non-zero values.  None when no value is finite."""
+    """(cut, over_nonzero): the q99 gate's tail cut, the 99th percentile of |finite values|, or of the
+    non-zero ones (over_nonzero) when that is 0.  A field that is 0 almost everywhere (cloud ice, hail)
+    would otherwise put every cell in the tail, and its extremes are its largest non-zero values.  The cut
+    is None when no value is finite."""
     finite = np.abs(sample_np[np.isfinite(sample_np)])
     if not finite.size:
-        return None
+        return None, False
     cut = float(np.quantile(finite, 0.99))
-    if cut == 0:
-        nonzero = finite[finite > 0]
-        cut = float(np.quantile(nonzero, 0.99)) if nonzero.size else 0.0
-    return cut
+    if cut != 0:
+        return cut, False
+    nonzero = finite[finite > 0]
+    return (float(np.quantile(nonzero, 0.99)) if nonzero.size else 0.0), bool(nonzero.size)
 
 
 def fmt3(x) -> str:
@@ -761,7 +762,8 @@ def sweep_sample_limit(var: str, da, opts, sweep: SweepContext) -> int:
 def sweep_build_sample(da, limit: int, opts, sweep: SweepContext):
     """Collective.  Rank 0 builds the sample, each node maps one shared copy (shared_sample_window) and all
     ranks split the full-field range pass; the dim coords travel along so every rank classifies the dims
-    alike.  Returns (sample_np, sample_da, fso_range, win); the caller frees win, collectively."""
+    alike.  Returns (sample_np, sample_da, fso_range, readable, win) with full_field_data_range's range and
+    readable; the caller frees win, collectively."""
     comm, rank = sweep.comm, sweep.rank
     if rank == 0:
         try:
@@ -776,13 +778,13 @@ def sweep_build_sample(da, limit: int, opts, sweep: SweepContext):
                                dict(local.coords[d].encoding)) for d in local.dims if d in local.coords}}
     else:
         sample_np_local = meta = None
-    fso_range = utils.full_field_data_range(da, comm=comm)
+    fso_range, readable = utils.full_field_data_range(da, comm=comm)
     meta = comm.bcast(meta, root=0)
     sample_np, win = shared_sample_window(sample_np_local, meta["shape"], meta["dtype"], sweep)
     del sample_np_local
     coords = {d: xr.Variable((d,), v, attrs=a, encoding=e) for d, (v, a, e) in meta["coords"].items()}
     sample_da = xr.DataArray(sample_np, dims=meta["dims"], coords=coords, attrs=meta["attrs"], name=meta["name"])
-    return sample_np, sample_da, fso_range, win
+    return sample_np, sample_da, fso_range, readable, win
 
 
 def shared_sample_window(local_np, shape, dtype, sweep: SweepContext):
@@ -1177,14 +1179,14 @@ def sweep_variable(da, var: str, opts, sweep: SweepContext, n_vars: int) -> None
         click.echo(f"[var] {var} | units={da.attrs.get('units', 'N/A')} | "
                    f"relative L1 threshold={sweep.thresholds['l1']:.3e}")
     limit = sweep_sample_limit(var, da, opts, sweep)
-    sample_np, sample_da, fso_range, win = sweep_build_sample(da, limit, opts, sweep)
-    _sweep_variable_body(da, var, opts, sweep, n_vars, t0, sample_np, sample_da, fso_range)
+    sample_np, sample_da, fso_range, readable, win = sweep_build_sample(da, limit, opts, sweep)
+    _sweep_variable_body(da, var, opts, sweep, n_vars, t0, sample_np, sample_da, fso_range, readable)
     # Free is collective: after an error the exception must reach the abort hook rather than wait here.
     del sample_np, sample_da
     win.Free()
 
 
-def _sweep_variable_body(da, var, opts, sweep: SweepContext, n_vars, t0, sample_np, sample_da, fso_range):
+def _sweep_variable_body(da, var, opts, sweep: SweepContext, n_vars, t0, sample_np, sample_da, fso_range, readable):
     # Collective, like sweep_variable: every rank runs it, and an early return must be identical on every rank;
     # sets opts.phys_slack.
     rank = sweep.rank
@@ -1193,24 +1195,26 @@ def _sweep_variable_body(da, var, opts, sweep: SweepContext, n_vars, t0, sample_
     if opts.phys_slack and rank == 0:
         click.echo(f"[gates] {var}: bounds slack {opts.phys_slack:g} ({opts.phys_tolerance:g} of the range {span:g})")
     # q99_cut holds ~3 sample-sized temporaries: rank 0 computes it, the others receive the float
-    q99_abs = sweep.comm.bcast(q99_cut(sample_np) if rank == 0 else None, root=0) if opts.extremes_sensitive else None
+    q99_abs, over_nonzero = (sweep.comm.bcast(q99_cut(sample_np) if rank == 0 else None, root=0)
+                             if opts.extremes_sensitive else (None, False))
     if opts.extremes_sensitive and rank == 0:
-        click.echo(f"[gates] {var}: q99(|value|)={q99_abs} (extreme-tail cut for the q99 gate)")
-    # A sample without variation says nothing about the codecs: every pipeline reproduces it exactly and
-    # the ratio ranks overheads.  A field whose finite values are all one number needs no search.
+        basis = "of the non-zero |values|: the plain one is 0" if over_nonzero else "of |value|"
+        click.echo(f"[gates] {var}: q99 cut={q99_abs} (99th percentile {basis}; the q99 gate's extreme tail)")
+    # The errors and ratios of a sample without variation do not carry over to a field that varies.  A field
+    # whose finite values are all one number, or that has none, needs no search.
     sample_range = sweep.comm.bcast(utils.finite_range(sample_np) if rank == 0 else None, root=0)
     try:
-        if fso_range is not None and fso_range[0] == fso_range[1]:
+        if (fso_range is not None and fso_range[0] == fso_range[1]) or (fso_range is None and readable):
+            what = (f"every finite value of the field is {fso_range[0]:g}" if fso_range is not None
+                    else "the field has no finite value")
             if rank == 0:
-                click.echo(f"[sample] {var}: every finite value of the field is {fso_range[0]:g}; the search is "
-                           f"skipped and Zstd stores it losslessly.")
+                click.echo(f"[sample] {var}: {what}; the search is skipped and Zstd stores it losslessly.")
             spaces = ([utils.zarrcodecs_nc.Zstd(level=6)], [None], [None])
         elif sample_range is None or sample_range[0] == sample_range[1]:
             what = "has no finite value" if sample_range is None else f"holds the single value {sample_range[0]:g}"
             raise click.ClickException(f"the sample {what}" + (
                 f" while the field spans [{fso_range[0]:g}, {fso_range[1]:g}]; raise --eval-data-size-limit so "
                 f"that the sample reaches that variation" if fso_range is not None
-                else ", and the full-field pass found none: nothing to compress" if sample_range is None
                 else ", and the field's value range could not be read"))
         else:
             chunks = [utils.compute_chunk_shape_for_eval(shape, sample_np.dtype, target_mib=opts.inner_chunk_mib,

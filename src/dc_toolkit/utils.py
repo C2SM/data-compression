@@ -159,7 +159,7 @@ def is_lat_lon(da) -> bool:
 # =============================================================================
 # Horizontal dims are never thinned, so codecs see the real spatial structure.
 
-SAMPLE_MIN_KEEP = 3  # time steps, and levels, a sample keeps at least (all of them when there are fewer)
+SAMPLE_MIN_KEEP = 3  # indices a sample keeps at least across the time-like dims, and across the vertical ones
 
 _TIME_LIKE_DIM_RE = re.compile(
     r"^(?:time|.*_time|t|step|forecast_reference_time|forecast_period|"
@@ -245,10 +245,10 @@ def minimum_sample(da: xr.DataArray) -> tuple:
     keep, parts = 1, []
     for group, label in ((time_dims, "time steps"), (vertical_dims, "levels")):
         if group:
-            info = [(i, n, int(da.sizes[n])) for i, n in group]
-            kept = int(np.prod(list(_distribute_group(info, SAMPLE_MIN_KEEP).values())))
-            keep *= kept
-            parts.append(f"{kept} {label}")
+            plan = _distribute_group([(i, n, int(da.sizes[n])) for i, n in group], SAMPLE_MIN_KEEP)
+            keep *= int(np.prod(list(plan.values())))
+            parts.append(f"{plan[group[0][1]]} {label}" if len(group) == 1
+                         else " x ".join(f"{n}={plan[n]}" for _, n in group))
     slab = int(da.dtype.itemsize) * int(np.prod([da.sizes[d] for _, d in spatial_dims]))
     return min(int(da.nbytes), slab * keep), " x ".join(parts)
 
@@ -326,11 +326,11 @@ def _distribute_group(dims_info, group_keep) -> dict:
     SAMPLE_MIN_KEEP (or the whole group, when it has fewer)."""
     if not dims_info:
         return {}
+    floor = min(SAMPLE_MIN_KEEP, int(np.prod([size for _, _, size in dims_info])))
     if len(dims_info) == 1:
         _, name, size = dims_info[0]
-        return {name: max(1, min(size, int(group_keep)))}
+        return {name: min(size, max(floor, int(group_keep)))}
     plan = _balanced_group_plan(dims_info, group_keep)
-    floor = min(SAMPLE_MIN_KEEP, int(np.prod([size for _, _, size in dims_info])))
     for _, name, size in sorted(dims_info, key=lambda t: -t[2]):  # small dims split the floor unevenly
         while int(np.prod(list(plan.values()))) < floor and plan[name] < size:
             plan[name] += 1
@@ -346,8 +346,11 @@ def _allocate_stride_plan(da, time_dims, vertical_dims, max_product,
     T = int(np.prod([s for _, _, s in time_info])) if time_info else 1
     V = int(np.prod([s for _, _, s in vert_info])) if vert_info else 1
     t_min, v_min = min(T, SAMPLE_MIN_KEEP), min(V, SAMPLE_MIN_KEEP)
-    P = max(float(max_product), float(t_min * v_min))
     kept = lambda plan, info: int(np.prod([plan[n] for _, n, _ in info])) if info else 1  # noqa: E731
+    # what each group keeps at the least: several small dims can overshoot the minimum (2 x 2 for 3)
+    t_floor = kept(_distribute_group(time_info, t_min), time_info)
+    v_floor = kept(_distribute_group(vert_info, v_min), vert_info)
+    P = max(float(max_product), float(t_floor * v_floor))
     if policy == "balanced":
         plan = _balanced_group_plan(time_info + vert_info, P)
         if kept(plan, time_info) < t_min:
@@ -362,8 +365,8 @@ def _allocate_stride_plan(da, time_dims, vertical_dims, max_product,
         vfloor = int(vertical_floor)
     else:
         vfloor = max(4, int(math.ceil(math.log2(V)))) if V > 1 else 1
-    # The floor of levels shrinks to what leaves room for the minimum of time steps, never below v_min.
-    level_target = max(v_min, min(vfloor, V, int(P // t_min)))
+    # The floor of levels shrinks to what leaves room for the minimum of time steps, never below v_floor.
+    level_target = max(v_floor, min(vfloor, V, int(P // t_floor)))
     time_plan = _distribute_group(time_info, max(t_min, min(T, int(P // level_target))))
     return {**time_plan, **_distribute_group(vert_info, max(v_min, min(V, int(P // kept(time_plan, time_info)))))}
 
@@ -803,9 +806,10 @@ def finite_range(a: np.ndarray):
 
 
 def full_field_data_range(da, comm=None):
-    """Finite (min, max) over the whole field, min == max when it is constant; None if it has no
-    finite value or could not be read (with a warning).  Collective over `comm` when given: its ranks split the
-    blocks and all reach the reductions, a failed read included, so all return the same answer."""
+    """(range, readable): the finite (min, max) over the whole field, min == max when it is constant and
+    None when it has no finite value or could not be read; readable is False after a failed read (with a
+    warning).  Collective over `comm` when given: its ranks split the blocks and all reach the reductions,
+    a failed read included, so all return the same answer."""
     data = da.data if hasattr(da, "data") else np.asarray(da)
     rank, size = (comm.Get_rank(), comm.Get_size()) if comm is not None else (0, 1)
     dmin, dmax, failed = np.inf, -np.inf, 0
@@ -828,8 +832,8 @@ def full_field_data_range(da, comm=None):
         click.echo("[range] WARNING: no full-field value range: FixedScaleOffset is left out, and EBCC and "
                    "--phys-tolerance run without it.")
     if failed or not (np.isfinite(dmin) and np.isfinite(dmax)):
-        return None
-    return (dmin, dmax)
+        return None, not failed
+    return (dmin, dmax), True
 
 
 def fixed_scale_offset_configs(da, data_range=None):
@@ -947,7 +951,7 @@ def pipeline_name(compressor, filt, serializer) -> str:
 # definitions are evaluated again.
 METRIC_DEFINITIONS = ("N_Corrupt: cells whose finiteness the round trip changes",
                       "Q99_Rel: cells with |x| >= the q99 cut, taken over the non-zero values when the plain one is 0",
-                      "Grad_Rel: finite differences along the horizontal dims")
+                      "Grad_Rel: finite differences along the horizontal dims, else the non-leading ones")
 
 
 def _info_bytes(info) -> Tuple[int, int]:
