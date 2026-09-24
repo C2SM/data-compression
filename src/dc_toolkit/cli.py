@@ -140,7 +140,8 @@ _VERIFY_OPTIONS = [
               help="Field to sweep (default: every non-empty integer/float32/float64 variable with at least "
                    "one dim, CF bounds excepted).")
 @click.option("--eval-data-size-limit", default="5GB", callback=utils_cli.size_option_callback, show_default=True,
-              help="Budget of the representative sample the combos are scored on (e.g. 5GB, 512MiB).")
+              help="Budget of the representative sample the combos are scored on (e.g. 5GB, 512MiB): shrunk "
+                   "to fit the node's memory, and raised to keep at least 3 time steps and 3 levels.")
 @_OVERSUBSCRIPTION_OPTION
 @utils_cli.add_options(_CHUNK_OPTIONS)
 @_MEMORY_OPTION
@@ -153,8 +154,8 @@ _VERIFY_OPTIONS = [
 @click.option("--bias-threshold", type=click.FloatRange(min=0.0), default=None, callback=_finite,
               help="Relative bias budget |mean signed error| / mean|orig| (default: 0.5 x L1).")
 @click.option("--q99-threshold", type=click.FloatRange(min=0.0), default=None, callback=_finite,
-              help="Relative budget over cells with |value| >= the 99th percentile (default: 2 x L1).  "
-                   "Only with --extremes-sensitive.")
+              help="Relative budget over cells with |value| >= the 99th percentile, taken over the non-zero "
+                   "values when the plain one is 0 (default: 2 x L1).  Only with --extremes-sensitive.")
 @click.option("--l2-gate/--no-l2-gate", default=True, show_default=True, help="Enable the L2 gate.")
 @click.option("--linf-gate/--no-linf-gate", default=True, show_default=True, help="Enable the Linf gate.")
 @click.option("--bias-gate/--no-bias-gate", default=True, show_default=True, help="Enable the bias gate.")
@@ -167,8 +168,8 @@ _VERIFY_OPTIONS = [
                    "rings past a bound the field sits on by a hair. Stored in the manifest as an absolute "
                    "value, so compress's verify gate applies the same slack.")
 @click.option("--gradient-gate/--no-gradient-gate", default=False, show_default=True,
-              help="Enable the spatial-gradient gate (one more pass over the sample per combo; "
-                   "for winds, pressure).")
+              help="Enable the spatial-gradient gate: finite differences along the horizontal dims (one more "
+                   "pass over the sample per combo; for winds, pressure).")
 @click.option("--gradient-threshold", type=click.FloatRange(min=0.0), default=0.1, show_default=True, callback=_finite,
               help="Max relative L1 error of the finite-difference field (absolute fraction, not x L1).")
 @click.option("--gradient-shortcircuit/--no-gradient-shortcircuit", default=True, show_default=True,
@@ -177,12 +178,13 @@ _VERIFY_OPTIONS = [
 @click.option("--sampling-policy", type=click.Choice(["cascade", "balanced"]), default="cascade",
               show_default=True,
               help="How an over-budget field is thinned (only its time and vertical dims; the others are kept "
-                   "whole): 'cascade' spends the budget on time steps first, keeping a minimum of vertical "
-                   "levels; 'balanced' splits it evenly across the time and vertical dims.")
-@click.option("--vertical-floor", type=click.IntRange(min=1), default=None,
-              help="Minimum vertical levels kept by the cascade policy, capped at the level count and at "
-                   "the square root of the number of horizontal slabs the budget holds "
-                   "(default: max(4, ceil(log2(n_levels)))).")
+                   "whole, and at least 3 time steps and 3 levels are kept): 'cascade' keeps a floor of "
+                   "levels, then spends the budget on time steps; 'balanced' splits it evenly across the time "
+                   "and vertical dims.")
+@click.option("--vertical-floor", type=click.IntRange(min=3), default=None,
+              help="Vertical levels the cascade policy keeps before it adds time steps (default: "
+                   "max(4, ceil(log2(n_levels)))); a budget that cannot hold them with 3 time steps lowers "
+                   "it, down to 3.")
 @click.option("--resume/--no-resume", default=True, show_default=True,
               help="Skip combos already recorded in config_space_{var}_rank*.csv: their metrics are reused "
                    "and the gates re-applied with the current thresholds.  A change to what "

@@ -159,6 +159,8 @@ def is_lat_lon(da) -> bool:
 # =============================================================================
 # Horizontal dims are never thinned, so codecs see the real spatial structure.
 
+SAMPLE_MIN_KEEP = 3  # time steps, and levels, a sample keeps at least (all of them when there are fewer)
+
 _TIME_LIKE_DIM_RE = re.compile(
     r"^(?:time|.*_time|t|step|forecast_reference_time|forecast_period|"
     r"ensemble|realization|member|reftime|valid_time|epoch)$", re.IGNORECASE)
@@ -228,13 +230,31 @@ def _classify_sample_dims(da: xr.DataArray):
     return time_dims, vertical_dims, spatial_dims
 
 
+def horizontal_axes(da: xr.DataArray) -> tuple:
+    """Positions of the dims that are neither time nor vertical and have more than one index."""
+    return tuple(pos for pos, name in _classify_sample_dims(da)[2] if da.sizes[name] > 1)
+
+
+def minimum_sample_bytes(da: xr.DataArray) -> int:
+    """Size of the smallest sample build_representative_sample takes from `da`: one horizontal slab
+    times SAMPLE_MIN_KEEP time steps and SAMPLE_MIN_KEEP levels (or all, where there are fewer)."""
+    time_dims, vertical_dims, spatial_dims = _classify_sample_dims(da)
+    keep = 1
+    for group in (time_dims, vertical_dims):
+        if group:
+            keep *= min(SAMPLE_MIN_KEEP, int(np.prod([da.sizes[d] for _, d in group])))
+    slab = int(da.dtype.itemsize) * int(np.prod([da.sizes[d] for _, d in spatial_dims]))
+    return min(int(da.nbytes), slab * keep)
+
+
 def build_representative_sample(da: xr.DataArray, size_limit_bytes: int, rank: int = 0,
                                 policy: str = "cascade",
                                 vertical_floor: int | None = None) -> xr.DataArray:
-    """Deterministic subset of `da` within `size_limit_bytes`: evenly spaced indices along time/
-    vertical dims (without any, the whole field and a warning).  "cascade" spends the budget on
-    time steps first above a budget-aware floor of levels, "balanced" splits it evenly in log
-    space.  Raises SampleTooLargeError when one horizontal slab does not fit."""
+    """Deterministic subset of `da` within `size_limit_bytes`, but never below minimum_sample_bytes:
+    along each time and vertical dim, the middle index of equal blocks (without such dims, the whole
+    field and a warning).  "cascade" keeps its floor of levels, then spends the budget on time steps;
+    "balanced" splits it evenly in log space.  Raises SampleTooLargeError when one horizontal slab
+    does not fit."""
     nbytes = int(da.nbytes)
     if nbytes <= size_limit_bytes:
         if rank == 0:
@@ -271,12 +291,13 @@ def build_representative_sample(da: xr.DataArray, size_limit_bytes: int, rank: i
     isel = {}
     for _, name in stride_dims:
         size, n_keep = int(da.sizes[name]), plan[name]
-        if n_keep < size:
-            isel[name] = np.unique(np.linspace(0, size - 1, num=n_keep, dtype=int)).tolist()
+        if n_keep < size:  # block midpoints: the ends of a dim (model top, first step) are the least typical
+            isel[name] = ((np.arange(n_keep) + 0.5) * size / n_keep).astype(int).tolist()
     sampled = da.isel(isel) if isel else da
 
     if rank == 0:
-        strided = ", ".join(f"{n}={plan[n]}/{da.sizes[n]}" for _, n in stride_dims)
+        strided = ", ".join(f"{n}={plan[n]}/{da.sizes[n]}"
+                            + (f" {isel[n]}" if n in isel and len(isel[n]) <= 8 else "") for _, n in stride_dims)
         spatial = (" | preserved spatial: " + ", ".join(d for _, d in spatial_dims)) if spatial_dims else ""
         click.echo(f"[sample] field is {hsize(nbytes)} > limit {hsize(size_limit_bytes)}; "
                    f"policy={policy}; strided {strided}{spatial} -> {hsize(int(sampled.nbytes))}.")
@@ -305,24 +326,31 @@ def _distribute_group(dims_info, group_keep) -> dict:
 
 def _allocate_stride_plan(da, time_dims, vertical_dims, max_product,
                           policy="cascade", vertical_floor=None) -> dict:
-    """{dim_name: n_keep} for every time and vertical dim."""
+    """{dim_name: n_keep} for every time and vertical dim, at least SAMPLE_MIN_KEEP time steps and
+    levels (or all, where there are fewer) even when `max_product` slabs cannot hold them."""
     time_info = [(i, n, int(da.sizes[n])) for i, n in time_dims]
     vert_info = [(i, n, int(da.sizes[n])) for i, n in vertical_dims]
-    if policy == "balanced":
-        return _balanced_group_plan(time_info + vert_info, max_product)
-
     T = int(np.prod([s for _, _, s in time_info])) if time_info else 1
     V = int(np.prod([s for _, _, s in vert_info])) if vert_info else 1
-    P = max(1.0, float(max_product))
+    t_min, v_min = min(T, SAMPLE_MIN_KEEP), min(V, SAMPLE_MIN_KEEP)
+    P = max(float(max_product), float(t_min * v_min))
+    if policy == "balanced":
+        plan = _balanced_group_plan(time_info + vert_info, P)
+        kept = lambda info: int(np.prod([plan[n] for _, n, _ in info])) if info else 1  # noqa: E731
+        if kept(time_info) < t_min:
+            plan.update({**_distribute_group(time_info, t_min), **_distribute_group(vert_info, max(v_min, P // t_min))})
+        elif kept(vert_info) < v_min:
+            plan.update({**_distribute_group(vert_info, v_min), **_distribute_group(time_info, max(t_min, P // v_min))})
+        return plan
+
     if vertical_floor is not None:
-        vfloor = max(1, int(vertical_floor))
+        vfloor = int(vertical_floor)
     else:
         vfloor = max(4, int(math.ceil(math.log2(V)))) if V > 1 else 1
-    vfloor = min(vfloor, V)
-    # Cap the level floor at sqrt(P) so a tight budget degrades to the balanced split.
-    base_level = max(1, min(vfloor, int(math.floor(math.sqrt(P)))))
-    time_keep = max(1, min(T, int(math.floor(P / base_level))))
-    level_keep = max(1, min(V, int(math.floor(P / time_keep))))
+    # The floor of levels shrinks to what leaves room for the minimum of time steps, never below v_min.
+    level_target = max(v_min, min(vfloor, V, int(P // t_min)))
+    time_keep = max(t_min, min(T, int(P // level_target)))
+    level_keep = max(v_min, min(V, int(P // time_keep)))
     return {**_distribute_group(time_info, time_keep), **_distribute_group(vert_info, level_keep)}
 
 
@@ -746,6 +774,20 @@ def valid_digits_for_quantize(da):
     raise TypeError(f"Unsupported dtype '{da.dtype}'. Quantize only supports float32 and float64.")
 
 
+def finite_range(a: np.ndarray):
+    """(min, max) over the finite values of `a`, or None when it has none; copies `a` only when it
+    holds +-inf."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)  # all NaN
+        lo, hi = np.nanmin(a), np.nanmax(a)
+    if not (np.isfinite(lo) and np.isfinite(hi)):
+        a = a[np.isfinite(a)]
+        if not a.size:
+            return None
+        lo, hi = a.min(), a.max()
+    return float(lo), float(hi)
+
+
 def full_field_data_range(da, comm=None):
     """Finite (min, max) over the whole field, or None if it is constant, has no finite value or
     could not be read (with a warning).  Collective over `comm` when given: its ranks split the
@@ -758,17 +800,10 @@ def full_field_data_range(da, comm=None):
             blocks = list(data.blocks.ravel())[rank::size]
         else:
             blocks = [data] if rank == 0 else []
-        for block in blocks:  # one block in memory at a time, reduced without a copy
-            x = np.asarray(block.compute() if isinstance(block, dask.array.Array) else block)
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore", RuntimeWarning)  # an all-NaN block
-                lo, hi = np.nanmin(x), np.nanmax(x)
-            if not (np.isfinite(lo) and np.isfinite(hi)):  # +-inf, or no finite value at all
-                x = x[np.isfinite(x)]
-                if not x.size:
-                    continue
-                lo, hi = x.min(), x.max()
-            dmin, dmax = min(dmin, float(lo)), max(dmax, float(hi))
+        for block in blocks:  # one block in memory at a time
+            r = finite_range(np.asarray(block.compute() if isinstance(block, dask.array.Array) else block))
+            if r is not None:
+                dmin, dmax = min(dmin, r[0]), max(dmax, r[1])
     except Exception as e:
         failed = 1
         click.echo(f"[range] WARNING rank {rank}: reading the field failed ({e!r})", err=True)
@@ -894,6 +929,13 @@ def pipeline_name(compressor, filt, serializer) -> str:
 # 5. IN-MEMORY EVALUATION
 # =============================================================================
 
+# What the metrics measure, recorded in the resume state so that rows measured under other
+# definitions are evaluated again.
+METRIC_DEFINITIONS = ("N_Corrupt: cells whose finiteness the round trip changes",
+                      "Q99_Rel: cells with |x| >= the q99 cut, taken over the non-zero values when the plain one is 0",
+                      "Grad_Rel: finite differences along the horizontal dims")
+
+
 def _info_bytes(info) -> Tuple[int, int]:
     """(count_bytes, count_bytes_stored) from a zarr ArrayInfo."""
     count = getattr(info, "count_bytes", None)
@@ -927,9 +969,9 @@ def _rel(err, ori) -> float:
     return float(err) / float(ori)
 
 
-# FixedScaleOffset casts NaN fill to int and numpy warns on every chunk; silenced since the norms
-# mask fill out, although those cells decode to finite values that no metric flags.  A real FSO
-# overflow is silent: full_field_data_range and the verify gate guard against it.
+# FixedScaleOffset casts NaN fill to int and numpy warns on every chunk; silenced, since N_Corrupt
+# counts those cells.  A real FSO overflow is silent: full_field_data_range and the verify gate guard
+# against it.
 warnings.filterwarnings("ignore", message="invalid value encountered in cast", category=RuntimeWarning)
 
 
@@ -950,9 +992,9 @@ def _zarr_roundtrip(sample_np, dims, codec_kwargs, chunks):
 
 
 def _error_sums(sample_np, decoded, chunks, q99_abs):
-    """Chunk-wise accumulators over the cells finite in both arrays (n_corrupt: finite in the original
-    only): (l1_err, l2_err_sq, linf_err, signed_err, l1_ori, l2_ori_sq, linf_ori, q99_err, q99_ori,
-    n_valid, n_corrupt, decoded_min, decoded_max); `q99_abs` None skips the tail sums."""
+    """Chunk-wise accumulators over the cells finite in both arrays (n_corrupt: cells finite in only
+    one of them): (l1_err, l2_err_sq, linf_err, signed_err, l1_ori, l2_ori_sq, linf_ori, q99_err,
+    q99_ori, n_valid, n_corrupt, decoded_min, decoded_max); `q99_abs` None skips the tail sums."""
     l1_err = l2_err_sq = linf_err = signed_err = 0.0
     l1_ori = l2_ori_sq = linf_ori = 0.0
     q99_err = q99_ori = 0.0
@@ -962,7 +1004,7 @@ def _error_sums(sample_np, decoded, chunks, q99_abs):
         for sl in _iter_chunk_slices(sample_np.shape, chunks):
             orig, dec = sample_np[sl], decoded[sl]
             finite_orig, finite_dec = np.isfinite(orig), np.isfinite(dec)
-            n_corrupt += int(np.count_nonzero(finite_orig & ~finite_dec))
+            n_corrupt += int(np.count_nonzero(finite_orig != finite_dec))  # data lost, or fill made data
             valid = finite_orig & finite_dec
             nv = int(np.count_nonzero(valid))
             if nv == 0:
@@ -990,8 +1032,9 @@ def evaluate_codec_pipeline(sample_np: np.ndarray, dims, codec_kwargs: dict, chu
                             q99_abs: float | None = None, compute_gradient: bool = False,
                             gradient_axes=None, precheck_thresholds: dict | None = None):
     """Round-trip `sample_np` through a pipeline in memory; returns (compression_ratio, errors_dict,
-    euclidean_distance).  Fill (non-finite in the original) and corruption (finite, then non-finite
-    after decode; counted in N_Corrupt) are left out of every norm.  With `precheck_thresholds`,
+    euclidean_distance).  Fill (non-finite in the original) is left out of every norm; a cell whose
+    finiteness the round trip changes (data turned NaN/Inf, or fill turned into data) is corruption,
+    counted in N_Corrupt.  With `precheck_thresholds`,
     combos failing a cheap gate skip the gradient metric, one more pass over the sample."""
     decoded, ratio = _zarr_roundtrip(sample_np, dims, codec_kwargs, chunks)
     want_q99 = q99_abs is not None and math.isfinite(q99_abs)
@@ -1095,7 +1138,7 @@ def compute_errors_distances(da_compressed, da, q99_abs=None):
         np.abs(err).sum(), np.abs(o).sum(),
         np.sqrt((err ** 2).sum()), np.sqrt((o ** 2).sum()),
         np.abs(err).max(), np.abs(o).max(),
-        err.sum(), (finite_orig & ~finite_dec).sum(),
+        err.sum(), (finite_orig != finite_dec).sum(),
         dask.array.nanmin(dec), dask.array.nanmax(dec),
     ]
     if q99_abs is not None:
