@@ -727,7 +727,7 @@ def sweep_sample_limit(var: str, da, opts, sweep: SweepContext) -> int:
     one shared sample beside the node's rank working sets fits the node memory budget; then the memory
     guards.  Returns the limit, the same on every rank."""
     ranks, chunk_mib = sweep.ranks_on_node, opts.inner_chunk_mib
-    field_bytes, floor_bytes = int(da.nbytes), utils.minimum_sample_bytes(da)
+    field_bytes, (floor_bytes, floor_kept) = int(da.nbytes), utils.minimum_sample(da)
     node_budget, source = detect_node_memory_budget()
     max_safe = max_sample_bytes_for_ranks(int(node_budget * opts.memory_threshold), ranks, chunk_mib)
     wanted = max(int(opts.eval_data_size_limit), floor_bytes)
@@ -735,16 +735,14 @@ def sweep_sample_limit(var: str, da, opts, sweep: SweepContext) -> int:
     limit = sweep.comm.allreduce(min(wanted, max_safe), op=MPI.MIN)
     if limit < floor_bytes:
         if sweep.rank == 0:
-            click.echo(f"[memcheck] FATAL: the smallest sample of '{var}' ({hsize(floor_bytes)}: "
-                       f"{utils.SAMPLE_MIN_KEEP} time steps x {utils.SAMPLE_MIN_KEEP} levels, or all where there are "
-                       f"fewer) does not fit with {ranks} rank(s) per node, inner_chunk_mib={chunk_mib} and a node "
+            click.echo(f"[memcheck] FATAL: the smallest sample of '{var}' ({hsize(floor_bytes)}: {floor_kept}) "
+                       f"does not fit with {ranks} rank(s) per node, inner_chunk_mib={chunk_mib} and a node "
                        f"memory budget of {hsize(node_budget)} (from {source}) at threshold "
                        f"{opts.memory_threshold:.2f}.  Start fewer ranks per node or request more RAM.")
         abort(1)
     if sweep.rank == 0 and floor_bytes > int(opts.eval_data_size_limit) and field_bytes > int(opts.eval_data_size_limit):
         click.echo(f"[sample] raised the sample budget of '{var}' from {hsize(opts.eval_data_size_limit)} "
-                   f"(--eval-data-size-limit) to {hsize(floor_bytes)} to keep {utils.SAMPLE_MIN_KEEP} time steps "
-                   f"and {utils.SAMPLE_MIN_KEEP} levels.")
+                   f"(--eval-data-size-limit) to {hsize(floor_bytes)}, its smallest sample: {floor_kept}.")
     elif sweep.rank == 0 and limit < int(opts.eval_data_size_limit):
         click.echo(f"[memcheck] auto-shrunk sample budget from {hsize(opts.eval_data_size_limit)} "
                    f"(--eval-data-size-limit) to {hsize(limit)} to stay under {opts.memory_threshold:.2f} x "
@@ -845,7 +843,8 @@ def read_rank_csvs(where_to_write, var: str, quarantine: bool = False) -> pd.Dat
 def sweep_recorded_rows(var, sample_np, q99_abs, fso_range, opts, sweep: SweepContext) -> set:
     """Collective: the pipelines whose recorded rows this run reuses, decided on rank 0 before any rank opens
     its CSV.  Rows are reused only with --resume, when sweep_state_{var}.json matches this run's dataset,
-    sample, full-field range, sampling and chunk settings and library versions (else, and with --no-resume,
+    sample, full-field range, sampling and chunk settings, metric definitions and library versions (else, and
+    with --no-resume,
     the per-rank CSVs are removed), and when they carry every metric the current gates need.  Failed combos
     are always retried."""
     done = set()
@@ -857,7 +856,7 @@ def sweep_recorded_rows(var, sample_np, q99_abs, fso_range, opts, sweep: SweepCo
             "sampling_policy": opts.sampling_policy, "vertical_floor": opts.vertical_floor,
             "inner_chunk_mib": opts.inner_chunk_mib, "spatial_split": opts.spatial_split,
             "sample_digest": hashlib.blake2b(memoryview(sample_np).cast("B"), digest_size=16).hexdigest(),
-            "metrics": utils.METRIC_DEFINITIONS, "env": env_versions()}, default=str))
+            "metric_definitions": utils.METRIC_DEFINITIONS, "env": env_versions()}, default=str))
         state_path = where / f"sweep_state_{var}.json"
         previous = read_json(state_path, "resume")
         rank_csvs = rank_files(where, "config_space", var)
@@ -1198,21 +1197,21 @@ def _sweep_variable_body(da, var, opts, sweep: SweepContext, n_vars, t0, sample_
     if opts.extremes_sensitive and rank == 0:
         click.echo(f"[gates] {var}: q99(|value|)={q99_abs} (extreme-tail cut for the q99 gate)")
     # A sample without variation says nothing about the codecs: every pipeline reproduces it exactly and
-    # the ratio ranks overheads.  Only a field that is constant throughout is stored without a search.
+    # the ratio ranks overheads.  A field whose finite values are all one number needs no search.
     sample_range = sweep.comm.bcast(utils.finite_range(sample_np) if rank == 0 else None, root=0)
-    constant = sample_range is not None and sample_range[0] == sample_range[1]
     try:
-        if sample_range is None or (constant and fso_range is not None):
-            what = "has no finite value" if sample_range is None else f"holds the single value {sample_range[0]:g}"
-            raise click.ClickException(
-                f"the sample {what}" + (f" while the field spans [{fso_range[0]:g}, {fso_range[1]:g}]; raise "
-                                        f"--eval-data-size-limit so that the sample reaches that variation"
-                                        if fso_range is not None else ", and so has the field: nothing to compress"))
-        if constant:
+        if fso_range is not None and fso_range[0] == fso_range[1]:
             if rank == 0:
-                click.echo(f"[sample] {var}: the field is constant ({sample_range[0]:g}); the search is skipped "
-                           f"and Zstd stores it losslessly.")
+                click.echo(f"[sample] {var}: every finite value of the field is {fso_range[0]:g}; the search is "
+                           f"skipped and Zstd stores it losslessly.")
             spaces = ([utils.zarrcodecs_nc.Zstd(level=6)], [None], [None])
+        elif sample_range is None or sample_range[0] == sample_range[1]:
+            what = "has no finite value" if sample_range is None else f"holds the single value {sample_range[0]:g}"
+            raise click.ClickException(f"the sample {what}" + (
+                f" while the field spans [{fso_range[0]:g}, {fso_range[1]:g}]; raise --eval-data-size-limit so "
+                f"that the sample reaches that variation" if fso_range is not None
+                else ", and the full-field pass found none: nothing to compress" if sample_range is None
+                else ", and the field's value range could not be read"))
         else:
             chunks = [utils.compute_chunk_shape_for_eval(shape, sample_np.dtype, target_mib=opts.inner_chunk_mib,
                                                           dims=sample_da.dims, allow_spatial_split=opts.spatial_split)

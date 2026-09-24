@@ -95,7 +95,7 @@ _MEMORY_OPTION = click.option(
     "--memory-threshold", type=click.FloatRange(0.05, 0.95), default=0.80, show_default=True,
     help="Max fraction of memory an estimated footprint may use.  evaluate_combos shrinks its sample until "
          "one node's footprint fits this fraction of the node's budget (cgroup limit, else RAM) and aborts "
-         "when none fits; compress refuses a write whose peak exceeds this fraction of the available RAM.")
+         "when the field's smallest sample does not fit; compress refuses a write whose peak exceeds this fraction of the available RAM.")
 _PERSIST_OPTIONS = _CHUNK_OVERRIDE_OPTIONS + [
     click.option("--shard-mib", type=click.IntRange(min=1), default=512, show_default=True,
                  help="Target shard size in MiB (an integer number of inner chunks).  Sharding is "
@@ -141,7 +141,8 @@ _VERIFY_OPTIONS = [
                    "one dim, CF bounds excepted).")
 @click.option("--eval-data-size-limit", default="5GB", callback=utils_cli.size_option_callback, show_default=True,
               help="Budget of the representative sample the combos are scored on (e.g. 5GB, 512MiB): shrunk "
-                   "to fit the node's memory, and raised to keep at least 3 time steps and 3 levels.")
+                   "to fit the node's memory, and raised to the field's smallest sample: 3 time steps and 3 "
+                   "levels (all, where there are fewer), or the whole field when it has neither.")
 @_OVERSUBSCRIPTION_OPTION
 @utils_cli.add_options(_CHUNK_OPTIONS)
 @_MEMORY_OPTION
@@ -188,8 +189,8 @@ _VERIFY_OPTIONS = [
 @click.option("--resume/--no-resume", default=True, show_default=True,
               help="Skip combos already recorded in config_space_{var}_rank*.csv: their metrics are reused "
                    "and the gates re-applied with the current thresholds.  A change to what "
-                   "sweep_state_{var}.json records (file, sample, sampling and chunk settings, library "
-                   "versions, EBCC's env vars) restarts the field.")
+                   "sweep_state_{var}.json records (file, sample, sampling and chunk settings, metric "
+                   "definitions, library versions, EBCC's env vars) restarts the field.")
 @click.option("--max-evals", type=click.IntRange(min=1), default=None,
               help="Cap the Cartesian product (quick test runs); EBCC combos are always included.")
 @click.pass_context

@@ -62,9 +62,9 @@ Every rank reads the same sample, and it must exist once per node, not once per 
 
 Under Open MPI on Linux the window is a file in `/dev/shm`, so a container must give that at least the sample size (`docker run --shm-size`); Cray MPICH on Santis does not use it.
 
-Everything downstream reads views of that array: `z[...] = sample_np` hands zarr chunk-shaped views, the error norms slice it chunk by chunk, the gradient metric walks it in slabs. It is read-only for the whole sweep, so sharing it costs nothing and needs no lock.
+Everything downstream reads views of that array: `z[...] = sample_np` hands zarr chunk-shaped views, the error norms slice it chunk by chunk, the gradient metric walks it in blocks of leading slabs of about 32 MiB. It is read-only for the whole sweep, so sharing it costs nothing and needs no lock.
 
-Work that touches the whole sample happens once, not once per rank: rank 0 computes the q99 cut of the extremes gate and EBCC's check for NaN/Inf and broadcasts the answers, and the full-field range for FixedScaleOffset is one pass over the file's blocks split across all ranks (without that range FixedScaleOffset is left out, never fitted to the sample). Anything added to the pre-sweep path should follow the same rule; a per-rank pass over the sample multiplies its temporaries by the rank count.
+Work that touches the whole sample happens once, not once per rank: rank 0 computes the q99 cut of the extremes gate, the sample's value range (a sample without variation is not searched) and EBCC's check for NaN/Inf and broadcasts the answers, and the full-field range for FixedScaleOffset is one pass over the file's blocks split across all ranks (without that range FixedScaleOffset is left out, never fitted to the sample). Anything added to the pre-sweep path should follow the same rule; a per-rank pass over the sample multiplies its temporaries by the rank count.
 
 ### Why 32 ranks and not 288?
 
@@ -88,7 +88,7 @@ So the shape of it is *one shared read-only sample per node, plus a private full
 node steady state  =  S + R × 2 × S + R × 32 MiB          (S = sample, R = ranks per node, 16 MiB inner chunks)
 ```
 
-about 325 GB for a 5 GB sample and 32 ranks (the R × 32 MiB term counts float64 fields; a float32 field's extra 2 × chunk per rank sits inside the factor-2 headroom). The factor 2 is a rank's own peak (decoded buffer plus encoded bytes plus a filter's copy); the ranks of a node do not peak together, and a node's measured steady state is nearer 1.1 × S per rank, so the model is conservative. The sweep checks the model against `--memory-threshold` × the node's budget (the cgroup limit under SLURM, else host RAM) and shrinks the sample when it does not fit (`[memcheck] auto-shrunk ...`).
+about 325 GB for a 5 GB sample and 32 ranks (the R × 32 MiB term counts float64 fields; a float32 field's extra 2 × chunk per rank sits inside the factor-2 headroom). The factor 2 is a rank's own peak (decoded buffer plus encoded bytes plus a filter's copy); the ranks of a node do not peak together, and a node's measured steady state is nearer 1.1 × S per rank, so the model is conservative. The sweep checks the model against `--memory-threshold` × the node's budget (the cgroup limit under SLURM, else host RAM) and shrinks the sample when it does not fit (`[memcheck] auto-shrunk ...`), but not below 3 time steps × 3 levels (all, where a field has fewer): a smaller `--eval-data-size-limit` is raised to that minimum (`[sample] raised the sample budget ...`), and a field whose minimum does not fit stops the sweep (`[memcheck] FATAL: the smallest sample ...`). At that minimum a 3-D field of the native R02B10 grid samples 2.8 GiB.
 
 The decoded buffer is what decoding with one `z[...]` costs: R combos in flight on a node hold R full-size decoded copies, however the sample is shared. That is why the sample is shared and the working sets are not, and why the knobs are the sample size and the number of ranks (`santis.run` sets both per field).
 

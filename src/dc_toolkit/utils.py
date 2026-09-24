@@ -163,9 +163,9 @@ SAMPLE_MIN_KEEP = 3  # time steps, and levels, a sample keeps at least (all of t
 
 _TIME_LIKE_DIM_RE = re.compile(
     r"^(?:time|.*_time|t|step|forecast_reference_time|forecast_period|"
-    r"ensemble|realization|member|reftime|valid_time|epoch)$", re.IGNORECASE)
+    r"ensemble|realization|member|member_id|reftime|valid_time|epoch)$", re.IGNORECASE)
 _CF_TIME_UNITS_RE = re.compile(r"^\s*\w+\s+since\s+", re.IGNORECASE)
-_CF_TIME_STANDARD_NAMES = frozenset({"time", "forecast_reference_time", "forecast_period"})
+_CF_TIME_STANDARD_NAMES = frozenset({"time", "forecast_reference_time", "forecast_period", "realization"})
 _CF_VERTICAL_STANDARD_NAMES = frozenset({
     "height", "altitude", "depth", "air_pressure", "pressure", "model_level_number",
     "atmosphere_hybrid_sigma_pressure_coordinate", "atmosphere_hybrid_height_coordinate",
@@ -235,22 +235,28 @@ def horizontal_axes(da: xr.DataArray) -> tuple:
     return tuple(pos for pos, name in _classify_sample_dims(da)[2] if da.sizes[name] > 1)
 
 
-def minimum_sample_bytes(da: xr.DataArray) -> int:
-    """Size of the smallest sample build_representative_sample takes from `da`: one horizontal slab
-    times SAMPLE_MIN_KEEP time steps and SAMPLE_MIN_KEEP levels (or all, where there are fewer)."""
+def minimum_sample(da: xr.DataArray) -> tuple:
+    """(bytes, description) of the smallest sample build_representative_sample takes from `da`: one
+    horizontal slab times the fewest time steps and levels it keeps, SAMPLE_MIN_KEEP of each (all,
+    where there are fewer); the whole field when it has no time or vertical dim."""
     time_dims, vertical_dims, spatial_dims = _classify_sample_dims(da)
-    keep = 1
-    for group in (time_dims, vertical_dims):
+    if not time_dims + vertical_dims:
+        return int(da.nbytes), "the whole field, which has no time or vertical dim to thin"
+    keep, parts = 1, []
+    for group, label in ((time_dims, "time steps"), (vertical_dims, "levels")):
         if group:
-            keep *= min(SAMPLE_MIN_KEEP, int(np.prod([da.sizes[d] for _, d in group])))
+            info = [(i, n, int(da.sizes[n])) for i, n in group]
+            kept = int(np.prod(list(_distribute_group(info, SAMPLE_MIN_KEEP).values())))
+            keep *= kept
+            parts.append(f"{kept} {label}")
     slab = int(da.dtype.itemsize) * int(np.prod([da.sizes[d] for _, d in spatial_dims]))
-    return min(int(da.nbytes), slab * keep)
+    return min(int(da.nbytes), slab * keep), " x ".join(parts)
 
 
 def build_representative_sample(da: xr.DataArray, size_limit_bytes: int, rank: int = 0,
                                 policy: str = "cascade",
                                 vertical_floor: int | None = None) -> xr.DataArray:
-    """Deterministic subset of `da` within `size_limit_bytes`, but never below minimum_sample_bytes:
+    """Deterministic subset of `da` within `size_limit_bytes`, but never below minimum_sample:
     along each time and vertical dim, the middle index of equal blocks (without such dims, the whole
     field and a warning).  "cascade" keeps its floor of levels, then spends the budget on time steps;
     "balanced" splits it evenly in log space.  Raises SampleTooLargeError when one horizontal slab
@@ -316,12 +322,19 @@ def _balanced_group_plan(dims_info, budget) -> dict:
 
 
 def _distribute_group(dims_info, group_keep) -> dict:
+    """{dim: n_keep} for one group of dims, about `group_keep` indices in all and never fewer than
+    SAMPLE_MIN_KEEP (or the whole group, when it has fewer)."""
     if not dims_info:
         return {}
     if len(dims_info) == 1:
         _, name, size = dims_info[0]
         return {name: max(1, min(size, int(group_keep)))}
-    return _balanced_group_plan(dims_info, group_keep)
+    plan = _balanced_group_plan(dims_info, group_keep)
+    floor = min(SAMPLE_MIN_KEEP, int(np.prod([size for _, _, size in dims_info])))
+    for _, name, size in sorted(dims_info, key=lambda t: -t[2]):  # small dims split the floor unevenly
+        while int(np.prod(list(plan.values()))) < floor and plan[name] < size:
+            plan[name] += 1
+    return plan
 
 
 def _allocate_stride_plan(da, time_dims, vertical_dims, max_product,
@@ -334,13 +347,15 @@ def _allocate_stride_plan(da, time_dims, vertical_dims, max_product,
     V = int(np.prod([s for _, _, s in vert_info])) if vert_info else 1
     t_min, v_min = min(T, SAMPLE_MIN_KEEP), min(V, SAMPLE_MIN_KEEP)
     P = max(float(max_product), float(t_min * v_min))
+    kept = lambda plan, info: int(np.prod([plan[n] for _, n, _ in info])) if info else 1  # noqa: E731
     if policy == "balanced":
         plan = _balanced_group_plan(time_info + vert_info, P)
-        kept = lambda info: int(np.prod([plan[n] for _, n, _ in info])) if info else 1  # noqa: E731
-        if kept(time_info) < t_min:
-            plan.update({**_distribute_group(time_info, t_min), **_distribute_group(vert_info, max(v_min, P // t_min))})
-        elif kept(vert_info) < v_min:
-            plan.update({**_distribute_group(vert_info, v_min), **_distribute_group(time_info, max(t_min, P // v_min))})
+        if kept(plan, time_info) < t_min:
+            plan.update(_distribute_group(time_info, t_min))
+            plan.update(_distribute_group(vert_info, max(v_min, P // kept(plan, time_info))))
+        elif kept(plan, vert_info) < v_min:
+            plan.update(_distribute_group(vert_info, v_min))
+            plan.update(_distribute_group(time_info, max(t_min, P // kept(plan, vert_info))))
         return plan
 
     if vertical_floor is not None:
@@ -349,9 +364,8 @@ def _allocate_stride_plan(da, time_dims, vertical_dims, max_product,
         vfloor = max(4, int(math.ceil(math.log2(V)))) if V > 1 else 1
     # The floor of levels shrinks to what leaves room for the minimum of time steps, never below v_min.
     level_target = max(v_min, min(vfloor, V, int(P // t_min)))
-    time_keep = max(t_min, min(T, int(P // level_target)))
-    level_keep = max(v_min, min(V, int(P // time_keep)))
-    return {**_distribute_group(time_info, time_keep), **_distribute_group(vert_info, level_keep)}
+    time_plan = _distribute_group(time_info, max(t_min, min(T, int(P // level_target))))
+    return {**time_plan, **_distribute_group(vert_info, max(v_min, min(V, int(P // kept(time_plan, time_info)))))}
 
 
 # =============================================================================
@@ -789,8 +803,8 @@ def finite_range(a: np.ndarray):
 
 
 def full_field_data_range(da, comm=None):
-    """Finite (min, max) over the whole field, or None if it is constant, has no finite value or
-    could not be read (with a warning).  Collective over `comm` when given: its ranks split the
+    """Finite (min, max) over the whole field, min == max when it is constant; None if it has no
+    finite value or could not be read (with a warning).  Collective over `comm` when given: its ranks split the
     blocks and all reach the reductions, a failed read included, so all return the same answer."""
     data = da.data if hasattr(da, "data") else np.asarray(da)
     rank, size = (comm.Get_rank(), comm.Get_size()) if comm is not None else (0, 1)
@@ -813,7 +827,7 @@ def full_field_data_range(da, comm=None):
     if failed and rank == 0:
         click.echo("[range] WARNING: no full-field value range: FixedScaleOffset is left out, and EBCC and "
                    "--phys-tolerance run without it.")
-    if failed or not (np.isfinite(dmin) and np.isfinite(dmax)) or dmax <= dmin:
+    if failed or not (np.isfinite(dmin) and np.isfinite(dmax)):
         return None
     return (dmin, dmax)
 
@@ -1069,20 +1083,23 @@ def evaluate_codec_pipeline(sample_np: np.ndarray, dims, codec_kwargs: dict, chu
 
 def _gradient_rel_l1(orig: np.ndarray, decoded: np.ndarray, axes=None) -> float:
     """Sum|d(decoded) - d(orig)| / Sum|d(orig)| over finite differences along `axes` (default: all
-    but the leading one; axis 0 for 1-D), in ~32 MiB float64 blocks of leading indices unless `axes`
-    includes axis 0."""
+    but the leading one; axis 0 for 1-D), in ~32 MiB float64 blocks of leading indices."""
     if axes is None:
         axes = tuple(range(1, orig.ndim)) if orig.ndim > 1 else (0,)
     axes = tuple(ax % orig.ndim for ax in axes)
     n = orig.shape[0]
-    step = max(1, n) if 0 in axes else max(1, (32 << 20) // (8 * max(1, int(np.prod(orig.shape[1:])))))
+    step = max(1, (32 << 20) // (8 * max(1, int(np.prod(orig.shape[1:])))))
     err_sum = ori_sum = 0.0
     with np.errstate(invalid="ignore"):
         for start in range(0, n, step):
-            o = orig[start:start + step].astype(np.float64, copy=False)
-            d = decoded[start:start + step].astype(np.float64, copy=False)
+            rows = min(step, n - start)
+            # one leading index more, so axis 0 also differences across the edge to the next block
+            stop = start + rows + (1 if 0 in axes and start + rows < n else 0)
+            o = orig[start:stop].astype(np.float64, copy=False)
+            d = decoded[start:stop].astype(np.float64, copy=False)
             for ax in axes:
-                do, dd = np.diff(o, axis=ax), np.diff(d, axis=ax)
+                do, dd = (np.diff(o, axis=0), np.diff(d, axis=0)) if ax == 0 else \
+                    (np.diff(o[:rows], axis=ax), np.diff(d[:rows], axis=ax))
                 m = np.isfinite(do) & np.isfinite(dd)
                 if m.any():
                     err_sum += float(np.abs(dd[m] - do[m]).sum())

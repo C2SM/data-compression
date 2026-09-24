@@ -12,14 +12,17 @@
 #     codec libraries are pinned to one thread (the exports below), since inner threads
 #     would compete for the same bandwidth.
 #   - A node holds about (1 + 2 x RANKS) x the sample (the [memory] line); the sweep
-#     shrinks the sample until that fits the node's memory ([memcheck]).
+#     shrinks the sample until that fits the node's memory ([memcheck]), but not below
+#     3 time steps x 3 levels, to which it raises a smaller SAMPLE (2.8 GiB for a 3-D
+#     field of the native R02B10 grid); a field whose minimum does not fit aborts.
 #   docs/PARALLELIZATION.md has the details.
 #
 # Environment knobs:
 #   DYAMOND_DATA_ROOT        parent dir of the Data_Dyamond_PostProcessed* trees (required)
 #   RESULTS_BASE             output root (default ./res_folder_dyamond_<job id>); an earlier run's root
 #                            continues it: its combos are reused and re-gated with the current thresholds
-#                            unless the input path, sample, chunking or library versions changed
+#                            unless the input path, sample, chunking, metric definitions or library
+#                            versions changed
 #   FIELDS_FILE              replaces the list below: one entry per line, same format (quotes,
 #                            indentation, blank lines and # lines are ignored)
 #   MAX_EVALS=N              cap the codec space (quick test runs)

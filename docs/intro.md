@@ -158,6 +158,9 @@ by 0.5 % of their typical magnitude". The other gates are derived from it unless
 | Linf | the **worst single cell** | 10 × L1 |
 | bias | systematic drift (mean signed error) | 0.5 × L1 |
 
+One more gate needs no setting: a pipeline that turns a missing value (`NaN`) into a number, or a number
+into `NaN` or `Inf`, is dropped (the `n_corrupt` count).
+
 A pipeline is **kept** only if it passes every gate, and the winner is the kept pipeline with the highest
 compression ratio. All errors are relative to the magnitude of the field, which matters more than you might
 expect; section 5 shows why.
@@ -653,8 +656,8 @@ stage out". For serializers, `all` includes plain bytes and `none` is plain byte
 | Option | Use it when |
 |---|---|
 | `--phys-min 0`, `--phys-max 100` | a decoded value outside these bounds is wrong by definition (negative humidity, 101 % cloud cover). `--phys-tolerance 0.0001` allows a hair of overshoot, as a fraction of the field's range, which lossy codecs produce on fields that sit exactly on a bound. |
-| `--extremes-sensitive` | the rare large values are what matters (precipitation, gusts, CAPE): adds a gate on the top 1 % of values |
-| `--gradient-gate` | differences between neighbouring cells matter (wind, pressure): adds a gate on spatial gradients |
+| `--extremes-sensitive` | the rare large values are what matters (precipitation, gusts, CAPE): adds a gate on the top 1 % of values (of the non-zero values, for a field that is 0 almost everywhere) |
+| `--gradient-gate` | differences between neighbouring cells matter (wind, pressure): adds a gate on horizontal gradients |
 
 **A store that opens anywhere.** Two codecs exist only inside `dc_toolkit`: EBCC, and `zfpy_flat`, a variant
 of zfp that regularly wins sweeps. A store that uses either one cannot be opened by a Zarr reader without
@@ -684,21 +687,26 @@ or attributes (units), so the file has none either.
 ## 10. Your own files on a laptop
 
 **The sample.** The sweep does not run on the whole field but on a representative sample of at most
-`--eval-data-size-limit` (default `5GB`, or less after `[memcheck] auto-shrunk`). A field that fits is
-evaluated in full, and so is a field with no time or vertical dimension to thin, whatever its size
-(`[sample] WARNING ... cannot stride-sample`); the memory checks count only the budget, not that excess, so
-start fewer ranks for such a field. For big files on a laptop, lower the limit, for example
-`--eval-data-size-limit 512MiB`.
+`--eval-data-size-limit` (default `5GB`, or less after `[memcheck] auto-shrunk`): whole horizontal fields at
+time steps and levels spread evenly through the file. A field that fits is evaluated in full. A sample keeps
+at least 3 time steps and 3 levels (all, where the field has fewer), so a smaller limit is raised to that
+(`[sample] raised the sample budget ...`); a field with no time or vertical dimension to thin is its own
+sample. For big files on a laptop, lower the limit, for example `--eval-data-size-limit 512MiB`.
 
-**Memory.** The processes of one machine share a single copy of the sample; each adds a working set of
-about twice the sample for the pipeline it is evaluating, so memory grows with the number of ranks. The
-`[memory]` line at the start of a sweep shows the estimate. If it does not fit, the toolkit shrinks the
-sample by itself (`[memcheck] auto-shrunk ...`) or refuses to start and tells you what to change. The two
-knobs are `--eval-data-size-limit` and the number of ranks you start (`mpirun -n`). The estimate is checked
-against the machine's total memory, not what is free at that moment; only the sample itself (twice the
-sample on the first rank) is checked against what is free, and the sweep refuses with `[memcheck] REFUSING
-to proceed` when it does not fit. When other programs hold much of the memory, close them or start fewer
-ranks, or the sweep will swap.
+A sample must show how the field varies. When it holds a single value (or none that is finite) while the
+field varies, the sweep skips the field (`[var] skipping ...`, an error for the `--field-to-compress`): raise
+`--eval-data-size-limit`. A field whose finite values are all one number is stored losslessly with Zstd,
+without a search.
+
+**Memory.** The processes of one machine share a single copy of the sample; each adds a working set of about
+twice the sample for the pipeline it is evaluating, so memory grows with the number of ranks. The `[memory]`
+line at the start of a sweep shows the estimate. If it does not fit, the toolkit shrinks the sample by itself
+(`[memcheck] auto-shrunk ...`), down to the minimum above, or refuses to start and tells you what to change.
+The two knobs are `--eval-data-size-limit` and the number of ranks you start (`mpirun -n`). The estimate is
+checked against the machine's total memory, not what is free at that moment; only the sample itself (twice the
+sample on the first rank) is checked against what is free, and the sweep refuses with `[memcheck] REFUSING to
+proceed` when it does not fit. When other programs hold much of the memory, close them or start fewer ranks,
+or the sweep will swap.
 
 **Time.** A sweep's duration grows with the sample size and with the number of pipelines. Start with
 `--max-evals` to see whether the numbers make sense, then run the full sweep. Leave your laptop usable by
@@ -707,15 +715,15 @@ starting fewer ranks, for example `mpirun -n 4`.
 **Interruptions.** Pressing Ctrl-C loses only the pipelines being evaluated at that moment: run the same
 command again and the sweep continues where it stopped (`[resume] N of M combo(s) ... already recorded`). It
 starts over only when something that affects the measurements changed: the file, the sample (its size, its
-sampling settings or its values), the chunk settings, or the versions of the compression libraries (EBCC's
-tuning environment variables included). An auto-shrunk sample is sized for the number of ranks, so resume
-with the same `mpirun -n`: a different count can build a different sample (when the field is larger than
-the budget), which starts the field over. `--no-resume` forces a fresh start.
+sampling settings or its values), the chunk settings, the definitions of the error metrics, or the versions of
+the compression libraries (EBCC's tuning environment variables included). An auto-shrunk sample is sized for
+the number of ranks, so resume with the same `mpirun -n`: a different count can build a different sample (when
+the field is larger than the budget), which starts the field over. `--no-resume` forces a fresh start.
 
 **Fields with NaN.** Cells that are NaN in your file (fill values, masked land or sea) are left out of every
-error norm. A `fixedscaleoffset` pipeline decodes them as finite numbers and no gate notices: compare
-`np.isnan` of the store with the original, or keep that filter out of the sweep (`--filter-class bitround`,
-`quantize` or `none`). In section 5's check, use `np.nanmax`.
+error norm, and a pipeline must give them back as NaN: `fixedscaleoffset` and `zfpy` decode them as numbers,
+so on such a field the sweep drops those pipelines and `compress` refuses them (`pass_finite`). In section
+5's check, use `np.nanmax`.
 
 **`compress` is safe to repeat.** Fields already in the store are skipped, and a field that failed is
 retried.
@@ -736,9 +744,11 @@ retried.
 | `[verify-gate] FAIL` and exit status 1 | the written field exceeds the budget | loosen the budget, or choose a more careful pipeline; nothing was left in the store |
 | `[verify-gate] ... no thresholds ...; verification advisory only` | `--pipeline` without a budget | add `--l1-threshold` if you want the check enforced |
 | `t already in ...; skipping.` | the store already holds the field | add `--no-skip-existing` to overwrite |
-| `[resume] ... starting this field from scratch` | the file, sample, chunking or library versions changed | nothing; the recorded results do not match, so the field is measured again |
+| `[resume] ... starting this field from scratch` | the file, sample, chunking, metric definitions or library versions changed | nothing; the recorded results do not match, so the field is measured again |
 | `[memcheck] REFUSING to proceed: ...` | too little memory is free at that moment: for a sweep, for the sample (twice it on the first rank); for `compress`, for the write | close other programs, or lower `--eval-data-size-limit` (sweep) or `--threads` (compress) |
-| `[memcheck] FATAL: cannot fit any sample with N rank(s) per node` | too many ranks for the memory | start fewer ranks (`mpirun -n`) |
+| `[memcheck] FATAL: the smallest sample of 'x' ... does not fit` | the field's smallest sample (3 time steps × 3 levels) and the ranks' working sets need more memory than the machine has | start fewer ranks (`mpirun -n`) |
+| `[sample] raised the sample budget ...` | the limit is below the field's smallest sample | nothing: a smaller sample would not show the field's time steps and levels |
+| `[var] skipping x: the sample holds the single value ...` | the time steps and levels the sample keeps do not show how the field varies | raise `--eval-data-size-limit` |
 | `[shared-sample] FATAL ... Allocate_shared failed` | the shared memory is smaller than the sample, usually in a container | `docker run --shm-size` of at least the sample size |
 | `[cr-drift] WARNING` | the sample predicted a different ratio than the whole field achieved | informative; a larger sample predicts better |
 | `[var] skipping grid geometry (CF bounds): ...` | helper variables were left out on purpose | nothing; name one with `--field-to-compress` if you really want it |
