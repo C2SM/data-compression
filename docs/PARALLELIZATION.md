@@ -200,6 +200,7 @@ To keep the parallelism behaving correctly, the toolkit relies on some invariant
 ## Where to read further
 
 - `santis.run` — the production driver for Santis: this topology, a per-field list of budgets, gates, sample sizes and ranks per node, and resume through `RESULTS_BASE`.
+- `docs/SAMPLING.md` — how the sweep's sample is built and sized, what it cannot see, and the data layouts the sampler does not handle yet.
 - `src/dc_toolkit/cli.py` — the commands and their options only.
 - `src/dc_toolkit/utils_cli.py` — what each command does, step by step, from the function the command calls (the sweep: `sweep_dataset` in section 5, then `sweep_setup`, `sweep_sample_limit`, `sweep_build_sample`, `shared_sample_window`, `node_counter`, `sweep_run_rank`; compress: `compress_fields` in section 6).
 - `src/dc_toolkit/utils.py` — `detect_node_topology` and `check_thread_oversubscription` (section 7); the memory guards (`check_memory_headroom`, `check_node_memory_headroom`) and the `--threads` check (`check_thread_count`) live in section 2 of `utils_cli.py`.

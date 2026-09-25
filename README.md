@@ -95,6 +95,8 @@ A combination is identified by its **pipeline**: the zarr JSON of its three code
 ### HPC parallelism (SLURM / MPI)
 
 > How every command parallelizes work (MPI ranks sharing one sample per node, why the production driver runs 32 ranks on a 288-core node, chunks vs shards): [`docs/PARALLELIZATION.md`](docs/PARALLELIZATION.md).
+>
+> How the sweep samples a field (which time steps and levels, the budget and its memory cap, what a sample cannot see, and the data layouts it does not handle yet): [`docs/SAMPLING.md`](docs/SAMPLING.md).
 
 `evaluate_combos` runs as **one MPI rank per core**: the ranks of a node share one copy of the sample through an MPI shared-memory window.  The combos still to evaluate are split across the nodes, and inside a node every rank claims the next combo of the node's share from a counter in the node's shared memory each time it finishes one, evaluating one pipeline at a time (the `[sweep]` line prints the share per node).  Scale out by increasing `--nodes`; the node count is not part of the resume state, so a sweep can be resubmitted on more or fewer nodes:
 

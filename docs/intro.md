@@ -693,6 +693,7 @@ at least 3 time steps and 3 levels (all, where the field has fewer; ensemble mem
 as time steps), so a smaller limit is raised to that
 (`[sample] raised the sample budget ...`); a field with no time or vertical dimension to thin is its own
 sample. For big files on a laptop, lower the limit, for example `--eval-data-size-limit 512MiB`.
+[SAMPLING.md](SAMPLING.md) explains the rules.
 
 A sample must show how the field varies. When it holds a single value (or none that is finite) while the
 field varies, the sweep skips the field (`[var] skipping ...`, an error for the `--field-to-compress`): raise
@@ -791,5 +792,6 @@ mpirun -n 8 dc_toolkit evaluate_combos FILE --where-to-write DIR --field-to-comp
 ```
 
 Where to go next: the [README](../README.md) documents every output file and the cluster setup, and
-[PARALLELIZATION.md](PARALLELIZATION.md) explains how the commands use your cores. Both commands are also
-available from a graphical interface (`dc_toolkit run_web_ui`).
+[PARALLELIZATION.md](PARALLELIZATION.md) explains how the commands use your cores, and [SAMPLING.md](SAMPLING.md)
+how the sweep samples a field. Both commands are also available from a graphical interface
+(`dc_toolkit run_web_ui`).
