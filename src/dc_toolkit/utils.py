@@ -626,8 +626,8 @@ def serializer_space(da, with_lossy=True, serializer_class="all", with_ebcc=Fals
     is the classic recipe, and all an 8-bit field gets: pco refuses those).  ZFPY needs `with_lossy`
     and floats (fixed-rate zfp is never exact on integers, and Delta, their only filter, turns that
     into a random walk on decode).  EBCC needs `with_ebcc` (or class 'ebcc'), `with_lossy` and float
-    (lat, lon) frames; `data_range` (full-field min, max) scales its error targets, else they are
-    relative to each tile.  ZFPYFlat is planned when `chunk_shapes` (the sample's and store's chunks)
+    (lat, lon) frames within the float32 range it casts to; `data_range` (full-field min, max) scales its
+    error targets, else they are relative to each tile.  ZFPYFlat is planned when `chunk_shapes` (the sample's and store's chunks)
     is not given or ZFPYRank encodes one of them at 2-D or more.  Raises ValueError when the space is
     empty."""
     if serializer_class.lower() == "ebcc":
@@ -662,6 +662,8 @@ def serializer_space(da, with_lossy=True, serializer_class="all", with_ebcc=Fals
                       for v in variants for mode, param, fn in modes for k in _ZFPY_K_GRID]
         elif cls is EBCC:
             tile, why = ebcc_tile(da)
+            if data_range and max(abs(data_range[0]), abs(data_range[1])) > float(np.finfo(np.float32).max):
+                tile, why = None, "the field exceeds the float32 range EBCC casts to"
             if tile is not None:
                 span = float(data_range[1] - data_range[0]) if data_range else None
                 space += [EBCC.from_params(*tile, r * span) if span else
@@ -877,7 +879,7 @@ def pipeline_name(compressor, filt, serializer) -> str:
 # =============================================================================
 
 # What the metrics measure; the resume state records it beside a digest of the code that measures them.
-METRIC_DEFINITIONS = ("N_Corrupt: cells whose finiteness the round trip changes",
+METRIC_DEFINITIONS = ("N_Corrupt: cells whose class (finite, NaN, +Inf, -Inf) the round trip changes",
                       "N_Bounds: cells the round trip moves from inside the physical bounds (with the slack) to outside",
                       "Q99_Rel: cells with |x| >= the q99 cut, taken over the non-zero values when the plain one is 0",
                       "Grad_Rel: finite differences along the horizontal dims, else the non-leading ones")
@@ -948,7 +950,7 @@ _ACC_MIN = ("decoded_min", "source_min")
 
 def _error_sums(orig_all, decoded_all, chunks, q99_abs=None, bounds=None) -> dict:
     """Accumulators of the error metrics, chunk by chunk, over the cells finite in both arrays; n_corrupt
-    counts the cells finite in only one, n_bounds those inside `bounds` (low, high) in the original and
+    counts the cells whose class (finite, NaN, +Inf, -Inf) differs, n_bounds those inside `bounds` (low, high) in the original and
     outside in the decoded array, source_min/max span the finite original.  `q99_abs` None skips the tail."""
     acc = dict(_ACC_INIT)
     with np.errstate(invalid="ignore"):
@@ -956,6 +958,11 @@ def _error_sums(orig_all, decoded_all, chunks, q99_abs=None, bounds=None) -> dic
             orig, dec = orig_all[sl], decoded_all[sl]
             finite_orig, finite_dec = np.isfinite(orig), np.isfinite(dec)
             acc["n_corrupt"] += int(np.count_nonzero(finite_orig != finite_dec))  # data lost, or fill made data
+            both = ~finite_orig & ~finite_dec
+            if both.any():  # a NaN turned Inf, or an Inf turned NaN or the other Inf
+                o, d = orig[both], dec[both]
+                nan_o, nan_d = np.isnan(o), np.isnan(d)
+                acc["n_corrupt"] += int(np.count_nonzero(nan_o != nan_d) + np.count_nonzero(~nan_o & ~nan_d & (o != d)))
             if orig.dtype.kind != "f":
                 acc["source_min"], acc["source_max"] = min(acc["source_min"], orig.min()), max(acc["source_max"], orig.max())
             elif finite_orig.any():
@@ -1026,8 +1033,8 @@ def evaluate_codec_pipeline(sample_np: np.ndarray, dims, codec_kwargs: dict, chu
                             q99_abs: float | None = None, bounds=None, compute_gradient: bool = False,
                             gradient_axes=None, precheck_thresholds: dict | None = None):
     """Round-trip `sample_np` through a pipeline in memory; returns (compression_ratio, errors_dict,
-    euclidean_distance).  Fill (non-finite in the original) is left out of every norm; a cell whose
-    finiteness the round trip changes (data turned NaN/Inf, or fill turned into data) is corruption,
+    euclidean_distance).  Fill (non-finite in the original) is left out of every norm; a cell whose class
+    the round trip changes (data turned NaN/Inf, fill turned into data, NaN into Inf) is corruption,
     counted in N_Corrupt; with `bounds` (low, high), N_Bounds counts the cells moved outside them.  With
     `precheck_thresholds`, combos failing a cheap gate skip the gradient metric, one more pass over the sample."""
     decoded, ratio = _zarr_roundtrip(sample_np, dims, codec_kwargs, chunks)

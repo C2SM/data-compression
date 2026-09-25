@@ -45,10 +45,12 @@ class ZFPYRank(zarrcodecs_nc.ZFPY, codec_name="zfpy"):
             dims = (dims[0] * dims[1],) + dims[2:]     # C-order keeps the fold contiguous
         return dims
 
-    async def _encode_single(self, chunk_data, chunk_spec):
+    def _encode_sync(self, chunk_data, chunk_spec):  # zarr's synchronous codec pipeline
         arr = np.ascontiguousarray(chunk_data.as_ndarray_like())
-        out = await asyncio.to_thread(self._codec.encode, arr.reshape(self.encode_shape(arr.shape)))
-        return chunk_spec.prototype.buffer.from_bytes(out)
+        return chunk_spec.prototype.buffer.from_bytes(self._codec.encode(arr.reshape(self.encode_shape(arr.shape))))
+
+    async def _encode_single(self, chunk_data, chunk_spec):  # the async one; before zarr 3.4 it skips _encode_sync
+        return await asyncio.to_thread(self._encode_sync, chunk_data, chunk_spec)
 
 
 class _ZFPYFlatCodec(numcodecs.zfpy.ZFPY):

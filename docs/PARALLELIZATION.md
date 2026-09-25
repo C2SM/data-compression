@@ -142,7 +142,7 @@ Dask operates on blocks of whole shards; zarr encodes the chunks inside each one
 
 ### Memory model
 
-A task holds its block, xarray's masking copy of it, zarr's encoded bytes and, with `--verify`, the block read back: below 4 × the block with the verify, 2 × without, plus the error sums' temporaries (8 × an inner chunk). compress runs as many blocks at once as fit in `--memory-threshold` × the memory available (the cgroup's grant under Slurm, else the host's), at most `--threads`, and refuses a field when a single block does not fit; the `[persist]` line prints the block and how many run at once. With 512 MiB blocks and 32 threads the write needs about 68 GiB.
+A task holds its block and its encoded chunks and shards, then, with `--verify`, the block read back: below 4 × the block either way (the write itself peaks near 3.5 ×), plus the error sums' temporaries (8 × an inner chunk). compress runs as many blocks at once as fit in `--memory-threshold` × the memory available (the cgroup's grant under Slurm, else the host's), at most `--threads`, and refuses a field when a single block does not fit; the `[persist]` line prints the block and how many run at once. With 512 MiB blocks and 32 threads the write needs about 68 GiB.
 
 ### Threads inside a codec
 

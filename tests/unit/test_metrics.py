@@ -36,6 +36,28 @@ def test_sweep_counts_fill_turned_into_data(sst, name, corrupt):
     assert err["N_Valid"] == sst.size - 128
 
 
+def test_corrupt_counts_a_changed_kind_of_non_finite_value():
+    orig = np.array([np.nan, np.inf, -np.inf, np.nan, 1.0], "f4")
+    dec = np.array([np.inf, np.nan, np.inf, np.nan, np.nan], "f4")  # NaN->Inf, Inf->NaN, -Inf->+Inf, kept, lost
+    assert utils._error_sums(orig, dec, (5,))["n_corrupt"] == 4
+
+
+def _chunk_bytes(codec, x, pipeline):
+    with zarr.config.set({"codec_pipeline.path": f"zarr.core.codec_pipeline.{pipeline}"}):
+        store = zarr.storage.MemoryStore()
+        z = zarr.create_array(store=store, name="x", shape=x.shape, dtype=x.dtype, chunks=x.shape, serializer=codec,
+                              compressors=None)
+        z[...] = x
+        return zarr.core.sync.sync(store.get("x/c/0/0/0", zarr.core.buffer.default_buffer_prototype())).to_bytes()
+
+
+@pytest.mark.parametrize("codec", [utils.ZFPYRank(mode=2, rate=8), utils.ZFPYFlat(mode=2, rate=8)])
+def test_zfp_encoders_fold_on_both_zarr_pipelines(codec):
+    """zarr's synchronous codec pipeline (an opt-in) encodes through _encode_sync: the fold must hold there too."""
+    x = np.random.default_rng(4).normal(size=(1, 3, 70000)).astype("f4")  # zfp cannot take 70000 cells at 3-D
+    assert _chunk_bytes(codec, x, "FusedCodecPipeline") == _chunk_bytes(codec, x, "BatchedCodecPipeline")
+
+
 def test_bounds_count_only_cells_the_round_trip_moves_out():
     orig = np.array([-1.0, 0.0, 0.5, 1.0, 2.0], "f4")   # -1 and 2 lie outside [0, 1] already
     dec = np.array([-2.0, -0.1, 0.5, 1.2, 0.5], "f4")   # 0 -> -0.1 and 1 -> 1.2 leave the bounds
@@ -103,6 +125,7 @@ def test_q99_cut_over_nonzero_values():
 def test_q99_cut_edge_cases():
     assert utils_cli.q99_cut(np.zeros(10, "f4")) == (0.0, False)
     assert utils_cli.q99_cut(np.full(10, np.nan)) == (None, False)
+    assert utils_cli.q99_cut(np.array([-128] * 50 + [3] * 50, "i1")) == (128.0, False)
 
 
 def _gradient_reference(o, d, axes):

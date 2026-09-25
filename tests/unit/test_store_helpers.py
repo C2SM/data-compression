@@ -122,6 +122,7 @@ def test_a_lock_being_written_is_respected(tmp_path):
 @pytest.mark.parametrize("owner, alive", [({"slurm_job_id": "1", "slurm_step_id": "0"}, None),
                                           ({"host": "elsewhere", "pid": 1}, True)])
 def test_lock_owner_on_another_host(owner, alive, monkeypatch):
+    monkeypatch.delenv("SLURM_CLUSTER_NAME", raising=False)
     if alive is None:  # a Slurm step: squeue decides; a job that does not exist is gone
         def fake(argv, **kw):
             return SimpleNamespace(returncode=1, stdout="", stderr="slurm_load_jobs error: Invalid job id specified")
@@ -131,6 +132,7 @@ def test_lock_owner_on_another_host(owner, alive, monkeypatch):
 
 
 def test_squeue_lists_the_owners_step(monkeypatch):
+    monkeypatch.delenv("SLURM_CLUSTER_NAME", raising=False)
     monkeypatch.setattr(utils_cli.subprocess, "run",
                         lambda argv, **kw: SimpleNamespace(returncode=0, stdout="7.0\n7.2\n", stderr=""))
     assert utils_cli._lock_owner_alive({"slurm_job_id": "7", "slurm_step_id": "2"})
@@ -140,8 +142,21 @@ def test_squeue_lists_the_owners_step(monkeypatch):
     assert utils_cli._lock_owner_alive({"slurm_job_id": "878983", "slurm_step_id": "0"})
 
 
+def test_a_lock_from_another_cluster_is_alive(monkeypatch):
+    """Clusters that share a file system do not know each other's job ids; squeue decides when a side is unnamed."""
+    monkeypatch.setenv("SLURM_CLUSTER_NAME", "here")
+    monkeypatch.setattr(utils_cli.subprocess, "run", lambda argv, **kw: SimpleNamespace(
+        returncode=1, stdout="", stderr="slurm_load_jobs error: Invalid job id specified"))
+    assert utils_cli._lock_owner_alive({"slurm_job_id": "5", "slurm_step_id": "0", "slurm_cluster": "there"})
+    assert not utils_cli._lock_owner_alive({"slurm_job_id": "5", "slurm_step_id": "0", "slurm_cluster": "here"})
+    assert not utils_cli._lock_owner_alive({"slurm_job_id": "5", "slurm_step_id": "0"})
+    monkeypatch.delenv("SLURM_CLUSTER_NAME")  # a login node
+    assert not utils_cli._lock_owner_alive({"slurm_job_id": "5", "slurm_step_id": "0", "slurm_cluster": "there"})
+
+
 def test_a_lock_of_this_very_step_is_an_earlier_incarnation(monkeypatch):
     """A requeued job reruns its steps under the same ids: their old locks are stale unless the pid lives here."""
+    monkeypatch.delenv("SLURM_CLUSTER_NAME", raising=False)
     monkeypatch.setenv("SLURM_JOB_ID", "123")
     monkeypatch.setenv("SLURM_STEP_ID", "4")
     owner = {"slurm_job_id": "123", "slurm_step_id": "4", "host": socket.gethostname()}
@@ -205,6 +220,29 @@ def test_promote_of_a_new_array_drops_the_listing(tmp_path):
     assert "consolidated_metadata" not in json.loads((merged / "zarr.json").read_text())
 
 
+def test_a_listing_that_cannot_be_dropped_stops_the_promotion(tmp_path, monkeypatch):
+    """Consolidated readers would decode the new array with the old array's metadata."""
+    merged = tmp_path / "d.zarr"
+    _store_with(merged, ["t"])
+    utils_cli.consolidate_store(str(merged))
+    _store_with(utils_cli.staging_path(str(merged)), ["t"])
+
+    def full(path, text):
+        raise OSError("Disk quota exceeded")
+    monkeypatch.setattr(utils_cli, "atomic_write", full)
+    with pytest.raises(OSError):
+        utils_cli.promote_staged(str(merged), "t")
+    assert (merged / "t" / "zarr.json").is_file() and (utils_cli.staging_path(str(merged)) / "t").is_dir()
+
+
+def test_cgroup_headroom_counts_clean_file_cache(tmp_path, monkeypatch):
+    for name, text in (("memory.max", "1000"), ("memory.current", "900"),
+                       ("memory.stat", "anon 500\nactive_file 300\ninactive_file 100\nfile_dirty 50\nfile_writeback 0")):
+        (tmp_path / name).write_text(text)
+    monkeypatch.setattr(utils_cli, "_cgroup_v2_memory_paths", lambda: iter([str(tmp_path / "memory.max")]))
+    assert utils_cli._cgroup_headroom() == 1000 - 900 + 300 + 100 - 50
+
+
 def test_an_array_set_aside_by_a_killed_promotion_comes_back(tmp_path):
     merged = tmp_path / "d.zarr"
     _store_with(merged, ["t"])
@@ -265,10 +303,11 @@ def test_chunk_geometry_precedence():
     assert sources == {"inner_chunk_mib": "manifest", "max_inner_chunk_mib": "cli", "spatial_split": "default"}
 
 
+@pytest.mark.parametrize("verify", [True, False])
 @pytest.mark.parametrize("avail, want", [(100 * 2**30, 8), (10 * 2**30, 3), (None, 8)])
-def test_write_concurrency_fits_the_memory(avail, want, monkeypatch):
+def test_write_concurrency_fits_the_memory(avail, want, verify, monkeypatch):
     monkeypatch.setattr(utils_cli, "available_memory", lambda threshold: avail)
-    opts = SimpleNamespace(verify=True, memory_threshold=0.8, threads=8)
+    opts = SimpleNamespace(verify=verify, memory_threshold=0.8, threads=8)
     assert utils_cli.write_concurrency(512 * 2**20, 16 * 2**20, 100, opts, "x") == want
 
 

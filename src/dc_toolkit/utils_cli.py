@@ -139,12 +139,14 @@ def measurement_digest() -> str:
     """Digest of the code that turns a pipeline into a result row (docstrings and comments aside): a change
     to it voids the recorded rows through sweep_state_{var}.json."""
     h = hashlib.blake2b(digest_size=8)
-    for obj in (utils._zarr_roundtrip, utils._error_sums, utils._merge_sums, utils._errors_from_sums, utils._rel,
+    h.update(repr((utils._ACC_INIT, utils._ACC_MAX, utils._ACC_MIN, utils.CHEAP_GATES)).encode())
+    for obj in (utils._zarr_roundtrip, utils._info_bytes, utils._iter_chunk_slices, utils._error_sums,
+                utils._merge_sums, utils._errors_from_sums, utils._rel, utils.within_limit,
                 utils.evaluate_codec_pipeline, utils._gradient_rel_l1, utils._gradient_pieces,
                 utils._classify_sample_dims, utils._is_time_like_coord, utils._is_vertical_like_coord,
                 utils._is_vertical_like_dim, utils.horizontal_axes, utils._compute_inner_chunk_shape,
-                utils._shrink_order, utils.compute_chunk_shape_for_eval, utils.codec_pipeline_kwargs,
-                codecs.ZFPYRank, codecs.ZFPYFlat, codecs.EBCC, q99_cut, sweep_evaluators):
+                utils._shrink_order, utils.compute_chunk_shape_for_eval, utils.codec_pipeline_kwargs, utils.ebcc_chunks,
+                codecs.ZFPYRank, codecs.ZFPYFlat, codecs._ZFPYFlatCodec, codecs.EBCC, q99_cut, sweep_evaluators):
         tree = ast.parse(textwrap.dedent(inspect.getsource(obj)))
         for node in ast.walk(tree):
             body = getattr(node, "body", None)
@@ -233,7 +235,7 @@ def promote_staged(merged_path: str, var: str) -> None:
     replacing an array of the same name, then remove the staging store.  Drops the consolidated metadata,
     which would not describe the new array."""
     target, aside = Path(merged_path) / var, staging_path(merged_path) / f"{var}{_REPLACED}"
-    drop_consolidated_metadata(merged_path)
+    drop_consolidated_metadata(merged_path)  # raises before any rename when it cannot
     if target.exists():
         os.replace(target, aside)  # two renames, so the old array is whole until the new one is in place
     try:
@@ -261,22 +263,16 @@ def consolidate_store(merged_path: str) -> list:
 
 def drop_consolidated_metadata(merged_path: str) -> bool:
     """Remove the store's consolidated metadata (True if there was any) so readers scan the arrays instead
-    of trusting a listing this run made stale."""
+    of trusting a listing this run made stale; raises when it cannot."""
     root = Path(merged_path) / "zarr.json"
     if not root.is_file():
         return False
-    try:
-        meta = json.loads(root.read_text())
-        if "consolidated_metadata" not in meta:
-            return False
-        meta.pop("consolidated_metadata")
-        tmp = root.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(meta, indent=2))
-        os.replace(tmp, root)  # atomic: readers may have the store open
-        return True
-    except Exception as e:
-        click.echo(f"[store] WARNING: could not drop the consolidated metadata of {merged_path}: {e}")
+    meta = json.loads(root.read_text())
+    if "consolidated_metadata" not in meta:
         return False
+    meta.pop("consolidated_metadata")
+    atomic_write(root, json.dumps(meta, indent=2))  # readers may have the store open
+    return True
 
 
 def read_json(path, label: str):
@@ -293,7 +289,7 @@ def read_json(path, label: str):
 
 def atomic_write(path, text: str) -> None:
     """Write through a temporary file and a rename, so a kill never leaves a truncated file."""
-    tmp = Path(f"{path}.tmp")
+    tmp = Path(f"{path}.{socket.gethostname()}.{os.getpid()}.tmp")
     tmp.write_text(text)
     os.replace(tmp, path)
 
@@ -326,8 +322,11 @@ def _lock_owner_alive(owner: dict) -> bool:
     """Whether the process that took a lock may still run: its Slurm step is running (its job, when it
     ran outside a step), else, on this host, its pid exists; unknown counts as alive.  A lock naming this
     very step (or this job, outside a step) is alive only as a live pid here: else an earlier incarnation
-    of a requeued job left it."""
+    of a requeued job left it.  Another cluster's jobs are unknown here."""
     job, step = str(owner.get("slurm_job_id") or ""), str(owner.get("slurm_step_id") or "")
+    cluster, here = owner.get("slurm_cluster"), os.environ.get("SLURM_CLUSTER_NAME")
+    if job and cluster and here and cluster != here:
+        return True
     if job:
         if job == os.environ.get("SLURM_JOB_ID") and (not step.isdigit() or step == os.environ.get("SLURM_STEP_ID")):
             return owner.get("host") == socket.gethostname() and _pid_alive(owner.get("pid"))
@@ -357,7 +356,8 @@ def _pid_alive(pid) -> bool:
 
 def _lock_owner_text(owner: dict) -> str:
     return (f"host {owner.get('host')}, pid {owner.get('pid')}"
-            + (f", Slurm step {owner['slurm_job_id']}.{owner.get('slurm_step_id')}" if owner.get("slurm_job_id") else "")
+            + (f", Slurm step {owner['slurm_job_id']}.{owner.get('slurm_step_id')} on {owner.get('slurm_cluster')}"
+               if owner.get("slurm_job_id") else "")
             + f", since {owner.get('time')}")
 
 
@@ -365,7 +365,8 @@ def acquire_lock(path: Path):
     """Create `path` exclusively, recording this process; a lock whose owner is gone is taken over.
     Returns None, or the description of a live owner."""
     me = {"host": socket.gethostname(), "pid": os.getpid(), "slurm_job_id": os.environ.get("SLURM_JOB_ID"),
-          "slurm_step_id": os.environ.get("SLURM_STEP_ID"), "time": time.strftime("%Y-%m-%dT%H:%M:%S")}
+          "slurm_step_id": os.environ.get("SLURM_STEP_ID"), "slurm_cluster": os.environ.get("SLURM_CLUSTER_NAME"),
+          "time": time.strftime("%Y-%m-%dT%H:%M:%S")}
     for _ in range(3):
         try:
             fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
@@ -470,7 +471,8 @@ def _cgroup_v2_memory_paths():
 
 
 def _cgroup_headroom():
-    """Bytes the job's cgroup v2 still grants (limit - usage + reclaimable file cache), or None."""
+    """Bytes the job's cgroup v2 still grants (limit - usage + clean file cache, which the kernel reclaims), or
+    None."""
     for path in _cgroup_v2_memory_paths():
         base = Path(path).parent
         try:
@@ -479,7 +481,9 @@ def _cgroup_headroom():
                 continue
             current = int((base / "memory.current").read_text())
             stat = dict(line.split() for line in (base / "memory.stat").read_text().splitlines())
-            return int(limit) - current + int(stat.get("inactive_file", 0))
+            clean = sum(int(stat.get(k, 0)) for k in ("active_file", "inactive_file")) - sum(
+                int(stat.get(k, 0)) for k in ("file_dirty", "file_writeback"))
+            return int(limit) - current + max(0, clean)
         except (OSError, ValueError):
             continue
     return None
@@ -634,7 +638,8 @@ def q99_cut(sample_np: np.ndarray):
     non-zero ones (over_nonzero) when that is 0.  A field that is 0 almost everywhere (cloud ice, hail)
     would otherwise put every cell in the tail, and its extremes are its largest non-zero values.  The cut
     is None when no value is finite."""
-    finite = np.abs(sample_np[np.isfinite(sample_np)])
+    finite = sample_np[np.isfinite(sample_np)]
+    finite = np.abs(finite.astype(np.float64) if finite.dtype.kind in "iu" else finite)  # |int8(-128)| wraps
     if not finite.size:
         return None, False
     cut = float(np.quantile(finite, 0.99))
@@ -722,8 +727,7 @@ def keeps_nonfinite(codec, dtype) -> bool:
 def codec_spaces(sample_da, space_args: dict, fso_range, chunk_shapes=None, nonfinite: int = 0):
     """(compressors, filters, serializers) for the sample.  `fso_range` is the FULL field's (min, max):
     FixedScaleOffset and EBCC must not be parameterised from a sample that may miss the extremes.  When
-    the field holds `nonfinite` NaN/Inf cells, the codecs that cannot keep them are left out; so is EBCC
-    when a float64 field exceeds the float32 range it casts to."""
+    the field holds `nonfinite` NaN/Inf cells, the codecs that cannot keep them are left out."""
     try:
         spaces = (utils.compressor_space(sample_da, space_args["with_lossy"], space_args["compressor_class"]),
                   utils.filter_space(sample_da, space_args["with_lossy"], space_args["filter_class"],
@@ -733,14 +737,12 @@ def codec_spaces(sample_da, space_args: dict, fso_range, chunk_shapes=None, nonf
                                          chunk_shapes=chunk_shapes))
     except (ValueError, TypeError) as e:
         raise click.ClickException(str(e))
-    f32_max = float(np.finfo(np.float32).max)
-    out_of_f32 = fso_range is not None and max(abs(fso_range[0]), abs(fso_range[1])) > f32_max
-    kept = tuple([c for c in space if c is None or (keeps_nonfinite(c, sample_da.dtype) or not nonfinite)
-                  and not (isinstance(c, utils.EBCC) and out_of_f32)] for space in spaces)
-    reason = "it holds NaN/Inf, which they cannot keep" if nonfinite else "EBCC cannot take values beyond float32"
+    kept = tuple([c for c in space if c is None or not nonfinite or keeps_nonfinite(c, sample_da.dtype)]
+                 for space in spaces)
     for space, left, what in zip(spaces, kept, ("compressor", "filter", "serializer")):
         if space and not left:
-            raise click.ClickException(f"the {what} class has nothing for this field: {reason}")
+            raise click.ClickException(f"the {what} class has nothing for this field: it holds NaN/Inf, which "
+                                       f"they cannot keep")
     return kept
 
 
@@ -848,10 +850,10 @@ def read_blocks(shape, dtype, write_unit, target_bytes: int = 512 * 2**20) -> tu
 
 def write_concurrency(block_bytes: int, inner_bytes: int, nblocks: int, opts, var: str) -> int:
     """Blocks compress holds at once: as many as fit in --memory-threshold of the available memory, at most
-    --threads; aborts when one does not fit.  Per block: the block, xarray's masking copy, zarr's encoded
-    bytes, with --verify the re-read block (measured below 4x the block), and the error sums' chunk
-    temporaries."""
-    per_block = (4 if opts.verify else 2) * block_bytes + PER_RANK_CHUNK_FACTOR * inner_bytes
+    --threads; aborts when one does not fit.  Per block: the block, its encoded chunks and shards and what the
+    allocator keeps of them (the write peaks near 3.5x the block; the verify's read-back follows it), and the
+    error sums' chunk temporaries."""
+    per_block = 4 * block_bytes + PER_RANK_CHUNK_FACTOR * inner_bytes
     avail = available_memory(opts.memory_threshold)
     fit = int(opts.threads) if avail is None else int(opts.memory_threshold * avail // per_block)
     if fit < 1:
@@ -901,21 +903,23 @@ def persist_field(da, var: str, merged_path: str, combo, opts, layout, q99_abs, 
 
 def fso_range_problem(combo, errors):
     """Why the pipeline's FixedScaleOffset cannot hold the written field (the verify pass's Source_Min and
-    Source_Max), or None: it does not clip, and a value beyond its range wraps."""
+    Source_Max), or None: it does not clip, and a value beyond its range wraps.  The field's extremes are
+    scaled in its own dtype, as the codec does; the encoding is monotone, so they decide."""
     filt = combo[1]
     if not isinstance(filt, utils.zarrcodecs_nc.FixedScaleOffset) or not errors:
         return None
     cfg = filt.codec_config
     offset, scale, astype = float(cfg["offset"]), float(cfg["scale"]), np.dtype(cfg["astype"])
-    if astype.kind not in "iu":
-        return None  # a float target overflows to inf, which the finite gate counts
-    info = np.iinfo(astype)
-    lo, hi = sorted((offset + (int(info.min) - 0.5) / scale, offset + (int(info.max) + 0.5) / scale))
     smin, smax = errors.get("Source_Min"), errors.get("Source_Max")
-    if smin is None or not math.isfinite(smin) or (lo <= smin and smax < hi):
+    if astype.kind not in "iu" or smin is None or not math.isfinite(smin):
+        return None  # a float target overflows to inf, which the finite gate counts
+    with np.errstate(over="ignore", invalid="ignore"):
+        coded = np.around((np.array([smin, smax], dtype=cfg["dtype"]) - offset) * scale)
+    info = np.iinfo(astype)
+    if np.all(np.isfinite(coded)) and info.min <= coded.min() and coded.max() <= info.max:
         return None
-    return (f"the field spans [{smin:g}, {smax:g}], beyond the [{lo:g}, {hi:g}] its FixedScaleOffset to "
-            f"{astype} holds")
+    return (f"the field spans [{smin:g}, {smax:g}], which its FixedScaleOffset to {astype} codes as "
+            f"[{coded[0]:g}, {coded[1]:g}], beyond [{info.min}, {info.max}]")
 
 
 # =============================================================================
@@ -946,6 +950,8 @@ def sweep_setup(opts) -> SweepContext:
         raise click.ClickException("EBCC is lossy: --with-ebcc / --serializer-class ebcc need --with-lossy.")
     if opts.with_ebcc and not utils.EBCC_AVAILABLE:
         raise click.ClickException("--with-ebcc needs the ebcc package: pip install -e '.[ebcc]'")
+    if opts.phys_min is not None and opts.phys_max is not None and opts.phys_min > opts.phys_max:
+        raise click.ClickException(f"--phys-min {opts.phys_min:g} is above --phys-max {opts.phys_max:g}.")
     comm = MPI.COMM_WORLD
     rank, size = comm.Get_rank(), comm.Get_size()
     node_comm, ranks_on_node, local_rank = utils.detect_node_topology(comm)
@@ -1141,7 +1147,7 @@ def sweep_recorded_rows(var, sample_np, q99_abs, fso_range, bounds, opts, sweep:
             "inner_chunk_mib": opts.inner_chunk_mib, "spatial_split": opts.spatial_split,
             "sample_digest": hashlib.blake2b(memoryview(sample_np).cast("B"), digest_size=16).hexdigest(),
             "bounds": bounds, "metric_definitions": utils.METRIC_DEFINITIONS, "code": measurement_digest(),
-            "env": env_versions()}, default=str))
+            "row_columns": PARTIAL_CSV_COLUMNS, "env": env_versions()}, default=str))
         digest = state_digest(state)
         state_path = where / f"sweep_state_{var}.json"
         previous = read_json(state_path, "resume")
@@ -1156,18 +1162,20 @@ def sweep_recorded_rows(var, sample_np, q99_abs, fso_range, bounds, opts, sweep:
                        f"starting this field from scratch.")
         crashes_path = where / f"crashes_{var}.json"
         crashes = {} if restart else (read_json(crashes_path, "resume") or {})
-        for path in rank_files(where, "inflight", var):
-            for line in path.read_text().splitlines():
+        journals = rank_files(where, "inflight", var)
+        for path in journals:
+            for line in path.read_text(errors="replace").splitlines():  # a node crash can leave garbage
                 mode, name, key = (line.split("\t", 2) + ["", ""])[:3]
                 if key and not restart:
                     entry = crashes.setdefault(key, {"name": name, "crashes": 0, "alone": False})
                     entry["crashes"] += 1
                     entry["alone"] = entry["alone"] or mode == "alone"
-            path.unlink()
-        if crashes:
+        if crashes:  # recorded before the journals go, so a kill in between loses no crash
             atomic_write(crashes_path, json.dumps(crashes, indent=2))
         else:
             crashes_path.unlink(missing_ok=True)
+        for path in journals:
+            path.unlink()
         if restart:
             moved = [n for n in (f"results_{var}.parquet", f"manifest_{var}.json", f"config_space_{var}.csv")
                      if (where / n).is_file()]
@@ -1376,15 +1384,19 @@ def _evaluate_and_record(cfg, mode: str, evaluate_one, gate, pw, fw, jf, failure
 
 
 class _Journal:
-    """inflight_{var}_rank{rank}.csv, holding the combo this rank evaluates: a rank killed inside one leaves
-    it behind.  SIGTERM (a cancel or the walltime: the combo is not at fault) and any Python exit remove it."""
+    """inflight_{var}_rank{rank}.csv, holding the combo this rank evaluates: a rank killed inside one (a crash,
+    the OOM killer) leaves it behind.  A signal from outside (a cancel, the walltime, --signal) and any Python
+    exit clear it: the combo is not at fault."""
+    SIGNALS = tuple(getattr(signal, n) for n in ("SIGTERM", "SIGHUP", "SIGQUIT", "SIGUSR1", "SIGUSR2", "SIGALRM",
+                                                 "SIGXCPU") if hasattr(signal, n))
 
     def __init__(self, where, var, rank):
         self.path = Path(where) / f"inflight_{var}_rank{rank}.csv"
 
     def __enter__(self):
         self.fh = open(self.path, "w", buffering=1)
-        self.previous = signal.signal(signal.SIGTERM, self._on_term)
+        self.previous = {s: signal.signal(s, self._on_term) for s in self.SIGNALS  # a handler of others stays
+                         if signal.getsignal(s) == signal.SIG_DFL}
         return self.fh
 
     def _on_term(self, signum, frame):
@@ -1395,7 +1407,8 @@ class _Journal:
         os.kill(os.getpid(), signum)
 
     def __exit__(self, *exc):
-        signal.signal(signal.SIGTERM, self.previous)
+        for s, handler in self.previous.items():
+            signal.signal(s, handler)
         self.fh.close()
         self.path.unlink(missing_ok=True)
 
@@ -1765,7 +1778,9 @@ def compress_candidates(opts):
     results_{var}.parquet.  A manifest must parse and match sweep_state_{var}.json.  `manifests` holds the
     usable manifests; `dropped` maps each field without a usable pipeline to why."""
     wtw = Path(opts.where_to_write)
-    wanted = {v.strip() for v in opts.vars_filter.split(",") if v.strip()} if opts.vars_filter else None
+    wanted = {v.strip() for v in opts.vars_filter.split(",") if v.strip()} if opts.vars_filter is not None else None
+    if wanted is not None and not wanted:
+        raise click.ClickException("--vars names no field.")
     manifests, dropped, sweep_env = {}, {}, None
     for mpath in sorted(wtw.glob("manifest_*.json")):
         var = mpath.stem.removeprefix("manifest_")
@@ -1836,13 +1851,15 @@ def compress_candidates(opts):
 
 def source_identity(path) -> dict:
     st = os.stat(path)
-    return {"path": os.path.abspath(path), "size": st.st_size, "mtime_ns": st.st_mtime_ns}
+    return {"path": os.path.realpath(path), "size": st.st_size, "mtime_ns": st.st_mtime_ns}
 
 
 def compress_plan(da, var: str, cand: dict, manifest, opts):
     """(combo, layout, request).  `request` identifies the array this run would write: source file, field,
     pipeline, layout and the verify gate's thresholds and bounds; compress records it on the array and
     --skip-existing compares it."""
+    if da.ndim == 0:
+        raise click.ClickException(f"{var} is a scalar; compress writes arrays with at least one dim")
     combo = pipeline_codecs(cand["pipeline"], var)
     geometry, sources = chunk_geometry(opts, manifest)
     click.echo(f"[chunks] {var}: " + ", ".join(f"{k}={v} ({sources[k]})" for k, v in geometry.items()))
@@ -1858,9 +1875,9 @@ def compress_plan(da, var: str, cand: dict, manifest, opts):
     return combo, layout, request
 
 
-def stored_mismatch(merged_path: str, var: str, request: dict, opts):
-    """Why the array `var` in the store is not what this run would write (compress_plan's request), or
-    None."""
+def stored_mismatch(merged_path: str, var: str, request: dict, predicted, opts):
+    """Why the array `var` in the store is not what this run would write (compress_plan's request, and a
+    ratio within --cr-drift-tol of `predicted` under --cr-drift-gate), or None."""
     try:
         attrs = json.loads((Path(merged_path) / var / "zarr.json").read_text()).get("attributes") or {}
     except (OSError, ValueError):
@@ -1876,9 +1893,9 @@ def stored_mismatch(merged_path: str, var: str, request: dict, opts):
         return "it needs dc_toolkit to be read"
     if opts.verify and opts.verify_gate and record.get("verify_gate") == "fail-advisory":
         return "it failed the verify gate (written with --no-verify-gate)"
-    drift = record.get("cr_drift")
-    if opts.cr_drift_gate and isinstance(drift, (int, float)) and drift < -opts.cr_drift_tol:
-        return f"its ratio fell {-drift:.0%} short of the sweep's (written without --cr-drift-gate)"
+    _, drift, direction = evaluate_cr_drift(record.get("ratio"), predicted, opts.cr_drift_tol)
+    if opts.cr_drift_gate and direction == "under":
+        return f"its ratio falls {-drift:.0%} short of the sweep's"
     changed = [k for k in request if k not in ("thresholds", "bounds", "q99_abs") and stored.get(k) != request[k]]
     if opts.verify and any(stored.get(k) != request[k] for k in ("thresholds", "bounds", "q99_abs")):
         changed.append("verify gate")
@@ -1941,9 +1958,8 @@ def compress_one(da, var: str, cand: dict, manifest, merged_path: str, opts, com
         try:
             # A JSON string: netCDF, which from_zarr_to_netcdf writes, has no nested attributes.
             zarr.open_array(store=staging, path=var, mode="r+").update_attributes({"dc_toolkit": json.dumps(json_safe({
-                "request": request, "verify_gate": verify_status, "ratio": out["ratio"], "cr_drift": drift,
-                "errors": entry["errors"], "written_by": provenance(), "time": time.strftime("%Y-%m-%dT%H:%M:%S")}),
-                sort_keys=True)})
+                "request": request, "verify_gate": verify_status, "ratio": out["ratio"], "errors": entry["errors"],
+                "written_by": provenance(), "time": time.strftime("%Y-%m-%dT%H:%M:%S")}), sort_keys=True)})
         finally:
             close_store(staging)
         promote_staged(merged_path, var)
@@ -1999,11 +2015,15 @@ def _compress_locked(opts, candidates, manifests, dropped, merged_path) -> bool:
                 any_error = True
                 click.echo(f"[compress] ERROR: variable '{var}' not in dataset; skipping.")
                 results[var] = {"status": "missing-from-dataset"}
+                if not opts.continue_on_error:
+                    click.echo("[compress] stopping at the first failure (--no-continue-on-error).")
+                    stopped_at = i
+                    break
                 continue
             try:
                 combo, layout, request = compress_plan(ds[var], var, cand, manifests.get(var), opts)
                 if opts.skip_existing and var in existing:
-                    reason = stored_mismatch(merged_path, var, request, opts)
+                    reason = stored_mismatch(merged_path, var, request, cand.get("ratio"), opts)
                     if reason is None:
                         click.echo(f"[compress] {var} already in {merged_path} as requested; skipping.")
                         results[var] = {"status": "skipped-existing"}
@@ -2035,10 +2055,15 @@ def _compress_locked(opts, candidates, manifests, dropped, merged_path) -> bool:
             names = consolidate_store(merged_path)
             click.echo(f"[compress] consolidated metadata on {merged_path} ({len(names)} array(s): {', '.join(names)})")
         else:  # a listing from an earlier run would describe this run's fields wrongly
-            drop_consolidated_metadata(merged_path)
-            click.echo("[compress] --no-consolidate: the store has no consolidated metadata; readers scan the "
-                       "arrays until the next consolidation (dc_toolkit merge_compressed_fields DATASET "
-                       "WHERE_TO_WRITE).")
+            try:
+                drop_consolidated_metadata(merged_path)
+                click.echo("[compress] --no-consolidate: the store has no consolidated metadata; readers scan the "
+                           "arrays until the next consolidation (dc_toolkit merge_compressed_fields DATASET "
+                           "WHERE_TO_WRITE).")
+            except Exception as e:
+                any_error = True
+                click.echo(f"[compress] ERROR: cannot drop the consolidated metadata of {merged_path}, which no "
+                           f"longer describes the store: {e!r}")
     write_json(os.path.join(opts.where_to_write, "batch_manifest.json"), {
         "command": "compress", "dataset_file": os.path.abspath(opts.dataset_file),
         "where_to_write": os.fspath(opts.where_to_write), "merged_store": merged_path,

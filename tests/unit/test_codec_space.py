@@ -105,6 +105,16 @@ def test_pairing_rules(filt, ser, dtype, ok):
 
 
 @pytest.mark.ebcc
+def test_a_range_beyond_float32_leaves_only_ebcc_out():
+    pytest.importorskip("ebcc")
+    da = xr.DataArray(np.zeros((4, 64, 64), "f8"), dims=("time", "lat", "lon"))
+    sers = utils.serializer_space(da, with_ebcc=True, data_range=(0.0, 1e300))
+    assert sers and not any(isinstance(s, utils.EBCC) for s in sers)
+    with pytest.raises(ValueError, match="float32 range"):
+        utils.serializer_space(da, serializer_class="ebcc", data_range=(0.0, 1e300))
+
+
+@pytest.mark.ebcc
 def test_ebcc_pairing_rules():
     pytest.importorskip("ebcc")
     ebcc = utils.EBCC.from_params(46, 90, 0.1)
@@ -135,6 +145,13 @@ def test_fso_range_problem(smin, smax, bad):
     fso = nc.FixedScaleOffset(offset=0.0, scale=65535 / 10.0, dtype="float32", astype="uint16")
     problem = utils_cli.fso_range_problem((None, fso, None), {"Source_Min": smin, "Source_Max": smax})
     assert bool(problem) is bad
+
+
+def test_fso_range_problem_uses_the_codecs_arithmetic():
+    """A maximum just past the last code: exact arithmetic keeps it, float32 scaling rounds it to 65536."""
+    fso = nc.FixedScaleOffset(offset=200.0, scale=546.125, dtype="float32", astype="uint16")
+    assert utils_cli.fso_range_problem((None, fso, None), {"Source_Min": 200.0, "Source_Max": 320.00092})
+    assert utils_cli.fso_range_problem((None, fso, None), {"Source_Min": 200.0, "Source_Max": 320.0}) is None
 
 
 @pytest.mark.parametrize("offset, bad", [(250.0, False), (200.0, True)])

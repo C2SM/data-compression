@@ -45,8 +45,18 @@ def test_skip_existing_under_the_cr_drift_gate(swept_copy):
     (out / "manifest_t.json").write_text(json.dumps(m))
     assert "[cr-drift] WARNING" in invoke("compress", src, out).output
     res = invoke("compress", src, out, "--cr-drift-gate", code=1)
-    assert "short of the sweep's (written without --cr-drift-gate); rewriting it" in res.output
-    assert "cr-drift gate FAILED" in res.output
+    assert "short of the sweep's; rewriting it" in res.output and "cr-drift gate FAILED" in res.output
+
+
+def test_skip_existing_checks_the_drift_against_this_runs_prediction(swept_copy):
+    """An array written with --pipeline (no prediction) is not skipped under --cr-drift-gate when the
+    manifest's prediction is far off."""
+    src, out = swept_copy
+    m = json.loads((out / "manifest_t.json").read_text())
+    invoke("compress", src, out, "--vars", "t", "--pipeline", json.dumps(m["best"]["pipeline"]))
+    m["best"]["ratio"] *= 20
+    (out / "manifest_t.json").write_text(json.dumps(m))
+    assert "short of the sweep's; rewriting it" in invoke("compress", src, out, "--cr-drift-gate", code=1).output
 
 
 def test_an_array_without_a_record_is_rewritten(swept_copy):
@@ -67,7 +77,7 @@ def test_fso_that_cannot_hold_the_field_is_refused(swept_copy):
     fso = {"compressor": None, "serializer": None, "filter": {"name": "numcodecs.fixedscaleoffset", "configuration": {
         "offset": lo, "scale": 65535 / (mid - lo), "dtype": str(t.dtype), "astype": "uint16"}}}
     res = invoke("compress", src, out, "--vars", "t", "--pipeline", json.dumps(fso), "--no-verify-gate", code=1)
-    assert "its FixedScaleOffset to uint16 holds" in res.output
+    assert "its FixedScaleOffset to uint16 codes as" in res.output
 
 
 def test_bounds_the_source_already_crosses_do_not_fail_lossless(tigge_copy, tmp_path):

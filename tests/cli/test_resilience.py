@@ -57,12 +57,13 @@ def test_a_suspect_that_survives_alone_is_recorded(run, tmp_path):
 
 
 @pytest.mark.mpi
-def test_a_terminated_run_blames_no_combo(run, tmp_path):
-    """SIGTERM is a cancel or the walltime: the combo in flight is not a suspect."""
+@pytest.mark.parametrize("how", ["TERM", "USR1"])
+def test_a_terminated_run_blames_no_combo(run, tmp_path, how):
+    """A signal from outside (a cancel, the walltime, --signal=USR1@T) does not make the combo a suspect."""
     marker = tmp_path / "terminated-once"
-    assert run(tmp_path, how="TERM", marker=marker).returncode != 0
+    assert run(tmp_path, how=how, marker=marker).returncode != 0
     assert (tmp_path / "inflight_t_rank0.csv").read_text() == ""
-    second = run(tmp_path, how="TERM", marker=marker)
+    second = run(tmp_path, how=how, marker=marker)
     assert second.returncode == 0 and "one at a time" not in second.stdout
     assert json.loads((tmp_path / "manifest_t.json").read_text())["num_rows"] == 3
 

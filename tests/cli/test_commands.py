@@ -45,6 +45,12 @@ def test_bad_options_exit_2(tigge, tmp_path, args):
     invoke(*[a.format(tigge=tigge, tmp=tmp_path) for a in args], code=2)
 
 
+def test_inverted_bounds_are_refused(tigge, tmp_path):
+    out = invoke("evaluate_combos", tigge, "--where-to-write", tmp_path, "--l1-threshold", "0.01", "--phys-min", "5",
+                 "--phys-max", "1", code=1).output
+    assert "--phys-min 5 is above --phys-max 1" in out
+
+
 def test_sweep_writes_the_documented_files(swept):
     """README.md, "Output files": nothing undocumented, nothing missing (one rank, no crash)."""
     names = {p.name for p in swept.iterdir()}
@@ -61,7 +67,7 @@ def test_manifest_records_provenance_and_the_state(swept):
     from dc_toolkit import utils_cli
     assert m["sweep_state_digest"] == utils_cli.state_digest(state)
     assert m["provenance"]["dc_toolkit"] and m["num_rows"] == 30 and m["num_filtered"] == 30 - m["num_passed"]
-    assert {"code", "bounds", "metric_definitions", "env"} <= set(state)
+    assert {"code", "bounds", "metric_definitions", "row_columns", "env"} <= set(state)
 
 
 def test_resume_reuses_every_row(tigge, sweep_copy, swept):
@@ -101,6 +107,18 @@ def test_compress_verify_merge_inspect(tigge, sweep_copy):
         assert record["request"]["pipeline"] == m["best"]["pipeline"] and record["verify_gate"] == "pass"
     batch = json.loads((sweep_copy / "batch_manifest.json").read_text())
     assert not batch["any_error"] and {r["verify_gate"] for r in batch["results"].values()} == {"pass"}
+
+
+def test_compress_refuses_an_empty_vars(tigge, sweep_copy):
+    assert "--vars names no field" in invoke("compress", tigge, sweep_copy, "--vars", " , ", code=1).output
+
+
+def test_no_continue_on_error_stops_at_a_missing_field(tigge, sweep_copy, tmp_path):
+    pipe = '{"compressor": {"name": "numcodecs.zstd", "configuration": {"level": 3}}, "filter": null, "serializer": null}'
+    out = invoke("compress", tigge, tmp_path / "o", "--vars", "aa,t", "--pipeline", pipe, "--no-continue-on-error",
+                 code=1).output
+    batch = json.loads((tmp_path / "o" / "batch_manifest.json").read_text())["results"]
+    assert batch["aa"]["status"] == "missing-from-dataset" and batch["t"]["status"] == "not-attempted", out
 
 
 def test_compress_failures_exit_1(tigge, sweep_copy, tmp_path):

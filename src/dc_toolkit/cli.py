@@ -115,7 +115,7 @@ _VERIFY_OPTIONS = [
     click.option("--verify-gate/--no-verify-gate", default=True, show_default=True,
                  help="With --verify, fail a field whose production norms exceed the sweep thresholds in "
                       "manifest_{var}.json, or whose round trip moved a cell across the sweep's physical "
-                      "bounds or changed its finiteness (the gradient gate is sweep-only).  "
+                      "bounds or changed its finiteness or NaN/Inf kind (the gradient gate is sweep-only).  "
                       "--no-verify-gate only warns."),
 ]
 
@@ -197,7 +197,7 @@ _VERIFY_OPTIONS = [
               help="Skip combos already recorded in config_space_{var}_rank*.csv: their metrics are reused "
                    "and the gates re-applied with the current thresholds.  A change to what "
                    "sweep_state_{var}.json records (file, sample, sampling and chunk settings, bounds, "
-                   "measuring code, metric definitions, library versions, EBCC's env vars) restarts the "
+                   "measuring code, row layout, metric definitions, library versions, EBCC's env vars) restarts the "
                    "field, keeping the previous results as *.previous.  A combo in flight when a rank died "
                    "is evaluated alone on the next run, and left out if it kills the rank again.")
 @click.option("--max-evals", type=click.IntRange(min=1), default=None,
