@@ -20,10 +20,8 @@ import os
 import subprocess
 import sys
 import warnings
-from pathlib import Path
 
 import click
-import dask
 
 from dc_toolkit import utils, utils_cli
 
@@ -108,13 +106,6 @@ _PERSIST_OPTIONS = _CHUNK_OVERRIDE_OPTIONS + [
 ]
 
 
-def _finite(ctx, param, value):
-    """Refuse NaN and +-inf: a non-finite bound or budget silently rejects or passes every combo."""
-    if value is not None and (value != value or abs(value) == float("inf")):
-        raise click.BadParameter("must be finite")
-    return value
-
-
 _VERIFY_OPTIONS = [
     click.option("--verify/--no-verify", default=True, show_default=True,
                  help="Re-read the store after writing and recompute the error norms "
@@ -148,15 +139,20 @@ _VERIFY_OPTIONS = [
 @_OVERSUBSCRIPTION_OPTION
 @utils_cli.add_options(_CHUNK_OPTIONS)
 @_MEMORY_OPTION
-@click.option("--l1-threshold", type=click.FloatRange(min=0.0), required=True, callback=_finite,
+@click.option("--l1-threshold", type=click.FloatRange(min=0.0), required=True,
+              callback=utils_cli.finite_option_callback,
               help="Relative L1 error budget (e.g. 0.005 = 0.5%).  The anchor for the other gates.")
-@click.option("--l2-threshold", type=click.FloatRange(min=0.0), default=None, callback=_finite,
+@click.option("--l2-threshold", type=click.FloatRange(min=0.0), default=None,
+              callback=utils_cli.finite_option_callback,
               help="Relative L2 budget (default: 2 x L1).")
-@click.option("--linf-threshold", type=click.FloatRange(min=0.0), default=None, callback=_finite,
+@click.option("--linf-threshold", type=click.FloatRange(min=0.0), default=None,
+              callback=utils_cli.finite_option_callback,
               help="Relative Linf (worst cell) budget (default: 10 x L1).")
-@click.option("--bias-threshold", type=click.FloatRange(min=0.0), default=None, callback=_finite,
+@click.option("--bias-threshold", type=click.FloatRange(min=0.0), default=None,
+              callback=utils_cli.finite_option_callback,
               help="Relative bias budget |mean signed error| / mean|orig| (default: 0.5 x L1).")
-@click.option("--q99-threshold", type=click.FloatRange(min=0.0), default=None, callback=_finite,
+@click.option("--q99-threshold", type=click.FloatRange(min=0.0), default=None,
+              callback=utils_cli.finite_option_callback,
               help="Relative budget over cells with |value| >= the 99th percentile, taken over the non-zero "
                    "values when the plain one is 0 (default: 2 x L1).  Only with --extremes-sensitive.")
 @click.option("--l2-gate/--no-l2-gate", default=True, show_default=True, help="Enable the L2 gate.")
@@ -164,9 +160,12 @@ _VERIFY_OPTIONS = [
 @click.option("--bias-gate/--no-bias-gate", default=True, show_default=True, help="Enable the bias gate.")
 @click.option("--extremes-sensitive/--no-extremes-sensitive", default=False, show_default=True,
               help="Enable the q99 extreme-tail gate (precip, gusts, CAPE, radiation peaks).")
-@click.option("--phys-min", type=float, default=None, callback=_finite, help="Reject combos whose decoded sample dips below this.")
-@click.option("--phys-max", type=float, default=None, callback=_finite, help="Reject combos whose decoded sample exceeds this.")
-@click.option("--phys-tolerance", type=click.FloatRange(0.0, 1.0), default=0.0, show_default=True, callback=_finite,
+@click.option("--phys-min", type=float, default=None,
+              callback=utils_cli.finite_option_callback, help="Reject combos whose decoded sample dips below this.")
+@click.option("--phys-max", type=float, default=None,
+              callback=utils_cli.finite_option_callback, help="Reject combos whose decoded sample exceeds this.")
+@click.option("--phys-tolerance", type=click.FloatRange(0.0, 1.0), default=0.0, show_default=True,
+              callback=utils_cli.finite_option_callback,
               help="Slack for --phys-min/--phys-max as a fraction of the field's value range: a lossy codec "
                    "rings past a bound the field sits on by a hair. Stored in the manifest as an absolute "
                    "value, so compress's verify gate applies the same slack.")
@@ -174,7 +173,8 @@ _VERIFY_OPTIONS = [
               help="Enable the spatial-gradient gate: finite differences along the horizontal dims, or the "
                    "non-leading dims of a field without any (one more pass over the sample per combo; for "
                    "winds, pressure).")
-@click.option("--gradient-threshold", type=click.FloatRange(min=0.0), default=0.1, show_default=True, callback=_finite,
+@click.option("--gradient-threshold", type=click.FloatRange(min=0.0), default=0.1, show_default=True,
+              callback=utils_cli.finite_option_callback,
               help="Max relative L1 error of the finite-difference field (absolute fraction, not x L1).")
 @click.option("--gradient-shortcircuit/--no-gradient-shortcircuit", default=True, show_default=True,
               help="Only compute the gradient for combos that already pass the cheap gates.")
@@ -211,18 +211,12 @@ def evaluate_combos(ctx, **_):
       mpirun -n 8 dc_toolkit evaluate_combos ...   (a laptop)
     The combos are evaluated in memory; use `compress` to write the winners.
     """
-    opts = utils_cli.opts(ctx)
-    sweep = utils_cli.sweep_setup(opts)
-    # array.chunk-size must be set before any open() with chunks="auto"; synchronous: one core per rank.
-    with dask.config.set({"array.chunk-size": "512MiB", "scheduler": "synchronous"}):
-        ds = utils.open_dataset(opts.dataset_file, opts.field_to_compress, rank=sweep.rank)
-        variables = utils_cli.sweep_variables(ds, opts.field_to_compress, sweep.rank)
-        for var in variables:
-            utils_cli.sweep_variable(ds[var], var, opts, sweep, n_vars=len(variables))
+    utils_cli.sweep_dataset(utils_cli.opts(ctx))
 
 
 _VERIFY_THRESHOLD_OPTIONS = [
-    click.option(f"--{k}-threshold", type=click.FloatRange(min=0.0), default=None, callback=_finite,
+    click.option(f"--{k}-threshold", type=click.FloatRange(min=0.0), default=None,
+                 callback=utils_cli.finite_option_callback,
                  help=f"Relative {label} budget for the verify gate, overriding the sweep's value in "
                       f"manifest_{{var}}.json (the only way to gate a --pipeline field without a manifest).")
     for k, label in (("l1", "L1"), ("l2", "L2"), ("linf", "Linf"), ("bias", "bias"))
@@ -272,76 +266,8 @@ def compress(ctx, **_):
     only then moved in, so a failed or interrupted write never enters the store.
     batch_manifest.json records every field; the exit status is 1 when any
     field failed.  Single process; dask threads parallelise each write."""
-    opts = utils_cli.opts(ctx)
     utils_cli.require_single_process("compress")
-    click.echo(utils_cli.version_banner("compress"))
-    utils_cli.single_process_setup(opts)
-    os.makedirs(opts.where_to_write, exist_ok=True)
-    candidates, manifests, dropped = utils_cli.compress_candidates(opts)
-    if not candidates and not dropped:
-        raise click.ClickException("no variables to compress.  Did evaluate_combos run against the same directory?")
-    merged_path = utils_cli.merged_store_path(opts.where_to_write, opts.dataset_file)
-    if Path(merged_path).resolve() == Path(opts.dataset_file).resolve():
-        raise click.ClickException(f"the output store {merged_path} is the input dataset; pick another "
-                                   f"WHERE_TO_WRITE.")
-    ds = utils.open_dataset(opts.dataset_file)
-    utils_cli.remove_staged(merged_path)
-    existing = utils_cli.existing_arrays(merged_path)
-
-    results = {var: {"status": "no-pipeline", "reason": reason} for var, reason in dropped.items()}
-    any_error, stopped_at = bool(dropped), None
-    with dask.config.set(scheduler="threads", num_workers=opts.threads):
-        for i, cand in enumerate(candidates, start=1):
-            var = cand["var"]
-            click.echo(f"\n[compress] ({i}/{len(candidates)}) {var} from {cand['source']}: {cand['name']}")
-            if opts.skip_existing and var in existing:
-                if not opts.stock_codecs_only or utils_cli.array_is_stock(merged_path, var):
-                    click.echo(f"[compress] {var} already in {merged_path}; skipping.")
-                    results[var] = {"status": "skipped-existing"}
-                    continue
-                click.echo(f"[compress] {var} in {merged_path} needs dc_toolkit to be read; rewriting it.")
-            if var not in ds.data_vars:
-                any_error = True
-                click.echo(f"[compress] ERROR: variable '{var}' not in dataset; skipping.")
-                results[var] = {"status": "missing-from-dataset"}
-            else:
-                try:
-                    results[var] = utils_cli.compress_one(ds[var], var, cand, manifests.get(var), merged_path, opts)
-                except (Exception, SystemExit) as e:  # SystemExit: a memory guard refused the write
-                    any_error = True
-                    message = (e.message if isinstance(e, click.ClickException)
-                               else "refused by a guard (see above)" if isinstance(e, SystemExit) else repr(e))
-                    click.echo(f"[compress] ERROR on {var}: {message}")
-                    results[var] = {"status": "error", "error": message}
-                    if not opts.continue_on_error:
-                        click.echo("[compress] stopping at the first failure (--no-continue-on-error).")
-                        stopped_at = i
-                        break
-
-    for cand in candidates[stopped_at:] if stopped_at else []:
-        results.setdefault(cand["var"], {"status": "not-attempted", "reason": "the run stopped at an earlier failure"})
-    if opts.stock_codecs_only:
-        left = sorted(v for v in utils_cli.existing_arrays(merged_path) if not utils_cli.array_is_stock(merged_path, v))
-        if left:
-            any_error = True
-            click.echo(f"[compress] ERROR: {merged_path} still holds array(s) that need dc_toolkit to be read: "
-                       f"{', '.join(left)}.")
-    if Path(merged_path).is_dir():
-        if opts.consolidate:
-            names = utils_cli.consolidate_store(merged_path)
-            click.echo(f"[compress] consolidated metadata on {merged_path} ({len(names)} array(s): {', '.join(names)})")
-        else:  # a listing from an earlier run would describe this run's fields wrongly
-            utils_cli.drop_consolidated_metadata(merged_path)
-            click.echo("[compress] --no-consolidate: the store has no consolidated metadata; readers scan the "
-                       "arrays until the next consolidation (dc_toolkit merge_compressed_fields DATASET "
-                       "WHERE_TO_WRITE).")
-    utils_cli.write_json(os.path.join(opts.where_to_write, "batch_manifest.json"), {
-        "command": "compress", "dataset_file": os.fspath(opts.dataset_file),
-        "where_to_write": os.fspath(opts.where_to_write), "merged_store": merged_path,
-        "results": results, "any_error": any_error, "env": utils_cli.env_versions(),
-    }, "compress")
-    if any_error:
-        sys.exit(1)
+    utils_cli.compress_fields(utils_cli.opts(ctx))
 
 
 @cli.command("merge_compressed_fields")
@@ -352,11 +278,7 @@ def merge_compressed_fields(dataset_file: str, compressed_files_location: str):
     as compress does at its end: the step after compress --no-consolidate runs.
     The unfinished write of an interrupted run is discarded first."""
     utils_cli.require_single_process("merge_compressed_fields")
-    merged_path = utils_cli.merged_store_path(compressed_files_location, dataset_file)
-    if not Path(merged_path).is_dir():
-        raise click.ClickException(f"store not found: {merged_path}.  Did compress run with the same directory?")
-    names = utils_cli.consolidate_store(merged_path)
-    click.echo(f"[merge] consolidated metadata on {merged_path} ({len(names)} array(s): {', '.join(names)})")
+    utils_cli.consolidate_merged_store(dataset_file, compressed_files_location)
 
 
 # =============================================================================
@@ -371,18 +293,7 @@ def open_zarr_and_inspect(zarr_path: str, head: int):
     """Print the group tree, per-array metadata (codecs, sharding, ratio) and a
     tiny head slice of a zarr v3 store."""
     utils_cli.require_single_process("open_zarr_and_inspect")
-    group, _store = utils.open_zarr_localstore(zarr_path, read_only=True)
-    click.echo(group.tree())
-    click.echo("-" * 80)
-    for name in group.array_keys():
-        z = group[name]
-        click.echo(f"Array: {name}")
-        click.echo(z.info_complete())
-        if head > 0:
-            slicer = tuple(slice(0, min(head, s)) for s in z.shape)
-            click.echo(f"Head slice {slicer}:")
-            click.echo(z[slicer])
-        click.echo("-" * 80)
+    utils_cli.inspect_store(zarr_path, head)
 
 
 @cli.command("from_nc_to_zarr")
@@ -439,12 +350,7 @@ def from_zarr_to_netcdf(ctx, **_):
 def perform_clustering(parquet_file: str, l_error: str):
     """Plot the elbow and silhouette scores of KMeans (k = 3..9, at most rows - 1) on compression ratio vs
     the chosen error, over the kept rows of a results_{var}.parquet from evaluate_combos."""
-    df = utils_cli.load_results(parquet_file)
-    if len(df) < 4:
-        click.echo(f"[perform_clustering] only {len(df)} finite passing combo(s) in {Path(parquet_file).name}; "
-                   f"need >= 4 to cluster.  Nothing to plot.")
-        return
-    utils_cli.elbow_silhouette_plot(df, l_error)
+    utils_cli.perform_clustering(parquet_file, l_error)
 
 
 @cli.command("analyze_clustering")
@@ -452,14 +358,7 @@ def perform_clustering(parquet_file: str, l_error: str):
 def analyze_clustering(parquet_file: str):
     """Interactive KMeans scatter plots of L1 / L2 / LInf vs compression ratio
     (opens in the browser) over the kept rows of a results_{var}.parquet."""
-    import plotly.io as pio
-
-    df = utils_cli.load_results(parquet_file)
-    if len(df) == 0:
-        click.echo(f"[analyze_clustering] no finite passing combos in {Path(parquet_file).name}; nothing to plot.")
-        return
-    pio.renderers.default = "browser"
-    utils_cli.clustering_figure(df).show()
+    utils_cli.analyze_clustering(parquet_file)
 
 
 @cli.command("plot_compression_errors")
@@ -478,22 +377,8 @@ def plot_compression_errors(ctx, **_):
     compression errors of one (lat, lon) field with one pipeline, including a
     copy shifted by 180 degrees in longitude to reveal whether the pipeline
     respects periodicity."""
-    opts = utils_cli.opts(ctx)
-    field = opts.field_to_compress
     utils_cli.require_single_process("plot_compression_errors")
-    os.makedirs(opts.where_to_write, exist_ok=True)
-    da = utils.open_dataset(opts.dataset_file, field)[field].squeeze()
-    click.echo(f"Squeezed (lat, lon) field_to_compress.nbytes = {utils.hsize(da.nbytes)}")
-    if not utils.is_lat_lon(da):
-        raise click.ClickException(f"Field {field} must have dimensions (lat, lon); it has {da.dims}.")
-    if da.nbytes / 2**30 > 2.5:
-        raise click.ClickException(f"Field {field} is too large ({utils.hsize(da.nbytes)}); max 2.5 GiB.")
-
-    combo = utils_cli.plot_pipeline(field, opts.pipeline, opts.manifest_dir or opts.where_to_write)
-    utils_cli.validate_pipeline(combo, da, field)
-    click.echo(f"pipeline: {utils.pipeline_name(*combo)}")
-    da, panels = utils_cli.error_plot_panels(da, field, combo)
-    utils_cli.save_error_plot(field, da, panels, os.path.join(opts.where_to_write, f"{field}_compression_errors.pdf"))
+    utils_cli.plot_compression_errors(utils_cli.opts(ctx))
 
 
 # =============================================================================

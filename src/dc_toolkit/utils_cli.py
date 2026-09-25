@@ -8,9 +8,10 @@ Sections
   3. Gates & thresholds
   4. Pipelines & persistence
   5. Sweep                      (evaluate_combos)
-  6. Compress                   (compress)
-  7. Format conversion          (from_nc_to_zarr, from_zarr_to_netcdf)
-  8. Analysis & plotting
+  6. Compress                   (compress, merge_compressed_fields)
+  7. Store inspection & format conversion
+                               (open_zarr_and_inspect, from_nc_to_zarr, from_zarr_to_netcdf)
+  8. Analysis & plotting        (perform_clustering, analyze_clustering, plot_compression_errors)
   9. UI support                 (the streamlit and Qt front-ends)
 """
 import csv
@@ -63,6 +64,13 @@ def size_option_callback(ctx, param, value):
         return utils.parse_size(value)
     except Exception as e:
         raise click.BadParameter(f"Invalid size '{value}': {e}")
+
+
+def finite_option_callback(ctx, param, value):
+    """Refuse NaN and +-inf: a non-finite bound or budget silently rejects or passes every combo."""
+    if value is not None and (value != value or abs(value) == float("inf")):
+        raise click.BadParameter("must be finite")
+    return value
 
 
 def add_options(options):
@@ -1267,8 +1275,19 @@ def _sweep_variable_body(da, var, opts, sweep: SweepContext, n_vars, t0, sample_
     write_json(os.path.join(opts.where_to_write, f"manifest_{var}.json"), manifest, "sweep")
 
 
+def sweep_dataset(opts) -> None:
+    """evaluate_combos: sweep the selected variables of the dataset one after the other; collective."""
+    sweep = sweep_setup(opts)
+    # array.chunk-size must be set before any open() with chunks="auto"; synchronous: one core per rank.
+    with dask.config.set({"array.chunk-size": "512MiB", "scheduler": "synchronous"}):
+        ds = utils.open_dataset(opts.dataset_file, opts.field_to_compress, rank=sweep.rank)
+        variables = sweep_variables(ds, opts.field_to_compress, sweep.rank)
+        for var in variables:
+            sweep_variable(ds[var], var, opts, sweep, n_vars=len(variables))
+
+
 # =============================================================================
-# 6. COMPRESS (compress)
+# 6. COMPRESS (compress, merge_compressed_fields)
 # =============================================================================
 
 def compress_candidates(opts):
@@ -1394,9 +1413,109 @@ def compress_one(da, var: str, cand: dict, manifest, merged_path: str, opts) -> 
     }
 
 
+def compress_fields(opts) -> None:
+    """compress: write the candidate fields into the merged store, each staged and gated first, then
+    consolidate it and record batch_manifest.json; exits with status 1 when any field failed."""
+    click.echo(version_banner("compress"))
+    single_process_setup(opts)
+    os.makedirs(opts.where_to_write, exist_ok=True)
+    candidates, manifests, dropped = compress_candidates(opts)
+    if not candidates and not dropped:
+        raise click.ClickException("no variables to compress.  Did evaluate_combos run against the same directory?")
+    merged_path = merged_store_path(opts.where_to_write, opts.dataset_file)
+    if Path(merged_path).resolve() == Path(opts.dataset_file).resolve():
+        raise click.ClickException(f"the output store {merged_path} is the input dataset; pick another "
+                                   f"WHERE_TO_WRITE.")
+    ds = utils.open_dataset(opts.dataset_file)
+    remove_staged(merged_path)
+    existing = existing_arrays(merged_path)
+
+    results = {var: {"status": "no-pipeline", "reason": reason} for var, reason in dropped.items()}
+    any_error, stopped_at = bool(dropped), None
+    with dask.config.set(scheduler="threads", num_workers=opts.threads):
+        for i, cand in enumerate(candidates, start=1):
+            var = cand["var"]
+            click.echo(f"\n[compress] ({i}/{len(candidates)}) {var} from {cand['source']}: {cand['name']}")
+            if opts.skip_existing and var in existing:
+                if not opts.stock_codecs_only or array_is_stock(merged_path, var):
+                    click.echo(f"[compress] {var} already in {merged_path}; skipping.")
+                    results[var] = {"status": "skipped-existing"}
+                    continue
+                click.echo(f"[compress] {var} in {merged_path} needs dc_toolkit to be read; rewriting it.")
+            if var not in ds.data_vars:
+                any_error = True
+                click.echo(f"[compress] ERROR: variable '{var}' not in dataset; skipping.")
+                results[var] = {"status": "missing-from-dataset"}
+            else:
+                try:
+                    results[var] = compress_one(ds[var], var, cand, manifests.get(var), merged_path, opts)
+                except (Exception, SystemExit) as e:  # SystemExit: a memory guard refused the write
+                    any_error = True
+                    message = (e.message if isinstance(e, click.ClickException)
+                               else "refused by a guard (see above)" if isinstance(e, SystemExit) else repr(e))
+                    click.echo(f"[compress] ERROR on {var}: {message}")
+                    results[var] = {"status": "error", "error": message}
+                    if not opts.continue_on_error:
+                        click.echo("[compress] stopping at the first failure (--no-continue-on-error).")
+                        stopped_at = i
+                        break
+
+    for cand in candidates[stopped_at:] if stopped_at else []:
+        results.setdefault(cand["var"], {"status": "not-attempted", "reason": "the run stopped at an earlier failure"})
+    if opts.stock_codecs_only:
+        left = sorted(v for v in existing_arrays(merged_path) if not array_is_stock(merged_path, v))
+        if left:
+            any_error = True
+            click.echo(f"[compress] ERROR: {merged_path} still holds array(s) that need dc_toolkit to be read: "
+                       f"{', '.join(left)}.")
+    if Path(merged_path).is_dir():
+        if opts.consolidate:
+            names = consolidate_store(merged_path)
+            click.echo(f"[compress] consolidated metadata on {merged_path} ({len(names)} array(s): {', '.join(names)})")
+        else:  # a listing from an earlier run would describe this run's fields wrongly
+            drop_consolidated_metadata(merged_path)
+            click.echo("[compress] --no-consolidate: the store has no consolidated metadata; readers scan the "
+                       "arrays until the next consolidation (dc_toolkit merge_compressed_fields DATASET "
+                       "WHERE_TO_WRITE).")
+    write_json(os.path.join(opts.where_to_write, "batch_manifest.json"), {
+        "command": "compress", "dataset_file": os.fspath(opts.dataset_file),
+        "where_to_write": os.fspath(opts.where_to_write), "merged_store": merged_path,
+        "results": results, "any_error": any_error, "env": env_versions(),
+    }, "compress")
+    if any_error:
+        sys.exit(1)
+
+
+def consolidate_merged_store(dataset_file, compressed_files_location) -> None:
+    """merge_compressed_fields: consolidate the metadata of the store compress wrote for
+    `dataset_file` under `compressed_files_location`."""
+    merged_path = merged_store_path(compressed_files_location, dataset_file)
+    if not Path(merged_path).is_dir():
+        raise click.ClickException(f"store not found: {merged_path}.  Did compress run with the same directory?")
+    names = consolidate_store(merged_path)
+    click.echo(f"[merge] consolidated metadata on {merged_path} ({len(names)} array(s): {', '.join(names)})")
+
+
 # =============================================================================
-# 7. FORMAT CONVERSION
+# 7. STORE INSPECTION & FORMAT CONVERSION
 # =============================================================================
+
+def inspect_store(zarr_path, head: int) -> None:
+    """open_zarr_and_inspect: print the group tree, each array's metadata and its first `head` elements
+    per dim."""
+    group, _store = utils.open_zarr_localstore(zarr_path, read_only=True)
+    click.echo(group.tree())
+    click.echo("-" * 80)
+    for name in group.array_keys():
+        z = group[name]
+        click.echo(f"Array: {name}")
+        click.echo(z.info_complete())
+        if head > 0:
+            slicer = tuple(slice(0, min(head, s)) for s in z.shape)
+            click.echo(f"Head slice {slicer}:")
+            click.echo(z[slicer])
+        click.echo("-" * 80)
+
 
 def nc_to_zarr(opts) -> None:
     """NetCDF -> UNCOMPRESSED zarr v3 store (no filters, compressors, sharding), for filesystem-dedup experiments."""
@@ -1611,6 +1730,47 @@ def save_error_plot(field: str, da, panels, path: str) -> None:
         fig.colorbar(ax.imshow(data, interpolation="none", cmap=cmap), ax=ax, shrink=0.7)
     fig.savefig(path, bbox_inches="tight")
     plt.close(fig)
+
+
+def perform_clustering(parquet_file, l_error: str) -> None:
+    """perform_clustering: the elbow and silhouette plot of the kept rows of a results parquet."""
+    df = load_results(parquet_file)
+    if len(df) < 4:
+        click.echo(f"[perform_clustering] only {len(df)} finite passing combo(s) in {Path(parquet_file).name}; "
+                   f"need >= 4 to cluster.  Nothing to plot.")
+        return
+    elbow_silhouette_plot(df, l_error)
+
+
+def analyze_clustering(parquet_file) -> None:
+    """analyze_clustering: the interactive clustering figure of the kept rows, opened in the browser."""
+    import plotly.io as pio
+
+    df = load_results(parquet_file)
+    if len(df) == 0:
+        click.echo(f"[analyze_clustering] no finite passing combos in {Path(parquet_file).name}; nothing to plot.")
+        return
+    pio.renderers.default = "browser"
+    clustering_figure(df).show()
+
+
+def plot_compression_errors(opts) -> None:
+    """plot_compression_errors: the error grid of one (lat, lon) field under one pipeline, saved as
+    {field}_compression_errors.pdf in opts.where_to_write."""
+    field = opts.field_to_compress
+    os.makedirs(opts.where_to_write, exist_ok=True)
+    da = utils.open_dataset(opts.dataset_file, field)[field].squeeze()
+    click.echo(f"Squeezed (lat, lon) field_to_compress.nbytes = {utils.hsize(da.nbytes)}")
+    if not utils.is_lat_lon(da):
+        raise click.ClickException(f"Field {field} must have dimensions (lat, lon); it has {da.dims}.")
+    if da.nbytes / 2**30 > 2.5:
+        raise click.ClickException(f"Field {field} is too large ({utils.hsize(da.nbytes)}); max 2.5 GiB.")
+
+    combo = plot_pipeline(field, opts.pipeline, opts.manifest_dir or opts.where_to_write)
+    validate_pipeline(combo, da, field)
+    click.echo(f"pipeline: {utils.pipeline_name(*combo)}")
+    da, panels = error_plot_panels(da, field, combo)
+    save_error_plot(field, da, panels, os.path.join(opts.where_to_write, f"{field}_compression_errors.pdf"))
 
 
 # =============================================================================
