@@ -61,7 +61,8 @@ _CODEC_SPACE_OPTIONS = [
                       "alone, and --with-ebcc adds EBCC to any class.  Fields the class cannot take are "
                       "skipped, as for --filter-class."),
     click.option("--with-lossy/--without-lossy", default=True, show_default=True,
-                 help="Include lossy filters and serializers in the codec space."),
+                 help="Include lossy filters and serializers in the codec space.  --without-lossy leaves a "
+                      "float field its compressors alone (Delta on floats does not round-trip exactly)."),
     click.option("--with-ebcc/--without-ebcc", default=False, show_default=True,
                  help="Add the EBCC serializer (lossy; needs --with-lossy and the optional ebcc package): "
                       "float (lat, lon) frames only, no compressor and no filter except the AsType "
@@ -93,27 +94,28 @@ _MEMORY_OPTION = click.option(
     "--memory-threshold", type=click.FloatRange(0.05, 0.95), default=0.80, show_default=True,
     help="Max fraction of memory an estimated footprint may use.  evaluate_combos shrinks its sample until "
          "one node's footprint fits this fraction of the node's budget (cgroup limit, else RAM) and aborts "
-         "when the field's smallest sample does not fit; compress refuses a write whose peak exceeds this fraction of the available RAM.")
+         "when the field's smallest sample does not fit; compress writes as many blocks at once as fit this "
+         "fraction of the available memory, and refuses a field when one block does not.")
 _PERSIST_OPTIONS = _CHUNK_OVERRIDE_OPTIONS + [
     click.option("--shard-mib", type=click.IntRange(min=1), default=512, show_default=True,
                  help="Target shard size in MiB (an integer number of inner chunks).  Sharding is "
                       "skipped when a shard would hold fewer than two chunks."),
     click.option("--threads", type=click.IntRange(min=1), default=None,
-                 help="Dask workers for the write (default and maximum: the visible cores).  Peak memory ~ "
-                      "threads x (max(source block, shard) + 3 x shard), at most 3 x the field; the memory "
-                      "guard refuses what does not fit."),
+                 help="Dask workers and zarr codec threads of the write (default and maximum: the visible "
+                      "cores).  Each worker writes one block (whole shards, ~512 MiB) and, with --verify, "
+                      "re-reads it; --memory-threshold caps how many run at once."),
     _OVERSUBSCRIPTION_OPTION, _MEMORY_OPTION,
 ]
 
 
 _VERIFY_OPTIONS = [
     click.option("--verify/--no-verify", default=True, show_default=True,
-                 help="Re-read the store after writing and recompute the error norms "
-                      "(roughly doubles wall time; skip for trusted re-runs)."),
+                 help="Re-read each block right after writing it and compute the error norms over the whole "
+                      "field; also checks that a FixedScaleOffset pipeline holds the field's range."),
     click.option("--verify-gate/--no-verify-gate", default=True, show_default=True,
-                 help="With --verify, fail a field whose production norms exceed the sweep thresholds "
-                      "or physical bounds in manifest_{var}.json, or whose round trip changed a cell's "
-                      "finiteness (NaN fill written as data; the gradient gate is sweep-only).  "
+                 help="With --verify, fail a field whose production norms exceed the sweep thresholds in "
+                      "manifest_{var}.json, or whose round trip moved a cell across the sweep's physical "
+                      "bounds or changed its finiteness (the gradient gate is sweep-only).  "
                       "--no-verify-gate only warns."),
 ]
 
@@ -160,10 +162,11 @@ _VERIFY_OPTIONS = [
 @click.option("--bias-gate/--no-bias-gate", default=True, show_default=True, help="Enable the bias gate.")
 @click.option("--extremes-sensitive/--no-extremes-sensitive", default=False, show_default=True,
               help="Enable the q99 extreme-tail gate (precip, gusts, CAPE, radiation peaks).")
-@click.option("--phys-min", type=float, default=None,
-              callback=utils_cli.finite_option_callback, help="Reject combos whose decoded sample dips below this.")
-@click.option("--phys-max", type=float, default=None,
-              callback=utils_cli.finite_option_callback, help="Reject combos whose decoded sample exceeds this.")
+@click.option("--phys-min", type=float, default=None, callback=utils_cli.finite_option_callback,
+              help="Physical lower bound: reject combos that move a cell from within the bounds to below it "
+                   "(cells the source already has beyond a bound do not count).")
+@click.option("--phys-max", type=float, default=None, callback=utils_cli.finite_option_callback,
+              help="Physical upper bound, as --phys-min.")
 @click.option("--phys-tolerance", type=click.FloatRange(0.0, 1.0), default=0.0, show_default=True,
               callback=utils_cli.finite_option_callback,
               help="Slack for --phys-min/--phys-max as a fraction of the field's value range: a lossy codec "
@@ -193,10 +196,13 @@ _VERIFY_OPTIONS = [
 @click.option("--resume/--no-resume", default=True, show_default=True,
               help="Skip combos already recorded in config_space_{var}_rank*.csv: their metrics are reused "
                    "and the gates re-applied with the current thresholds.  A change to what "
-                   "sweep_state_{var}.json records (file, sample, sampling and chunk settings, metric "
-                   "definitions, library versions, EBCC's env vars) restarts the field.")
+                   "sweep_state_{var}.json records (file, sample, sampling and chunk settings, bounds, "
+                   "measuring code, metric definitions, library versions, EBCC's env vars) restarts the "
+                   "field, keeping the previous results as *.previous.  A combo in flight when a rank died "
+                   "is evaluated alone on the next run, and left out if it kills the rank again.")
 @click.option("--max-evals", type=click.IntRange(min=1), default=None,
-              help="Cap the Cartesian product (quick test runs); EBCC combos are always included.")
+              help="Evaluate a seeded uniform subset of N combos of the product (quick test runs); EBCC combos "
+                   "are always included.")
 @click.pass_context
 def evaluate_combos(ctx, **_):
     """Sweep compressor x filter x serializer combinations on a representative
@@ -227,8 +233,8 @@ _VERIFY_THRESHOLD_OPTIONS = [
 @click.argument("dataset_file", type=click.Path(exists=True, dir_okay=True, file_okay=True))
 @click.argument("where_to_write", type=click.Path(dir_okay=True, file_okay=False, exists=False))
 @click.option("--vars", "vars_filter", default=None,
-              help="Comma-separated fields to write (default: every field with a manifest_{var}.json "
-                   "or results_{var}.parquet in WHERE_TO_WRITE).")
+              help="Comma-separated fields to write (default: every field with a manifest_{var}.json in "
+                   "WHERE_TO_WRITE).")
 @click.option("--pipeline", default=None,
               help="Write the --vars fields with this pipeline instead of the sweep's best: a JSON object "
                    "with compressor, filter and serializer, or the path of a file holding one; a "
@@ -248,8 +254,10 @@ _VERIFY_THRESHOLD_OPTIONS = [
               help="Fail a field whose ratio falls short of the sweep's by more than --cr-drift-tol "
                    "(default: warn only).")
 @click.option("--skip-existing/--no-skip-existing", default=True, show_default=True,
-              help="Skip fields already present in the store.  A field only appears there once its write "
-                   "and gates succeeded, so failed or interrupted fields are retried.")
+              help="Skip a field the store already holds as this run would write it: same source file "
+                   "(path, size, mtime), pipeline, chunks and verify gate, and under --cr-drift-gate a ratio "
+                   "within --cr-drift-tol; rewrite it otherwise.  A field only appears there once its write and "
+                   "gates succeeded, so failed or interrupted fields are retried.")
 @click.option("--continue-on-error/--no-continue-on-error", default=True, show_default=True,
               help="Log and go on when a field fails instead of stopping at the first failure.  "
                    "The exit status is 1 either way when any field failed.")
@@ -261,9 +269,10 @@ _VERIFY_THRESHOLD_OPTIONS = [
 def compress(ctx, **_):
     """Persist fields into {WHERE_TO_WRITE}/{dataset}.zarr, one zarr array per
     field, with the pipeline evaluate_combos found best (manifest_{var}.json,
-    else the best kept row of results_{var}.parquet) or the --pipeline you pass.
-    A field is written into a staging store beside the real one, gated, and
-    only then moved in, so a failed or interrupted write never enters the store.
+    which must match the field's sweep_state_{var}.json) or the --pipeline you
+    pass.  A field is written into a staging store beside the real one, gated,
+    and only then moved in, so a failed or interrupted write never enters the
+    store; each array records how it was written (attribute "dc_toolkit").
     batch_manifest.json records every field; the exit status is 1 when any
     field failed.  Single process; dask threads parallelise each write."""
     utils_cli.require_single_process("compress")

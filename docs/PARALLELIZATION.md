@@ -45,7 +45,7 @@ On a laptop the same program is started with `mpirun -n <cores>`; started withou
 Each rank is an ordinary Python process. That buys three things at once:
 
 - **Nothing is shared inside a node but the sample and the work counter.** The sample is read-only and the counter changes only through an atomic fetch-and-add; no interpreter lock, no memory allocator and no zarr event loop is contended by 32 workers, because each worker has its own.
-- **File reads scale.** The netCDF library serialises threads behind a global lock, so reader threads inside one process take turns; separate processes read in parallel. The full-field range is read that way: its blocks are split across all ranks. The sample is read once, by rank 0, and reaches the other ranks through the shared-memory window.
+- **File reads scale.** The netCDF library serialises threads behind a global lock, so reader threads inside one process take turns; separate processes read in parallel. The full-field scan is read that way: its blocks are split across all ranks. The sample is read once, by rank 0, and reaches the other ranks through the shared-memory window.
 - **One core per rank.** Each rank calls zarr's synchronous API one call at a time, with zarr's internal pool pinned to one worker (`threading.max_workers = 1`) and dask on its synchronous scheduler, because a rank owns one core.
 
 The price is one Python interpreter per rank, about 0.3 GiB each, which on a 288-core node is noise.
@@ -62,9 +62,9 @@ Every rank reads the same sample, and it must exist once per node, not once per 
 
 Under Open MPI on Linux the window is a file in `/dev/shm`, so a container must give that at least the sample size (`docker run --shm-size`); Cray MPICH on Santis does not use it.
 
-Everything downstream reads views of that array: `z[...] = sample_np` hands zarr chunk-shaped views, the error norms slice it chunk by chunk, the gradient metric walks it in blocks of leading slabs of about 32 MiB. It is read-only for the whole sweep, so sharing it costs nothing and needs no lock.
+Everything downstream reads views of that array: `z[...] = sample_np` hands zarr chunk-shaped views, the error norms slice it chunk by chunk, the gradient metric walks it in pieces of about 32 MiB of float64 that overlap by one index along the difference axis. It is read-only for the whole sweep, so sharing it costs nothing and needs no lock.
 
-Work that touches the whole sample happens once, not once per rank: rank 0 computes the q99 cut of the extremes gate, the sample's value range (a sample without variation is not searched) and EBCC's check for NaN/Inf and broadcasts the answers, and the full-field range for FixedScaleOffset is one pass over the file's blocks split across all ranks (without that range FixedScaleOffset is left out, never fitted to the sample). Anything added to the pre-sweep path should follow the same rule; a per-rank pass over the sample multiplies its temporaries by the rank count.
+Work that touches the whole sample happens once, not once per rank: rank 0 computes the q99 cut of the extremes gate and the sample's value range (a sample without variation is not searched) and broadcasts the answers, and the full-field scan is one pass over the file's blocks split across all ranks, one block in memory per rank: the range FixedScaleOffset is fitted to (never to the sample), the NaN/Inf count that leaves out the codecs that cannot keep them, and the time steps and levels on which the field varies, which the sample is taken from. Anything added to the pre-sweep path should follow the same rule; a per-rank pass over the sample multiplies its temporaries by the rank count.
 
 ### Why 32 ranks and not 288?
 
@@ -80,15 +80,16 @@ What is *not* shared is the working set of the combo each rank has in flight:
 |---|---|---|
 | its own `MemoryStore` holding the encoded bytes | sample / ratio | `store.clear()`, right after the decode |
 | **the decoded array** from `z[...]` | **1 × sample, full size** | the end of the combo |
-| float64 copies of a chunk's valid cells in the metric loop (original and error) | 2 × inner chunk for a float64 field, 4 × for float32 | per chunk |
+| zarr's chunks in flight (up to 10 at a time) | about 0.15 × sample | per call |
+| float64 copies of a chunk's valid cells in the metric loop (original and error), their masks, the gradient's pieces | up to about 8 × inner chunk | per chunk |
 
 So the shape of it is *one shared read-only sample per node, plus a private full-size decoded buffer per rank*. Only the metric loop and the codec calls work chunk-wise; `z[...]` materializes the whole sample. The model the toolkit prints as `[memory]` for each field, once its sample is built, is
 
 ```
-node steady state  =  S + R × 2 × S + R × 32 MiB          (S = sample, R = ranks per node, 16 MiB inner chunks)
+node steady state  =  S + R × 2 × S + R × 8 × chunk      (S = sample, R = ranks per node, chunk = 16 MiB)
 ```
 
-about 325 GB for a 5 GB sample and 32 ranks (the R × 32 MiB term counts float64 fields; a float32 field's extra 2 × chunk per rank sits inside the factor-2 headroom). The factor 2 is a rank's own peak (decoded buffer plus encoded bytes plus a filter's copy); the ranks of a node do not peak together, and a node's measured steady state is nearer 1.1 × S per rank, so the model is conservative. The sweep checks the model against `--memory-threshold` × the node's budget (the cgroup limit under SLURM, else host RAM) and shrinks the sample when it does not fit (`[memcheck] auto-shrunk ...`), but not below 3 time steps × 3 levels (3 indices across all time-like dims, such as ensemble members; all, where a field has fewer): a smaller `--eval-data-size-limit` is raised to that minimum (`[sample] raised the sample budget ...`), and a field whose minimum does not fit stops the sweep (`[memcheck] FATAL: the smallest sample ...`). At that minimum a 3-D field of the native R02B10 grid samples 2.8 GiB.
+about 329 GB for a 5 GB sample and 32 ranks. The factor 2 bounds a rank's own peak, measured at 2.03 × S for a pipeline that does not compress (ratio 1: the encoded bytes are a second full copy) and 1.2 to 1.34 × S for pipelines that do; the ranks of a node do not peak together, so the model is conservative. The sweep checks the model against `--memory-threshold` × the node's budget (the cgroup limit under SLURM, else host RAM) and shrinks the sample when it does not fit (`[memcheck] auto-shrunk ...`), but not below 3 time steps × 3 levels (3 indices across all time-like dims, such as ensemble members; all, where a field has fewer): a smaller `--eval-data-size-limit` is raised to that minimum (`[sample] raised the sample budget ...`), and a field whose minimum does not fit stops the sweep (`[memcheck] FATAL: the smallest sample ...`). At that minimum a 3-D field of the native R02B10 grid samples 2.8 GiB.
 
 The decoded buffer is what decoding with one `z[...]` costs: R combos in flight on a node hold R full-size decoded copies, however the sample is shared. That is why the sample is shared and the working sets are not, and why the knobs are the sample size and the number of ranks (`santis.run` sets both per field).
 
@@ -110,25 +111,25 @@ The command explicitly runs as a single Python process. It aborts if accidentall
 
 ### Parallelism via dask's threaded scheduler
 
-The field is rechunked into **write units**: one shard (~512 MiB by default), or one chunk when sharding is skipped. Dask's threaded scheduler runs one task per write unit on up to `--threads` workers; inside a task, zarr's sharding codec encodes the shard's inner chunks (one codec call per ~16 MiB chunk):
+The source is read in **blocks of whole write units**: shards (up to `--shard-mib`, 512 MiB by default), or chunks when sharding is skipped, grouped along the last axis a unit does not span until a block holds about 512 MiB. One dask task per block reads it (one hyperslab read), writes its shards (zarr's sharding codec encodes the inner chunks, one codec call per ~16 MiB chunk) and, with `--verify`, reads them back and adds up the block's error sums. The field's norms are the sums over the blocks, so the source is read once:
 
 ```
-   Field (e.g., 5 GB)
+   Field (e.g., native R02B10: 8 time steps x 120 levels x 84 M cells, 300 GiB)
          │
          ▼
-   Rechunked into 10 write units (shards of 512 MiB)
+   Blocks of whole shards: (8, 120, 139808) = 4 shards of (8, 120, 34952), 512 MiB
          │
          ▼
-   Dask scheduler: --threads workers, one task per shard
+   Dask scheduler: as many blocks at once as fit in memory, at most --threads
          │
          ▼
-   Each task:  read the shard's data → zarr encodes its 32 inner chunks (in compiled code) → one shard file
+   Each task:  read the block → encode and write its shards → read them back → error sums
          │
          ▼
-   The field is written into a staging store, re-read and gated, then moved into place
+   The field is written into a staging store, gated on the summed norms, then moved into place
 ```
 
-Threads work here because the heavy work is compiled code that releases Python's interpreter lock: the codec calls and the numpy reductions. The dask workers read and rechunk; the codec calls they issue run in zarr's own thread pool (asyncio's default, min(32, cores + 4) threads, since compress leaves `threading.max_workers` unset). Reads of a netCDF input take turns behind the library's global lock (see "File reads scale" above). Give the process its cores through the launcher, since `--threads` defaults to the visible ones (`srun --ntasks=1 --cpus-per-task=32` in `santis.run`, or plain invocation on a laptop).
+Threads work here because the heavy work is compiled code that releases Python's interpreter lock: the codec calls and the numpy reductions. The codec calls run in zarr's thread pool, which compress sizes to `--threads`. Reads of a netCDF input take turns behind the library's global lock (see "File reads scale" above), with HDF5's chunk cache off: a block reads a slice of many HDF5 chunks (a native DYAMOND file stores one time step × one level per 53 MiB chunk), and with a cache every slice would read its whole chunk. On such inputs the serial reads set the pace, and the encoding and verifying of other blocks overlaps them. Give the process its cores through the launcher, since `--threads` defaults to the visible ones (`srun --ntasks=1 --cpus-per-task=32` in `santis.run`, or plain invocation on a laptop).
 
 ### Chunks vs shards (a frequent confusion)
 
@@ -137,15 +138,15 @@ These are two different cuts of the same data. Different jobs, different sizes:
 - **Chunk** (`--inner-chunk-mib`, default: the sweep's value, else 16 MiB): the unit the codec works on. One codec call = one chunk. Smaller chunks have higher per-call overhead but more parallelism granularity; larger chunks compress more efficiently but use more memory.
 - **Shard** (`--shard-mib`, default 512 MiB): the unit zarr writes to disk. One shard = one file. Many chunks bundle into one shard so we do not end up with millions of tiny files (which would be a disaster on shared HPC filesystems).
 
-Dask operates on shards; zarr encodes the chunks inside each one. So `--shard-mib` sets the file size, the number of dask tasks (field / shard) and the memory per worker, while `--inner-chunk-mib` sets the size of a codec call (and of a partial read later).
+Dask operates on blocks of whole shards; zarr encodes the chunks inside each one. So `--shard-mib` sets the file size, while `--inner-chunk-mib` sets the size of a codec call (and of a partial read later).
 
 ### Memory model
 
-Peak memory ≈ `--threads × (max(source block, --shard-mib) + 3 × --shard-mib)`, capped at about three times the field: a write task holds its share of the source data, the rechunked shard, zarr's encode copy and the encoded bytes. `--threads` defaults to the visible core count: on a full 288-core Grace node with 512 MiB shards the per-thread term comes to about 576 GiB, more than the node has, so the three-times-the-field cap decides and the memory guard refuses any field larger than about a quarter of the available memory (0.8 / 3 at the default `--memory-threshold`); with `--threads 32` (or `srun --cpus-per-task=32`) and 512 MiB shards it is 64 GiB, though on a field smaller than about 21 GiB the three-times-the-field cap binds first. If you bump `--shard-mib`, memory scales linearly.
+A task holds its block, xarray's masking copy of it, zarr's encoded bytes and, with `--verify`, the block read back: below 4 × the block with the verify, 2 × without, plus the error sums' temporaries (8 × an inner chunk). compress runs as many blocks at once as fit in `--memory-threshold` × the memory available (the cgroup's grant under Slurm, else the host's), at most `--threads`, and refuses a field when a single block does not fit; the `[persist]` line prints the block and how many run at once. With 512 MiB blocks and 32 threads the write needs about 68 GiB.
 
 ### Threads inside a codec
 
-A codec call runs on one thread: zarr turns Blosc's internal threads off, and the other codecs have none. A write gets its parallelism from running many codec calls at once, one per thread of zarr's pool (at most min(32, cores + 4) threads), fed by the `--threads` dask workers; threads inside a single call would compete for the same memory bandwidth anyway.
+A codec call runs on one thread: zarr turns Blosc's internal threads off, and the other codecs have none. A write gets its parallelism from running many codec calls at once, one per thread of zarr's pool (`--threads` threads), fed by the dask tasks; threads inside a single call would compete for the same memory bandwidth anyway.
 
 ### Several fields
 
@@ -203,7 +204,7 @@ To keep the parallelism behaving correctly, the toolkit relies on some invariant
 - `docs/SAMPLING.md` — how the sweep's sample is built and sized, what it cannot see, and the data layouts the sampler does not handle yet.
 - `src/dc_toolkit/cli.py` — the commands and their options only.
 - `src/dc_toolkit/utils_cli.py` — what each command does, step by step, from the function the command calls (the sweep: `sweep_dataset` in section 5, then `sweep_setup`, `sweep_sample_limit`, `sweep_build_sample`, `shared_sample_window`, `node_counter`, `sweep_run_rank`; compress: `compress_fields` in section 6).
-- `src/dc_toolkit/utils.py` — `detect_node_topology` and `check_thread_oversubscription` (section 7); the memory guards (`check_memory_headroom`, `check_node_memory_headroom`) and the `--threads` check (`check_thread_count`) live in section 2 of `utils_cli.py`.
+- `src/dc_toolkit/utils.py` — `detect_node_topology` and `check_thread_oversubscription` (section 7); the memory guards (`check_memory_headroom`, `check_node_memory_headroom`) and the `--threads` check (`check_thread_count`) live in section 2 of `utils_cli.py`, compress's `write_concurrency` in section 4.
 
 ---
 
@@ -212,7 +213,7 @@ To keep the parallelism behaving correctly, the toolkit relies on some invariant
 | Command | Parallelism in one line |
 |---|---|
 | `evaluate_combos` | N nodes × R ranks/node, one rank per core, each rank evaluating one pipeline at a time and claiming the next from its node's counter in shared memory; one shared copy of the sample per node |
-| `compress` | One process, dask's threaded scheduler with `--threads` workers (default: visible cores), each worker writes one shard; fields done sequentially |
+| `compress` | One process, dask's threaded scheduler: each task reads, writes and verifies one block of whole shards, as many at once as fit in memory (at most `--threads`, default: visible cores); fields done sequentially |
 | `from_nc_to_zarr` | One process, dask's threaded scheduler with `--threads` workers (default: visible cores), one task per source chunk (`--preserve-source-chunks`, the default); every variable in one uncompressed, unsharded write |
 | `from_zarr_to_netcdf` | One process, dask's threaded scheduler with `--threads` workers decoding the zarr chunks; every variable in one NetCDF write |
 | `merge_compressed_fields` | Single-threaded metadata consolidation |

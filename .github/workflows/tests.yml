@@ -1,0 +1,70 @@
+# Unit, CLI and 1-4 rank MPI tests on every push and pull request; the EBCC build weekly.
+name: tests
+on:
+  push: {branches: [main]}
+  pull_request:
+  schedule: [{cron: "17 3 * * 1"}]   # weekly: fresh dependency versions and the EBCC build
+  workflow_dispatch:
+
+env:  # evaluate_combos and compress refuse to start unless every codec thread pool is pinned to 1
+  OMP_NUM_THREADS: 1
+  MKL_NUM_THREADS: 1
+  OPENBLAS_NUM_THREADS: 1
+  BLOSC_NTHREADS: 1
+  NUMBA_NUM_THREADS: 1
+  VECLIB_MAXIMUM_THREADS: 1
+  OMP_THREAD_LIMIT: 1
+  MPLBACKEND: Agg
+  DC_TOOLKIT_MPIEXEC: "mpirun --oversubscribe -n {n}"   # a hosted runner has 4 cores
+  OMPI_MCA_btl_vader_single_copy_mechanism: none        # CMA needs ptrace rights a runner lacks
+  TIGGE: netCDF_files/tigge_pl_t_q_dx=2_2024_08_02.nc
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {python: "3.11", constraints: ""}                        # the requires-python floor, newest deps
+          - {python: "3.14", constraints: constraints/santis.txt}    # the versions validated on Santis
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "${{ matrix.python }}", cache: pip}
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libopenmpi-dev openmpi-bin
+      - name: install (the documented script, then the test extra)
+        run: |
+          DC_CONSTRAINTS="${{ matrix.constraints }}" bash install_dc_toolkit.sh
+          pip install -e ".[test]"
+          dc_toolkit --help > /dev/null
+      - name: unit and in-process CLI tests (one rank)
+        run: pytest -m "not mpi and not slow" --durations=20
+      - name: MPI tests (1, 2 and 4 ranks; crash recovery)
+        run: pytest tests/mpi tests/cli/test_resilience.py -m mpi
+      - name: smoke - 2-rank sweep, compress, readable store
+        run: |
+          mpirun --oversubscribe -n 2 dc_toolkit evaluate_combos "$TIGGE" --where-to-write smoke \
+              --l1-threshold 0.005 --max-evals 200 --extremes-sensitive
+          dc_toolkit compress "$TIGGE" smoke
+          python - <<'PY'
+          import json, numpy as np, xarray as xr
+          m = json.load(open("smoke/batch_manifest.json"))
+          assert not m["any_error"] and {r["verify_gate"] for r in m["results"].values()} == {"pass"}, m
+          src, out = xr.open_dataset("netCDF_files/tigge_pl_t_q_dx=2_2024_08_02.nc"), xr.open_zarr(m["merged_store"])
+          for v in ("t", "q"):
+              assert np.array_equal(np.isfinite(src[v].values), np.isfinite(out[v].values)), v
+          PY
+
+  ebcc:  # weekly: EBCC builds from git (cmake, HDF5 headers) and takes minutes
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.13"}
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libopenmpi-dev openmpi-bin cmake libhdf5-dev
+      - run: WITH_EBCC=1 bash install_dc_toolkit.sh && pip install -e ".[test]"
+      - run: pytest -m "not mpi and not slow"   # the ebcc tests run instead of skipping
