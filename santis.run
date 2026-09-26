@@ -12,20 +12,24 @@
 #     codec libraries are pinned to one thread (the exports below), since inner threads
 #     would compete for the same bandwidth.
 #   - A node holds about (1 + 2 x RANKS) x the sample (the [memory] line); the sweep
-#     shrinks the sample until that fits the node's memory ([memcheck]).
+#     shrinks the sample until that fits the node's memory ([memcheck]), but not below
+#     3 time steps x 3 levels, to which it raises a smaller SAMPLE (2.8 GiB for a 3-D
+#     field of the native R02B10 grid); a field whose minimum does not fit aborts.
 #   docs/PARALLELIZATION.md has the details.
 #
 # Environment knobs:
 #   DYAMOND_DATA_ROOT        parent dir of the Data_Dyamond_PostProcessed* trees (required)
 #   RESULTS_BASE             output root (default ./res_folder_dyamond_<job id>); an earlier run's root
 #                            continues it: its combos are reused and re-gated with the current thresholds
-#                            unless the input path, sample, chunking or library versions changed
+#                            unless the input, sample, chunking, bounds, measuring code or library
+#                            versions changed, and a combo that killed its rank is retried alone
 #   FIELDS_FILE              replaces the list below: one entry per line, same format (quotes,
 #                            indentation, blank lines and # lines are ignored)
 #   MAX_EVALS=N              cap the codec space (quick test runs)
 #   WITH_EBCC=1              add the EBCC combos (float (lat, lon) fields; needs the ebcc package)
 #   COMPRESS=1               write each swept field with its best pipeline and verify it (one task)
 #   STOCK_CODECS_ONLY=1      with COMPRESS=1: only pipelines a zarr client without dc_toolkit decodes
+#   REWRITE_EXISTING=1       with COMPRESS=1: rewrite a field the store already holds as requested
 #   WALLTIME_SAFEGUARD_MIN   no field starts with fewer minutes left in the job (default 15)
 
 #SBATCH --account=YOUR_ACCOUNT_HERE
@@ -74,13 +78,14 @@ fi
 [[ "${WITH_EBCC:-0}" == 1 ]] && EXTRA_FLAGS+=(--with-ebcc)
 COMPRESS_FLAGS=()
 [[ "${STOCK_CODECS_ONLY:-0}" == 1 ]] && COMPRESS_FLAGS+=(--stock-codecs-only)
+[[ "${REWRITE_EXISTING:-0}" == 1 ]] && COMPRESS_FLAGS+=(--no-skip-existing)
 
 SAFEGUARD_MIN=${WALLTIME_SAFEGUARD_MIN:-15}
 JOB_END=${SLURM_JOB_END_TIME:-}     # epoch seconds; empty outside a job, which disables the safeguard
 
 echo "[santis.run] topology : up to ${SLURM_NTASKS_PER_NODE:-32} rank(s)/node x ${SLURM_JOB_NUM_NODES:-?} node(s), one shared sample per node"
 echo "[santis.run] data root: $DYAMOND_DATA_ROOT"
-echo "[santis.run] knobs    : MAX_EVALS='${MAX_EVALS}' WITH_EBCC=${WITH_EBCC:-0} COMPRESS=${COMPRESS:-0} STOCK_CODECS_ONLY=${STOCK_CODECS_ONLY:-0}"
+echo "[santis.run] knobs    : MAX_EVALS='${MAX_EVALS}' WITH_EBCC=${WITH_EBCC:-0} COMPRESS=${COMPRESS:-0} STOCK_CODECS_ONLY=${STOCK_CODECS_ONLY:-0} REWRITE_EXISTING=${REWRITE_EXISTING:-0}"
 
 # ---------------------------------------------------------------------------
 # Field list
@@ -205,8 +210,8 @@ for i in "${!LIST[@]}"; do
     rc=${PIPESTATUS[0]}; step=sweep
 
     if [[ $rc -eq 0 && "${COMPRESS:-0}" == 1 ]]; then
-        # One process with a dask thread per visible core; 32 keep the write peak, which
-        # grows with the thread count, well inside the node's memory.
+        # One process, 32 threads: the source reads are serial (HDF5), so more threads only
+        # add encode throughput; compress caps the blocks in flight by the memory left.
         srun --unbuffered --nodes=1 --ntasks=1 --cpus-per-task=32 dc_toolkit \
              compress "$INPUT" "$OUTDIR" --vars "$IVAR" "${COMPRESS_FLAGS[@]}" \
              2>&1 | stdbuf -oL -eL tee "$OUTDIR/compress.log"

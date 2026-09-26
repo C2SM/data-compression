@@ -10,3 +10,4 @@ out-*
 *manifest*.json
 SWEEP*/
 VAST*/
+.pytest_cache/

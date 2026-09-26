@@ -7,18 +7,16 @@
   6. Persistence                  (dask -> zarr LocalStore, optional verify)
   7. MPI & topology
   8. Progress & timing"""
-import asyncio
 import atexit
-import importlib
 import json
 import math
 import os
 import re
-import struct
 import sys
 import time
 import warnings
 from collections import defaultdict
+from dataclasses import dataclass
 from itertools import product
 from pathlib import Path
 from typing import Optional, Tuple
@@ -31,22 +29,13 @@ import numpy as np
 import psutil
 import xarray as xr
 import zarr
-import numcodecs
-import numcodecs.zfpy
 import zfpy
 from mpi4py import MPI
 from zarr.core.sync import sync as _zarr_sync
 from zarr.codecs import numcodecs as zarrcodecs_nc
-from zarr.codecs.numcodecs._codecs import _NumcodecsArrayBytesCodec
-from zarr.registry import get_codec_class, register_codec
+from zarr.registry import get_codec_class
 
-os.environ.setdefault("EBCC_LOG_LEVEL", "4")  # the C library logs to stderr; 4 = errors only
-try:
-    importlib.import_module("ebcc.zarr_filter")  # registers "ebcc_filter" with numcodecs
-    from ebcc.filter_wrapper import EBCC_Filter
-    EBCC_AVAILABLE = True
-except ImportError:
-    EBCC_AVAILABLE = False
+from dc_toolkit.codecs import EBCC, EBCC_AVAILABLE, _EBCC_TILE_MAX, _EBCC_TILE_MIN, ZFPYFlat, ZFPYRank
 
 
 class CombinationProducedNonFiniteError(Exception):
@@ -120,16 +109,27 @@ def open_zarr_localstore(path: str, read_only: bool = True):
     return zarr.open_group(store, mode="r" if read_only else "a", use_consolidated=False), store
 
 
-def open_dataset(dataset_file: str, field_to_compress: Optional[str] = None, rank: int = 0):
-    """Lazy dask-backed .nc / .grib / .zarr dataset; aborts on another suffix or a missing field."""
+def open_dataset(dataset_file: str, field_to_compress: Optional[str] = None, rank: int = 0, chunks="auto"):
+    """Lazy .nc / .grib / .zarr dataset, dask-backed unless `chunks` is None; aborts on another suffix or a
+    missing field.  A netCDF float variable declaring no _FillValue or missing_value gets netCDF's default
+    fill as its _FillValue: cells never written hold it, and would enter every norm as 9.97e36."""
     suffix = Path(dataset_file).suffix.lower()
     if suffix == ".nc":
-        ds = xr.open_dataset(dataset_file, chunks="auto")
+        ds = xr.open_dataset(dataset_file, chunks=chunks)
+        undeclared = [v for v, x in ds.data_vars.items()
+                      if np.dtype(x.encoding.get("dtype", x.dtype)).kind == "f"
+                      and not {"_FillValue", "missing_value"} & (set(x.encoding) | set(x.attrs))]
+        if undeclared:
+            import netCDF4
+            raw = xr.open_dataset(dataset_file, chunks=chunks, decode_cf=False)
+            for v in undeclared:
+                raw[v].attrs["_FillValue"] = netCDF4.default_fillvals[np.dtype(raw[v].dtype).str[1:]]
+            ds = xr.decode_cf(raw)
     elif suffix == ".grib":
-        ds = xr.open_dataset(dataset_file, chunks="auto", engine="cfgrib",
+        ds = xr.open_dataset(dataset_file, chunks=chunks, engine="cfgrib",
                              backend_kwargs={"indexpath": ""})
     elif suffix == ".zarr":
-        ds = xr.open_zarr(dataset_file, chunks="auto", consolidated=None)
+        ds = xr.open_zarr(dataset_file, chunks=chunks, consolidated=None)
     else:
         if rank == 0:
             click.echo(f"Unsupported file format: {suffix}. Only .nc / .grib / .zarr are supported.")
@@ -159,11 +159,13 @@ def is_lat_lon(da) -> bool:
 # =============================================================================
 # Horizontal dims are never thinned, so codecs see the real spatial structure.
 
+SAMPLE_MIN_KEEP = 3  # indices a sample keeps at least across the time-like dims, and across the vertical ones
+
 _TIME_LIKE_DIM_RE = re.compile(
     r"^(?:time|.*_time|t|step|forecast_reference_time|forecast_period|"
-    r"ensemble|realization|member|reftime|valid_time|epoch)$", re.IGNORECASE)
+    r"ensemble|realization|member|member_id|reftime|valid_time|epoch)$", re.IGNORECASE)
 _CF_TIME_UNITS_RE = re.compile(r"^\s*\w+\s+since\s+", re.IGNORECASE)
-_CF_TIME_STANDARD_NAMES = frozenset({"time", "forecast_reference_time", "forecast_period"})
+_CF_TIME_STANDARD_NAMES = frozenset({"time", "forecast_reference_time", "forecast_period", "realization"})
 _CF_VERTICAL_STANDARD_NAMES = frozenset({
     "height", "altitude", "depth", "air_pressure", "pressure", "model_level_number",
     "atmosphere_hybrid_sigma_pressure_coordinate", "atmosphere_hybrid_height_coordinate",
@@ -228,12 +230,40 @@ def _classify_sample_dims(da: xr.DataArray):
     return time_dims, vertical_dims, spatial_dims
 
 
+def horizontal_axes(da: xr.DataArray) -> tuple:
+    """Positions of the dims that are neither time nor vertical and have more than one index."""
+    return tuple(pos for pos, name in _classify_sample_dims(da)[2] if da.sizes[name] > 1)
+
+
+def minimum_sample(da: xr.DataArray) -> tuple:
+    """(bytes, description) of the smallest sample build_representative_sample takes from `da`: one
+    horizontal slab times the fewest time steps and levels it keeps, SAMPLE_MIN_KEEP of each (all,
+    where there are fewer); the whole field when it has no time or vertical dim."""
+    time_dims, vertical_dims, spatial_dims = _classify_sample_dims(da)
+    if not time_dims + vertical_dims:
+        return int(da.nbytes), "the whole field, which has no time or vertical dim to thin"
+    keep, parts = 1, []
+    for group, label in ((time_dims, "time step"), (vertical_dims, "level")):
+        if group:
+            plan = _distribute_group([(i, n, int(da.sizes[n])) for i, n in group], SAMPLE_MIN_KEEP)
+            keep *= int(np.prod(list(plan.values())))
+            k = plan[group[0][1]]
+            parts.append(f"{k} {label}{'s' if k != 1 else ''}" if len(group) == 1
+                         else " x ".join(f"{n}={plan[n]}" for _, n in group))
+    slab = int(da.dtype.itemsize) * int(np.prod([da.sizes[d] for _, d in spatial_dims]))
+    return min(int(da.nbytes), slab * keep), " x ".join(parts)
+
+
 def build_representative_sample(da: xr.DataArray, size_limit_bytes: int, rank: int = 0,
-                                policy: str = "cascade",
-                                vertical_floor: int | None = None) -> xr.DataArray:
-    """Deterministic subset of `da` within `size_limit_bytes`: evenly spaced indices along time/
-    vertical dims (without any, the whole field and a warning).  "cascade" spends the budget on
-    time steps first above a budget-aware floor of levels, "balanced" splits it evenly in log
+                                policy: str = "cascade", vertical_floor: int | None = None,
+                                candidates: Optional[dict] = None, extremes: Optional[dict] = None) -> xr.DataArray:
+    """Deterministic subset of `da` within `size_limit_bytes`, but never below minimum_sample:
+    along each time and vertical dim, the middle index of equal blocks of its `candidates` (dim ->
+    indices; default all), e.g. the levels on which the field varies (without such dims, the whole
+    field and a warning).  `extremes` (dim -> per-index values, e.g. each level's minimum when a lower
+    bound is gated): when the chosen indices miss the minimum of such values, the nearest one is swapped
+    for the index attaining it, so the sample reaches the field's approach to the bound.  "cascade"
+    keeps its floor of levels, then spends the budget on time steps; "balanced" splits it evenly in log
     space.  Raises SampleTooLargeError when one horizontal slab does not fit."""
     nbytes = int(da.nbytes)
     if nbytes <= size_limit_bytes:
@@ -266,17 +296,33 @@ def build_representative_sample(da: xr.DataArray, size_limit_bytes: int, rank: i
                                   dims=tuple(da.dims), spatial_dims=tuple(spatial_names))
 
     max_product = float(size_limit_bytes) / float(irreducible_bytes)
-    plan = _allocate_stride_plan(da, time_dims, vertical_dims, max_product,
-                                 policy=policy, vertical_floor=vertical_floor)
+    cand = {n: np.asarray((candidates or {}).get(n, np.arange(da.sizes[n])), dtype=int) for _, n in stride_dims}
+    cand = {n: (c if c.size else np.arange(da.sizes[n])) for n, c in cand.items()}
+    plan = _allocate_stride_plan(da, time_dims, vertical_dims, max_product, policy=policy,
+                                 vertical_floor=vertical_floor, sizes={n: c.size for n, c in cand.items()})
     isel = {}
     for _, name in stride_dims:
-        size, n_keep = int(da.sizes[name]), plan[name]
-        if n_keep < size:
-            isel[name] = np.unique(np.linspace(0, size - 1, num=n_keep, dtype=int)).tolist()
+        c, n_keep = cand[name], plan[name]
+        if n_keep < da.sizes[name]:  # block midpoints: the ends of a dim (model top, first step) are the least typical
+            chosen = c[((np.arange(n_keep) + 0.5) * c.size / n_keep).astype(int)]
+            pinned = set()  # positions an earlier extreme swapped in
+            for v in (extremes or {}).get(name, []):
+                v = np.asarray(v, dtype=float)
+                target = v[c].min()
+                free = [i for i in range(chosen.size) if i not in pinned]
+                if free and np.isfinite(target) and v[chosen].min() > target:
+                    at = int(c[np.flatnonzero(v[c] == target)[0]])
+                    i = min(free, key=lambda i: abs(int(chosen[i]) - at))
+                    chosen[i] = at
+                    pinned.add(i)
+            isel[name] = sorted(chosen.tolist())
     sampled = da.isel(isel) if isel else da
 
     if rank == 0:
-        strided = ", ".join(f"{n}={plan[n]}/{da.sizes[n]}" for _, n in stride_dims)
+        strided = ", ".join(f"{n}={plan[n]}/{da.sizes[n]}"
+                            + (f" {isel[n]}" if n in isel else "")
+                            + (f" (of the {cand[n].size} that vary)" if cand[n].size < da.sizes[n] else "")
+                            for _, n in stride_dims)
         spatial = (" | preserved spatial: " + ", ".join(d for _, d in spatial_dims)) if spatial_dims else ""
         click.echo(f"[sample] field is {hsize(nbytes)} > limit {hsize(size_limit_bytes)}; "
                    f"policy={policy}; strided {strided}{spatial} -> {hsize(int(sampled.nbytes))}.")
@@ -295,35 +341,55 @@ def _balanced_group_plan(dims_info, budget) -> dict:
 
 
 def _distribute_group(dims_info, group_keep) -> dict:
+    """{dim: n_keep} for one group of dims, about `group_keep` indices in all and never fewer than
+    SAMPLE_MIN_KEEP (or the whole group, when it has fewer)."""
     if not dims_info:
         return {}
+    floor = min(SAMPLE_MIN_KEEP, int(np.prod([size for _, _, size in dims_info])))
     if len(dims_info) == 1:
         _, name, size = dims_info[0]
-        return {name: max(1, min(size, int(group_keep)))}
-    return _balanced_group_plan(dims_info, group_keep)
+        return {name: min(size, max(floor, int(group_keep)))}
+    plan = _balanced_group_plan(dims_info, group_keep)
+    for _, name, size in sorted(dims_info, key=lambda t: -t[2]):  # small dims split the floor unevenly
+        while int(np.prod(list(plan.values()))) < floor and plan[name] < size:
+            plan[name] += 1
+    return plan
 
 
 def _allocate_stride_plan(da, time_dims, vertical_dims, max_product,
-                          policy="cascade", vertical_floor=None) -> dict:
-    """{dim_name: n_keep} for every time and vertical dim."""
-    time_info = [(i, n, int(da.sizes[n])) for i, n in time_dims]
-    vert_info = [(i, n, int(da.sizes[n])) for i, n in vertical_dims]
-    if policy == "balanced":
-        return _balanced_group_plan(time_info + vert_info, max_product)
-
+                          policy="cascade", vertical_floor=None, sizes=None) -> dict:
+    """{dim_name: n_keep} for every time and vertical dim, at least SAMPLE_MIN_KEEP time steps and
+    levels (or all, where there are fewer) even when `max_product` slabs cannot hold them; `sizes`
+    (dim -> indices to choose from) overrides the dims' lengths."""
+    size = lambda n: int((sizes or {}).get(n, da.sizes[n]))  # noqa: E731
+    time_info = [(i, n, size(n)) for i, n in time_dims]
+    vert_info = [(i, n, size(n)) for i, n in vertical_dims]
     T = int(np.prod([s for _, _, s in time_info])) if time_info else 1
     V = int(np.prod([s for _, _, s in vert_info])) if vert_info else 1
-    P = max(1.0, float(max_product))
+    t_min, v_min = min(T, SAMPLE_MIN_KEEP), min(V, SAMPLE_MIN_KEEP)
+    kept = lambda plan, info: int(np.prod([plan[n] for _, n, _ in info])) if info else 1  # noqa: E731
+    # what each group keeps at the least: several small dims can overshoot the minimum (2 x 2 for 3)
+    t_floor = kept(_distribute_group(time_info, t_min), time_info)
+    v_floor = kept(_distribute_group(vert_info, v_min), vert_info)
+    P = max(float(max_product), float(t_floor * v_floor))
+    if policy == "balanced":
+        plan = _balanced_group_plan(time_info + vert_info, P)
+        if kept(plan, time_info) < t_min:
+            plan.update(_distribute_group(time_info, t_min))
+            plan.update(_distribute_group(vert_info, max(v_min, P // kept(plan, time_info))))
+        elif kept(plan, vert_info) < v_min:
+            plan.update(_distribute_group(vert_info, v_min))
+            plan.update(_distribute_group(time_info, max(t_min, P // kept(plan, vert_info))))
+        return plan
+
     if vertical_floor is not None:
-        vfloor = max(1, int(vertical_floor))
+        vfloor = int(vertical_floor)
     else:
         vfloor = max(4, int(math.ceil(math.log2(V)))) if V > 1 else 1
-    vfloor = min(vfloor, V)
-    # Cap the level floor at sqrt(P) so a tight budget degrades to the balanced split.
-    base_level = max(1, min(vfloor, int(math.floor(math.sqrt(P)))))
-    time_keep = max(1, min(T, int(math.floor(P / base_level))))
-    level_keep = max(1, min(V, int(math.floor(P / time_keep))))
-    return {**_distribute_group(time_info, time_keep), **_distribute_group(vert_info, level_keep)}
+    # The floor of levels shrinks to what leaves room for the minimum of time steps, never below v_floor.
+    level_target = max(v_floor, min(vfloor, V, int(P // t_floor)))
+    time_plan = _distribute_group(time_info, max(t_min, min(T, int(P // level_target))))
+    return {**time_plan, **_distribute_group(vert_info, max(v_min, min(V, int(P // kept(time_plan, time_info)))))}
 
 
 # =============================================================================
@@ -473,8 +539,13 @@ def compressor_space(da, with_lossy=True, compressor_class="all"):
 
 
 def filter_space(da, with_lossy=True, filter_class="all", data_range=None):
-    """Array->array filters; integer dtypes get Delta only.  FixedScaleOffset needs `data_range`, the
-    FULL field's (min, max).  Raises ValueError when the requested class has nothing for this field."""
+    """Array->array filters; integer dtypes get Delta only, and a float field without `with_lossy` gets no
+    filter (Delta is not exactly invertible on floats).  FixedScaleOffset needs `data_range`, the FULL
+    field's (min, max).  Raises ValueError when the requested class has nothing for this field."""
+    if da.dtype.kind == "f" and not with_lossy:
+        if filter_class.lower() in ("all", "none"):
+            return [None]
+        raise ValueError(f"--filter-class {filter_class} has nothing lossless for a float field; use none")
     classes = [zarrcodecs_nc.Delta]
     if with_lossy:
         classes += [zarrcodecs_nc.BitRound, zarrcodecs_nc.Quantize, zarrcodecs_nc.FixedScaleOffset]
@@ -509,123 +580,10 @@ def filter_space(da, with_lossy=True, filter_class="all", data_range=None):
     return space
 
 
-# ---- ZFPY: two encoders, because neither rank wins --------------------------
-# zfp codes 4^d blocks, so the rank a chunk is encoded at decides which correlations it uses:
-# the chunk's own rank keeps cross-axis gradients in a block and wins on correlated slower axes;
-# 1-D wins when those carry little signal (no bits spent on noise, more redundancy left for the
-# compressor).  The sweep carries both, under distinct names: a pipeline's identity is its JSON.
-
-
-# ZFPYRank encodes each chunk at its own rank, folded only as far as zfp requires (at most 4-D;
-# per-axis header budget 2**24 at 2-D, 2**16 at 3-D, 2**12 at 4-D, which DYAMOND's cell axis
-# overflows): size-1 axes dropped, then the slowest pair folded until everything fits.  Its
-# plain "zfpy" name decodes anywhere.  (Comments, not docstrings: zarr replaces codec docstrings.)
-class ZFPYRank(zarrcodecs_nc.ZFPY, codec_name="zfpy"):
-    _ZFP_MAX_PER_AXIS = {1: 2**48, 2: 2**24, 3: 2**16, 4: 2**12}
-
-    @classmethod
-    def encode_shape(cls, shape) -> tuple:
-        dims = tuple(d for d in shape if d > 1) or (1,)
-        max_rank = max(cls._ZFP_MAX_PER_AXIS)
-        while len(dims) > 1 and (len(dims) > max_rank
-                                 or any(d > cls._ZFP_MAX_PER_AXIS[len(dims)] for d in dims)):
-            dims = (dims[0] * dims[1],) + dims[2:]     # C-order keeps the fold contiguous
-        return dims
-
-    async def _encode_single(self, chunk_data, chunk_spec):
-        arr = np.ascontiguousarray(chunk_data.as_ndarray_like())
-        out = await asyncio.to_thread(self._codec.encode, arr.reshape(self.encode_shape(arr.shape)))
-        return chunk_spec.prototype.buffer.from_bytes(out)
-
-
-class _ZFPYFlatCodec(numcodecs.zfpy.ZFPY):
-    """zfpy under a second numcodecs id: zarr's wrapper resolves codec_name in that registry."""
-
-    codec_id = "zfpy_flat"
-
-
-numcodecs.register_codec(_ZFPYFlatCodec)
-
-
-# ZFPYFlat encodes every chunk as 1-D.  Decoding is stock zfp (the stream carries
-# its own shape), but a client without dc_toolkit cannot resolve the name.
-class ZFPYFlat(ZFPYRank, codec_name="zfpy_flat"):
-    @classmethod
-    def encode_shape(cls, shape) -> tuple:
-        return (max(1, int(np.prod(shape))),)
-
-
-register_codec("numcodecs.zfpy_flat", ZFPYFlat)   # in-process reads must not depend on the install's entry points
-
-
-# ---- EBCC (optional): JPEG 2000 base layer + error-bounded residual ----------
-# Compresses float32 (lat, lon) frames, each chunk exactly one tile.  NaN/Inf or a tile that
-# does not divide the frame make the C library EXIT THE PROCESS, so callers validate first
-# (ebcc_tile, ebcc_sweep_entries for the sweep, utils_cli.validate_pipeline for persist, plots).
+# ---- EBCC (optional): the sweep's error targets and tiles -----------------------
 # Maximum absolute error targets as fractions of the FULL field's value range (the paper's
 # 0.1 %..10 % band plus one decade below); EBCC's own floor is range/65535 (uint16 base layer).
 _EBCC_ERROR_FRACTIONS = (1e-1, 3e-2, 1e-2, 3e-3, 1e-3, 3e-4, 1e-4)
-# Start of both rate-control searches (OpenJPEG rate = base_cr/2): it sets the bisection bracket,
-# so it shifts the achieved ratio by ~10 %, and it is part of the arglist, hence the pipeline's identity.
-_EBCC_BASE_CR = 2.0
-# EBCC_MIN/MAX_INTERNAL_IMAGE_DIM in ebcc_codec.h: the C filter exits outside them.
-_EBCC_TILE_MIN, _EBCC_TILE_MAX = 32, 2047
-
-
-def _f32(bits) -> float:
-    """The float32 EBCC packs into a uint32 arglist entry."""
-    return struct.unpack("f", struct.pack("I", int(bits)))[0]
-
-
-class EBCC(_NumcodecsArrayBytesCodec, codec_name="ebcc_filter"):
-    """zarr v3 wrapper of ebcc.zarr_filter.EBCCZarrFilter, "numcodecs.ebcc_filter" in zarr.json with
-    the integer arglist [height, width, f32bits(base_cr), mode, f32bits(target)]; mode 0 none (no
-    target), 1 max_error_target, 2 relative_error_target.  Source only: zarr replaces __doc__."""
-
-    def __init__(self, **codec_config):
-        if not EBCC_AVAILABLE:
-            raise ImportError("the EBCC serializer needs the ebcc package: pip install -e '.[ebcc]'")
-        arglist = list(codec_config.get("arglist") or [])
-        try:  # anything else makes the C library exit the process
-            mode = int(arglist[3])
-            ok = (mode in (0, 1, 2) and len(arglist) == (4 if mode == 0 else 5)
-                  and all(_EBCC_TILE_MIN <= int(v) <= _EBCC_TILE_MAX for v in arglist[:2])
-                  and all(math.isfinite(_f32(v)) and _f32(v) > 0 for v in arglist[2:3] + arglist[4:5]))
-        except (IndexError, TypeError, ValueError, struct.error):
-            ok = False
-        if not ok:
-            raise ValueError(f"EBCC arglist must be [height, width, base_cr bits, mode 0/1/2, target bits (modes 1, 2)] "
-                             f"with the tile sides in [{_EBCC_TILE_MIN}, {_EBCC_TILE_MAX}] and positive base_cr and "
-                             f"target; got {arglist}")
-        super().__init__(**codec_config)
-
-    @classmethod
-    def from_params(cls, height: int, width: int, target: float, mode: str = "max_error_target",
-                    base_cr: float = _EBCC_BASE_CR):
-        opts = EBCC_Filter(base_cr=base_cr, height=height, width=width,
-                           residual_opt=(mode, target)).hdf_filter_opts
-        return cls(arglist=[int(v) for v in opts])
-
-    @property
-    def arglist(self) -> list:
-        return [int(v) for v in self.codec_config["arglist"]]
-
-    @property
-    def height(self) -> int:
-        return self.arglist[0]
-
-    @property
-    def width(self) -> int:
-        return self.arglist[1]
-
-    def __repr__(self) -> str:
-        a = self.arglist
-        mode = {0: "none", 1: "max_error_target", 2: "relative_error_target"}.get(a[3], a[3])
-        target = f", {mode}={_f32(a[4]):g}" if len(a) > 4 else ""
-        return f"EBCC(height={a[0]}, width={a[1]}, base_cr={_f32(a[2]):g}{target})"
-
-
-register_codec("numcodecs.ebcc_filter", EBCC)
 
 
 def _ebcc_tile_size(n: int):
@@ -667,7 +625,7 @@ def ebcc_sweep_entries(filters, serializers, dtype, all_finite: bool):
     if not ebccs:
         return [], ""
     if not all_finite:
-        return [], "the sample contains NaN/Inf, which EBCC cannot encode"
+        return [], "the field holds NaN/Inf, which EBCC cannot encode"
     dtype, filt = np.dtype(dtype), None
     if dtype != np.float32:
         astype = [f for f in filters if isinstance(f, zarrcodecs_nc.AsType)]
@@ -681,8 +639,8 @@ def serializer_space(da, with_lossy=True, serializer_class="all", with_ebcc=Fals
     is the classic recipe, and all an 8-bit field gets: pco refuses those).  ZFPY needs `with_lossy`
     and floats (fixed-rate zfp is never exact on integers, and Delta, their only filter, turns that
     into a random walk on decode).  EBCC needs `with_ebcc` (or class 'ebcc'), `with_lossy` and float
-    (lat, lon) frames; `data_range` (full-field min, max) scales its error targets, else they are
-    relative to each tile.  ZFPYFlat is planned when `chunk_shapes` (the sample's and store's chunks)
+    (lat, lon) frames within the float32 range it casts to; `data_range` (full-field min, max) scales its
+    error targets, else they are relative to each tile.  ZFPYFlat is planned when `chunk_shapes` (the sample's and store's chunks)
     is not given or ZFPYRank encodes one of them at 2-D or more.  Raises ValueError when the space is
     empty."""
     if serializer_class.lower() == "ebcc":
@@ -717,6 +675,8 @@ def serializer_space(da, with_lossy=True, serializer_class="all", with_ebcc=Fals
                       for v in variants for mode, param, fn in modes for k in _ZFPY_K_GRID]
         elif cls is EBCC:
             tile, why = ebcc_tile(da)
+            if data_range and max(abs(data_range[0]), abs(data_range[1])) > float(np.finfo(np.float32).max):
+                tile, why = None, "the field exceeds the float32 range EBCC casts to"
             if tile is not None:
                 span = float(data_range[1] - data_range[0]) if data_range else None
                 space += [EBCC.from_params(*tile, r * span) if span else
@@ -746,41 +706,80 @@ def valid_digits_for_quantize(da):
     raise TypeError(f"Unsupported dtype '{da.dtype}'. Quantize only supports float32 and float64.")
 
 
-def full_field_data_range(da, comm=None):
-    """Finite (min, max) over the whole field, or None if it is constant, has no finite value or
-    could not be read (with a warning).  Collective over `comm` when given: its ranks split the
-    blocks and all reach the reductions, a failed read included, so all return the same answer."""
-    data = da.data if hasattr(da, "data") else np.asarray(da)
+def finite_range(a: np.ndarray):
+    """(min, max) over the finite values of `a`, or None when it has none; copies `a` only when it
+    holds +-inf."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)  # all NaN
+        lo, hi = np.nanmin(a), np.nanmax(a)
+    if not (np.isfinite(lo) and np.isfinite(hi)):
+        a = a[np.isfinite(a)]
+        if not a.size:
+            return None
+        lo, hi = a.min(), a.max()
+    return float(lo), float(hi)
+
+
+@dataclass
+class FieldScan:
+    """What one pass over the whole field found (scan_field)."""
+    range: Optional[tuple]  # finite (min, max), min == max for a constant field; None: no finite value or unread
+    readable: bool          # False when a block could not be read, twice
+    nonfinite: int          # NaN and Inf cells
+    varying: dict           # dim -> bool per index: the single time dim's and single vertical dim's indices
+                            # holding more than one finite value
+    index_range: dict       # dim -> (min, max) per index over its finite values, for the same dims
+
+
+def scan_field(da, comm=None) -> FieldScan:
+    """Collective over `comm` when given: one pass over the whole field, its blocks split across the
+    ranks (one block in memory at a time, a failed read retried once), for a FieldScan.  All ranks get
+    the same answer."""
+    data = da.data if isinstance(da.data, dask.array.Array) else dask.array.from_array(np.asarray(da.data))
     rank, size = (comm.Get_rank(), comm.Get_size()) if comm is not None else (0, 1)
-    dmin, dmax, failed = np.inf, -np.inf, 0
-    try:
-        if isinstance(data, dask.array.Array):
-            blocks = list(data.blocks.ravel())[rank::size]
-        else:
-            blocks = [data] if rank == 0 else []
-        for block in blocks:  # one block in memory at a time, reduced without a copy
-            x = np.asarray(block.compute() if isinstance(block, dask.array.Array) else block)
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore", RuntimeWarning)  # an all-NaN block
-                lo, hi = np.nanmin(x), np.nanmax(x)
-            if not (np.isfinite(lo) and np.isfinite(hi)):  # +-inf, or no finite value at all
-                x = x[np.isfinite(x)]
-                if not x.size:
-                    continue
-                lo, hi = x.min(), x.max()
-            dmin, dmax = min(dmin, float(lo)), max(dmax, float(hi))
-    except Exception as e:
-        failed = 1
-        click.echo(f"[range] WARNING rank {rank}: reading the field failed ({e!r})", err=True)
+    time_dims, vertical_dims, _ = _classify_sample_dims(da)
+    per_index = {name: (pos, np.full(da.sizes[name], np.inf), np.full(da.sizes[name], -np.inf))
+                 for group in (time_dims, vertical_dims) if len(group) == 1 for pos, name in group}
+    offsets = [np.concatenate(([0], np.cumsum(c)[:-1])) for c in data.chunks]
+    dmin, dmax, failed, nonfinite = np.inf, -np.inf, 0, 0
+    with warnings.catch_warnings(), np.errstate(invalid="ignore"):
+        warnings.simplefilter("ignore", RuntimeWarning)  # all-NaN slices
+        for idx in list(np.ndindex(*data.numblocks))[rank::size]:
+            for attempt in (1, 2):
+                try:
+                    b = np.asarray(data.blocks[idx].compute())
+                    break
+                except Exception as e:
+                    b = None
+                    click.echo(f"[range] WARNING rank {rank}: reading block {idx} failed ({e!r})"
+                               + ("; retrying" if attempt == 1 else ""), err=True)
+            if b is None:
+                failed = 1
+                break
+            r = finite_range(b)
+            if r is not None:
+                dmin, dmax = min(dmin, r[0]), max(dmax, r[1])
+            if b.dtype.kind == "f":
+                nonfinite += b.size - int(np.count_nonzero(np.isfinite(b)))
+                if per_index and np.isinf(b).any():
+                    b = np.where(np.isinf(b), np.nan, b)  # the per-index extremes are over finite values
+            for pos, lo, hi in per_index.values():
+                other = tuple(a for a in range(b.ndim) if a != pos)
+                blo, bhi = np.fmin.reduce(b, axis=other), np.fmax.reduce(b, axis=other)  # NaN ignored
+                sl = slice(offsets[pos][idx[pos]], offsets[pos][idx[pos]] + b.shape[pos])
+                lo[sl] = np.fmin(lo[sl], blo)
+                hi[sl] = np.fmax(hi[sl], bhi)
     if comm is not None:
         failed = comm.allreduce(failed, op=MPI.MAX)
         dmin, dmax = comm.allreduce(dmin, op=MPI.MIN), comm.allreduce(dmax, op=MPI.MAX)
-    if failed and rank == 0:
-        click.echo("[range] WARNING: no full-field value range: FixedScaleOffset is left out, and EBCC and "
-                   "--phys-tolerance run without it.")
-    if failed or not (np.isfinite(dmin) and np.isfinite(dmax)) or dmax <= dmin:
-        return None
-    return (dmin, dmax)
+        nonfinite = comm.allreduce(nonfinite, op=MPI.SUM)
+        for _, lo, hi in per_index.values():
+            comm.Allreduce(MPI.IN_PLACE, lo, op=MPI.MIN)
+            comm.Allreduce(MPI.IN_PLACE, hi, op=MPI.MAX)
+    finite = not failed and np.isfinite(dmin) and np.isfinite(dmax)
+    return FieldScan(range=(float(dmin), float(dmax)) if finite else None, readable=not failed,
+                     nonfinite=int(nonfinite), varying={n: hi > lo for n, (_, lo, hi) in per_index.items()},
+                     index_range={n: (lo, hi) for n, (_, lo, hi) in per_index.items()})
 
 
 def fixed_scale_offset_configs(da, data_range=None):
@@ -894,6 +893,13 @@ def pipeline_name(compressor, filt, serializer) -> str:
 # 5. IN-MEMORY EVALUATION
 # =============================================================================
 
+# What the metrics measure; the resume state records it beside a digest of the code that measures them.
+METRIC_DEFINITIONS = ("N_Corrupt: cells whose class (finite, NaN, +Inf, -Inf) the round trip changes",
+                      "N_Bounds: cells the round trip moves from inside the physical bounds (with the slack) to outside",
+                      "Q99_Rel: cells with |x| >= the q99 cut, taken over the non-zero values when the plain one is 0",
+                      "Grad_Rel: finite differences along the horizontal dims, else the non-leading ones")
+
+
 def _info_bytes(info) -> Tuple[int, int]:
     """(count_bytes, count_bytes_stored) from a zarr ArrayInfo."""
     count = getattr(info, "count_bytes", None)
@@ -927,9 +933,9 @@ def _rel(err, ori) -> float:
     return float(err) / float(ori)
 
 
-# FixedScaleOffset casts NaN fill to int and numpy warns on every chunk; silenced since the norms
-# mask fill out, although those cells decode to finite values that no metric flags.  A real FSO
-# overflow is silent: full_field_data_range and the verify gate guard against it.
+# FixedScaleOffset casts NaN fill to int and numpy warns on every chunk; silenced, since N_Corrupt
+# counts those cells.  A real FSO overflow is silent: the full-field range and compress's range check
+# (utils_cli.fso_range_problem) guard against it.
 warnings.filterwarnings("ignore", message="invalid value encountered in cast", category=RuntimeWarning)
 
 
@@ -949,74 +955,108 @@ def _zarr_roundtrip(sample_np, dims, codec_kwargs, chunks):
     return decoded, count_bytes / count_bytes_stored
 
 
-def _error_sums(sample_np, decoded, chunks, q99_abs):
-    """Chunk-wise accumulators over the cells finite in both arrays (n_corrupt: finite in the original
-    only): (l1_err, l2_err_sq, linf_err, signed_err, l1_ori, l2_ori_sq, linf_ori, q99_err, q99_ori,
-    n_valid, n_corrupt, decoded_min, decoded_max); `q99_abs` None skips the tail sums."""
-    l1_err = l2_err_sq = linf_err = signed_err = 0.0
-    l1_ori = l2_ori_sq = linf_ori = 0.0
-    q99_err = q99_ori = 0.0
-    n_valid = n_corrupt = 0
-    decoded_min, decoded_max = math.inf, -math.inf
+_ACC_INIT = {"l1_err": 0.0, "l2_err_sq": 0.0, "linf_err": 0.0, "signed_err": 0.0, "l1_ori": 0.0,
+             "l2_ori_sq": 0.0, "linf_ori": 0.0, "q99_err": 0.0, "q99_ori": 0.0, "n_valid": 0, "n_corrupt": 0,
+             "n_bounds": 0, "decoded_min": math.inf, "decoded_max": -math.inf,
+             "source_min": math.inf, "source_max": -math.inf}
+_ACC_MAX = ("linf_err", "linf_ori", "decoded_max", "source_max")
+_ACC_MIN = ("decoded_min", "source_min")
+
+
+def _error_sums(orig_all, decoded_all, chunks, q99_abs=None, bounds=None) -> dict:
+    """Accumulators of the error metrics, chunk by chunk, over the cells finite in both arrays; n_corrupt
+    counts the cells whose class (finite, NaN, +Inf, -Inf) differs, n_bounds those inside `bounds` (low, high) in the original and
+    outside in the decoded array, source_min/max span the finite original.  `q99_abs` None skips the tail."""
+    acc = dict(_ACC_INIT)
     with np.errstate(invalid="ignore"):
-        for sl in _iter_chunk_slices(sample_np.shape, chunks):
-            orig, dec = sample_np[sl], decoded[sl]
+        for sl in _iter_chunk_slices(orig_all.shape, chunks):
+            orig, dec = orig_all[sl], decoded_all[sl]
             finite_orig, finite_dec = np.isfinite(orig), np.isfinite(dec)
-            n_corrupt += int(np.count_nonzero(finite_orig & ~finite_dec))
+            acc["n_corrupt"] += int(np.count_nonzero(finite_orig != finite_dec))  # data lost, or fill made data
+            both = ~finite_orig & ~finite_dec
+            if both.any():  # a NaN turned Inf, or an Inf turned NaN or the other Inf
+                o, d = orig[both], dec[both]
+                nan_o, nan_d = np.isnan(o), np.isnan(d)
+                acc["n_corrupt"] += int(np.count_nonzero(nan_o != nan_d) + np.count_nonzero(~nan_o & ~nan_d & (o != d)))
+            if orig.dtype.kind != "f":
+                acc["source_min"], acc["source_max"] = min(acc["source_min"], orig.min()), max(acc["source_max"], orig.max())
+            elif finite_orig.any():
+                acc["source_min"] = min(acc["source_min"], float(np.min(orig, where=finite_orig, initial=np.inf)))
+                acc["source_max"] = max(acc["source_max"], float(np.max(orig, where=finite_orig, initial=-np.inf)))
             valid = finite_orig & finite_dec
             nv = int(np.count_nonzero(valid))
             if nv == 0:
                 continue
-            n_valid += nv
+            acc["n_valid"] += nv
             # Two float64 temporaries per chunk (the boolean index copied already), then all in place.
             o_abs = orig[valid].astype(np.float64, copy=False)
             e_abs = dec[valid].astype(np.float64, copy=False)
-            decoded_min, decoded_max = min(decoded_min, float(e_abs.min())), max(decoded_max, float(e_abs.max()))
+            acc["decoded_min"] = min(acc["decoded_min"], float(e_abs.min()))
+            acc["decoded_max"] = max(acc["decoded_max"], float(e_abs.max()))
+            if bounds is not None:
+                lo, hi = bounds
+                acc["n_bounds"] += int(np.count_nonzero((o_abs >= lo) & (o_abs <= hi) & ((e_abs < lo) | (e_abs > hi))))
             e_abs -= o_abs
-            signed_err += float(e_abs.sum()); l2_err_sq += float(np.dot(e_abs, e_abs))
+            acc["signed_err"] += float(e_abs.sum()); acc["l2_err_sq"] += float(np.dot(e_abs, e_abs))
             np.abs(e_abs, out=e_abs); np.abs(o_abs, out=o_abs)
-            l1_err += float(e_abs.sum()); linf_err = max(linf_err, float(e_abs.max(initial=0.0)))
-            l1_ori += float(o_abs.sum()); l2_ori_sq += float(np.dot(o_abs, o_abs))
-            linf_ori = max(linf_ori, float(o_abs.max(initial=0.0)))
+            acc["l1_err"] += float(e_abs.sum()); acc["linf_err"] = max(acc["linf_err"], float(e_abs.max(initial=0.0)))
+            acc["l1_ori"] += float(o_abs.sum()); acc["l2_ori_sq"] += float(np.dot(o_abs, o_abs))
+            acc["linf_ori"] = max(acc["linf_ori"], float(o_abs.max(initial=0.0)))
             if q99_abs is not None:
                 ext = o_abs >= q99_abs
                 if ext.any():
-                    q99_err += float(e_abs[ext].sum()); q99_ori += float(o_abs[ext].sum())
-    return (l1_err, l2_err_sq, linf_err, signed_err, l1_ori, l2_ori_sq, linf_ori, q99_err, q99_ori,
-            n_valid, n_corrupt, decoded_min, decoded_max)
+                    acc["q99_err"] += float(e_abs[ext].sum()); acc["q99_ori"] += float(o_abs[ext].sum())
+    return acc
+
+
+def _merge_sums(parts) -> dict:
+    """One accumulator dict from several _error_sums results."""
+    acc = dict(_ACC_INIT)
+    for p in parts:
+        for k, v in p.items():
+            acc[k] = max(acc[k], v) if k in _ACC_MAX else min(acc[k], v) if k in _ACC_MIN else acc[k] + v
+    return acc
+
+
+def _errors_from_sums(acc: dict, want_q99: bool):
+    """(errors dict, L2 error) from _error_sums accumulators; raises CombinationProducedNonFiniteError when a
+    norm overflowed."""
+    if not all(map(math.isfinite, (acc["l1_err"], acc["l2_err_sq"], acc["linf_err"]))):
+        raise CombinationProducedNonFiniteError(
+            f"non-finite error accumulators after masking (l1_err={acc['l1_err']}, "
+            f"l2_err_sq={acc['l2_err_sq']}, linf_err={acc['linf_err']})")
+    l2_err, l2_ori, n_valid = math.sqrt(acc["l2_err_sq"]), math.sqrt(acc["l2_ori_sq"]), acc["n_valid"]
+    finite_src = math.isfinite(acc["source_min"])
+    errors = {
+        "Relative_Error_L1": _rel(acc["l1_err"], acc["l1_ori"]),
+        "Relative_Error_L2": _rel(l2_err, l2_ori),
+        "Relative_Error_Linf": _rel(acc["linf_err"], acc["linf_ori"]),
+        "Bias_Rel": _rel(abs(acc["signed_err"]), acc["l1_ori"]),
+        "Decoded_Min": float(acc["decoded_min"]) if n_valid else float("nan"),
+        "Decoded_Max": float(acc["decoded_max"]) if n_valid else float("nan"),
+        "Source_Min": float(acc["source_min"]) if finite_src else float("nan"),
+        "Source_Max": float(acc["source_max"]) if finite_src else float("nan"),
+        "N_Corrupt": int(acc["n_corrupt"]),
+        "N_Bounds": int(acc["n_bounds"]),
+        "N_Valid": int(n_valid),
+        "Q99_Rel": _rel(acc["q99_err"], acc["q99_ori"]) if want_q99 else None,
+    }
+    return errors, l2_err
 
 
 def evaluate_codec_pipeline(sample_np: np.ndarray, dims, codec_kwargs: dict, chunks,
-                            q99_abs: float | None = None, compute_gradient: bool = False,
+                            q99_abs: float | None = None, bounds=None, compute_gradient: bool = False,
                             gradient_axes=None, precheck_thresholds: dict | None = None):
     """Round-trip `sample_np` through a pipeline in memory; returns (compression_ratio, errors_dict,
-    euclidean_distance).  Fill (non-finite in the original) and corruption (finite, then non-finite
-    after decode; counted in N_Corrupt) are left out of every norm.  With `precheck_thresholds`,
-    combos failing a cheap gate skip the gradient metric, one more pass over the sample."""
+    euclidean_distance).  Fill (non-finite in the original) is left out of every norm; a cell whose class
+    the round trip changes (data turned NaN/Inf, fill turned into data, NaN into Inf) is corruption,
+    counted in N_Corrupt; with `bounds` (low, high), N_Bounds counts the cells moved outside them.  With
+    `precheck_thresholds`, combos failing a cheap gate skip the gradient metric, one more pass over the sample."""
     decoded, ratio = _zarr_roundtrip(sample_np, dims, codec_kwargs, chunks)
     want_q99 = q99_abs is not None and math.isfinite(q99_abs)
     with Timer("eval.metrics"):
-        (l1_err, l2_err_sq, linf_err, signed_err, l1_ori, l2_ori_sq, linf_ori, q99_err, q99_ori,
-         n_valid, n_corrupt, decoded_min, decoded_max) = _error_sums(sample_np, decoded, chunks,
-                                                                     q99_abs if want_q99 else None)
-    if not all(map(math.isfinite, (l1_err, l2_err_sq, linf_err))):
-        raise CombinationProducedNonFiniteError(
-            f"non-finite error accumulators after masking "
-            f"(l1_err={l1_err}, l2_err_sq={l2_err_sq}, linf_err={linf_err})")
-
-    l2_err, l2_ori = math.sqrt(l2_err_sq), math.sqrt(l2_ori_sq)
-    errors = {
-        "Relative_Error_L1": _rel(l1_err, l1_ori),
-        "Relative_Error_L2": _rel(l2_err, l2_ori),
-        "Relative_Error_Linf": _rel(linf_err, linf_ori),
-        "Bias_Rel": _rel(abs(signed_err), l1_ori),
-        "Decoded_Min": decoded_min if n_valid else float("nan"),
-        "Decoded_Max": decoded_max if n_valid else float("nan"),
-        "N_Corrupt": int(n_corrupt),
-        "N_Valid": int(n_valid),
-        "Q99_Rel": _rel(q99_err, q99_ori) if want_q99 else None,
-    }
-
+        errors, l2_err = _errors_from_sums(
+            _error_sums(sample_np, decoded, chunks, q99_abs if want_q99 else None, bounds), want_q99)
     do_grad = compute_gradient
     if compute_gradient and precheck_thresholds is not None:
         do_grad = all(within_limit(errors[m], precheck_thresholds.get(t)) for m, t in CHEAP_GATES)
@@ -1024,27 +1064,48 @@ def evaluate_codec_pipeline(sample_np: np.ndarray, dims, codec_kwargs: dict, chu
     return ratio, errors, l2_err
 
 
-def _gradient_rel_l1(orig: np.ndarray, decoded: np.ndarray, axes=None) -> float:
-    """Sum|d(decoded) - d(orig)| / Sum|d(orig)| over finite differences along `axes` (default: all
-    but the leading one; axis 0 for 1-D), in ~32 MiB float64 blocks of leading indices unless `axes`
-    includes axis 0."""
+def _gradient_pieces(shape, axis: int, max_elems: int):
+    """Slices covering an array of `shape` in pieces of at most about `max_elems` elements, consecutive
+    pieces along `axis` sharing one index: every neighbouring pair along `axis` lies in exactly one piece."""
+    n, rest = shape[axis], [a for a in range(len(shape)) if a != axis]
+    rest_elems = int(np.prod([shape[a] for a in rest])) if rest else 1
+    span = max(1, max_elems // rest_elems - 1)  # differences per piece along `axis`
+    block = {a: shape[a] for a in rest}
+    if 2 * rest_elems > max_elems:  # even two indices along `axis` are too many: split the other axes too
+        inner, budget = 1, max(1, max_elems // 2)
+        for a in reversed(rest):
+            if inner * shape[a] > budget:
+                block[a] = max(1, budget // inner)
+                block.update({b: 1 for b in rest[:rest.index(a)]})
+                break
+            inner *= shape[a]
+    ranges = [range(0, shape[a], block[a]) for a in rest]
+    for a0 in range(0, n - 1, span):
+        for starts in product(*ranges):
+            sl = [slice(None)] * len(shape)
+            sl[axis] = slice(a0, min(n, a0 + span + 1))
+            for a, st in zip(rest, starts):
+                sl[a] = slice(st, min(shape[a], st + block[a]))
+            yield tuple(sl)
+
+
+def _gradient_rel_l1(orig: np.ndarray, decoded: np.ndarray, axes=None, max_elems: int = 4 << 20) -> float:
+    """Sum|d(decoded) - d(orig)| / Sum|d(orig)| over finite differences along `axes` (default: all but the
+    leading one; axis 0 for 1-D), in pieces of about 32 MiB of float64 (_gradient_pieces)."""
     if axes is None:
         axes = tuple(range(1, orig.ndim)) if orig.ndim > 1 else (0,)
-    axes = tuple(ax % orig.ndim for ax in axes)
-    n = orig.shape[0]
-    step = max(1, n) if 0 in axes else max(1, (32 << 20) // (8 * max(1, int(np.prod(orig.shape[1:])))))
     err_sum = ori_sum = 0.0
     with np.errstate(invalid="ignore"):
-        for start in range(0, n, step):
-            o = orig[start:start + step].astype(np.float64, copy=False)
-            d = decoded[start:start + step].astype(np.float64, copy=False)
-            for ax in axes:
-                do, dd = np.diff(o, axis=ax), np.diff(d, axis=ax)
+        for ax in sorted({a % orig.ndim for a in axes}):
+            for sl in _gradient_pieces(orig.shape, ax, max_elems):
+                do = np.diff(orig[sl].astype(np.float64), axis=ax)
+                dd = np.diff(decoded[sl].astype(np.float64), axis=ax)
                 m = np.isfinite(do) & np.isfinite(dd)
-                if m.any():
-                    err_sum += float(np.abs(dd[m] - do[m]).sum())
-                    ori_sum += float(np.abs(do[m]).sum())
-                del do, dd, m
+                dd -= do
+                np.abs(dd, out=dd)
+                np.abs(do, out=do)
+                err_sum += float(np.sum(dd, where=m))
+                ori_sum += float(np.sum(do, where=m))
     if ori_sum == 0:
         return 0.0 if err_sum == 0 else float("inf")
     return err_sum / ori_sum
@@ -1055,67 +1116,36 @@ def _gradient_rel_l1(orig: np.ndarray, decoded: np.ndarray, axes=None) -> float:
 # =============================================================================
 
 def persist_with_codec_pipeline(da, store, component: str, codec_kwargs: dict, inner_chunks, shards,
-                                verify: bool = True, q99_abs=None):
-    """Write dask-backed `da` to `store` at `component`; returns (compression_ratio, errors,
-    euclidean_distance), the last two None unless `verify` re-reads the store.  One dask task
-    writes one shard (one chunk when unsharded), so no two tasks write the same object."""
-    assert isinstance(da.data, dask.array.Array), "expects a dask-backed xr.DataArray"
-    write_unit = shards if shards is not None else inner_chunks
-    zarr_kwargs = dict(zarr_format=3, dimension_names=tuple(da.dims), chunks=inner_chunks, **codec_kwargs)
-    if shards is not None:
-        zarr_kwargs["shards"] = shards
+                                verify: bool = True, q99_abs=None, bounds=None):
+    """Write dask-backed `da`, whose blocks hold whole write units (shards, else inner chunks), to `store`
+    at `component`, one task per block: with `verify` the task re-reads what it wrote and adds up the error
+    sums of its block, so the field is read once.  Returns (compression_ratio, errors, euclidean_distance),
+    the last two None without `verify`."""
+    data = da.data
+    assert isinstance(data, dask.array.Array), "expects a dask-backed xr.DataArray"
+    unit = shards if shards is not None else inner_chunks
+    assert all(x % u == 0 for c, u in zip(data.chunks, unit) for x in c[:-1]), "blocks must hold whole write units"
+    z = zarr.create_array(store=store, name=component, shape=data.shape, dtype=data.dtype, chunks=inner_chunks,
+                          shards=shards, zarr_format=3, dimension_names=tuple(da.dims), overwrite=True,
+                          **codec_kwargs)
+    want_q99 = verify and q99_abs is not None and math.isfinite(q99_abs)
 
-    with Timer("dask.array.to_zarr"):
-        dask.array.to_zarr(da.data.rechunk(write_unit), store, component=component,
-                           overwrite=True, compute=True, **zarr_kwargs)
+    def write(block, region):
+        z[region] = block
+        return _error_sums(np.asarray(block), z[region], inner_chunks, q99_abs if want_q99 else None,
+                           bounds) if verify else None
 
-    # use_consolidated=False: consolidated metadata written before this array does not list it.
-    z = zarr.open_group(store, mode="r", use_consolidated=False)[component]
+    starts = [np.concatenate(([0], np.cumsum(c)[:-1])) for c in data.chunks]
+    tasks = [dask.delayed(write)(block, tuple(slice(int(s[i]), int(s[i] + c[i]))
+                                              for s, c, i in zip(starts, data.chunks, idx)))
+             for idx, block in zip(np.ndindex(*data.numblocks), data.to_delayed().ravel())]
+    with Timer("persist.write"):
+        parts = dask.compute(*tasks)
     count_bytes, count_bytes_stored = _info_bytes(z.info_complete())
-    ratio = count_bytes / count_bytes_stored
-
-    errors = euclidean_distance = None
-    if verify:
-        with Timer("compute_errors_distances"):
-            errors, euclidean_distance = compute_errors_distances(
-                dask.array.from_zarr(z, chunks=write_unit), da.data, q99_abs=q99_abs)
-    return ratio, errors, euclidean_distance
-
-
-def compute_errors_distances(da_compressed, da, q99_abs=None):
-    """(errors, l2_error) of two dask arrays in one dask.compute, masked like evaluate_codec_pipeline
-    and with its keys except N_Valid and Grad_Rel."""
-    da, da_compressed = da.astype(np.float64), da_compressed.astype(np.float64)  # integer squares would wrap
-    finite_orig, finite_dec = np.isfinite(da), np.isfinite(da_compressed)
-    valid = finite_orig & finite_dec
-    o = dask.array.where(valid, da, 0)
-    dec = dask.array.where(valid, da_compressed, np.nan)  # so nanmin/nanmax skip the masked cells
-    err = dask.array.where(valid, da_compressed, 0) - o
-    reductions = [
-        np.abs(err).sum(), np.abs(o).sum(),
-        np.sqrt((err ** 2).sum()), np.sqrt((o ** 2).sum()),
-        np.abs(err).max(), np.abs(o).max(),
-        err.sum(), (finite_orig & ~finite_dec).sum(),
-        dask.array.nanmin(dec), dask.array.nanmax(dec),
-    ]
-    if q99_abs is not None:
-        tail = np.abs(o) >= float(q99_abs)
-        reductions += [dask.array.where(tail, np.abs(err), 0.0).sum(),
-                       dask.array.where(tail, np.abs(o), 0.0).sum()]
-    with warnings.catch_warnings():
-        warnings.filterwarnings("ignore", message="All-NaN slice encountered")
-        computed = dask.compute(*reductions)
-    l1e, l1o, l2e, l2o, linfe, linfo, signed, ncorrupt, dmin, dmax = computed[:10]
-    errors = {
-        "Relative_Error_L1": _rel(l1e, l1o),
-        "Relative_Error_L2": _rel(l2e, l2o),
-        "Relative_Error_Linf": _rel(linfe, linfo),
-        "Bias_Rel": _rel(abs(float(signed)), l1o),
-        "Decoded_Min": float(dmin), "Decoded_Max": float(dmax),
-        "N_Corrupt": int(ncorrupt),
-        "Q99_Rel": _rel(computed[10], computed[11]) if q99_abs is not None else None,
-    }
-    return errors, l2e
+    if not verify:
+        return count_bytes / count_bytes_stored, None, None
+    errors, l2_err = _errors_from_sums(_merge_sums(parts), want_q99)
+    return count_bytes / count_bytes_stored, errors, l2_err
 
 
 # =============================================================================
@@ -1148,10 +1178,9 @@ def detect_physical_cores() -> int:
     return max(1, min(avail, psutil.cpu_count(logical=False) or avail))
 
 
-def check_thread_oversubscription(abort_if_unsafe: bool = True, rank: int = 0, comm=None) -> None:
-    """Warn on rank 0 when a THREAD_ENV_VARS entry is not 1, then MPI Abort unless `abort_if_unsafe`
-    is off (not a collective: the first rank to call it ends the job)."""
-    comm = comm or MPI.COMM_WORLD
+def check_thread_oversubscription(abort_if_unsafe: bool = True, rank: int = 0) -> None:
+    """Warn on rank 0 when a THREAD_ENV_VARS entry is not 1, then end the job (abort) unless
+    `abort_if_unsafe` is off (not a collective: the first rank to call it ends the job)."""
     problems = []
     for v in THREAD_ENV_VARS:
         val = os.environ.get(v)
@@ -1169,7 +1198,7 @@ def check_thread_oversubscription(abort_if_unsafe: bool = True, rank: int = 0, c
             if abort_if_unsafe:
                 click.echo("  Aborting (use --no-oversubscription-check to override).")
         if abort_if_unsafe:
-            comm.Abort(1)
+            abort(1)
 
 
 # =============================================================================
