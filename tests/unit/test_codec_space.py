@@ -66,6 +66,13 @@ def test_config_space_order_is_deterministic_and_capped():
     assert [utils.pipeline_json(*c) for c in a] == [utils.pipeline_json(*c) for c in b] and len(a) == 50
 
 
+def test_max_evals_subsets_nest():
+    """A quick test with a small cap, then a larger one: the larger sweep reuses the smaller one's rows."""
+    small = {utils.pipeline_json(*c) for c in utils_cli.sweep_config_space(*space("float32"), 10, 1, np.dtype("float32"), True)}
+    large = {utils.pipeline_json(*c) for c in utils_cli.sweep_config_space(*space("float32"), 40, 1, np.dtype("float32"), True)}
+    assert small < large
+
+
 def test_max_evals_spans_the_space():
     """--max-evals takes a uniform subset, not the first compressor's combos."""
     cs = utils_cli.sweep_config_space(*space("float32"), 300, 1, np.dtype("float32"), True)

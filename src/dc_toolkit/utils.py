@@ -256,13 +256,15 @@ def minimum_sample(da: xr.DataArray) -> tuple:
 
 def build_representative_sample(da: xr.DataArray, size_limit_bytes: int, rank: int = 0,
                                 policy: str = "cascade", vertical_floor: int | None = None,
-                                candidates: Optional[dict] = None) -> xr.DataArray:
+                                candidates: Optional[dict] = None, extremes: Optional[dict] = None) -> xr.DataArray:
     """Deterministic subset of `da` within `size_limit_bytes`, but never below minimum_sample:
     along each time and vertical dim, the middle index of equal blocks of its `candidates` (dim ->
     indices; default all), e.g. the levels on which the field varies (without such dims, the whole
-    field and a warning).  "cascade" keeps its floor of levels, then spends the budget on time steps;
-    "balanced" splits it evenly in log space.  Raises SampleTooLargeError when one horizontal slab
-    does not fit."""
+    field and a warning).  `extremes` (dim -> per-index values, e.g. each level's minimum when a lower
+    bound is gated): when the chosen indices miss the minimum of such values, the nearest one is swapped
+    for the index attaining it, so the sample reaches the field's approach to the bound.  "cascade"
+    keeps its floor of levels, then spends the budget on time steps; "balanced" splits it evenly in log
+    space.  Raises SampleTooLargeError when one horizontal slab does not fit."""
     nbytes = int(da.nbytes)
     if nbytes <= size_limit_bytes:
         if rank == 0:
@@ -302,12 +304,23 @@ def build_representative_sample(da: xr.DataArray, size_limit_bytes: int, rank: i
     for _, name in stride_dims:
         c, n_keep = cand[name], plan[name]
         if n_keep < da.sizes[name]:  # block midpoints: the ends of a dim (model top, first step) are the least typical
-            isel[name] = c[((np.arange(n_keep) + 0.5) * c.size / n_keep).astype(int)].tolist()
+            chosen = c[((np.arange(n_keep) + 0.5) * c.size / n_keep).astype(int)]
+            pinned = set()  # positions an earlier extreme swapped in
+            for v in (extremes or {}).get(name, []):
+                v = np.asarray(v, dtype=float)
+                target = v[c].min()
+                free = [i for i in range(chosen.size) if i not in pinned]
+                if free and np.isfinite(target) and v[chosen].min() > target:
+                    at = int(c[np.flatnonzero(v[c] == target)[0]])
+                    i = min(free, key=lambda i: abs(int(chosen[i]) - at))
+                    chosen[i] = at
+                    pinned.add(i)
+            isel[name] = sorted(chosen.tolist())
     sampled = da.isel(isel) if isel else da
 
     if rank == 0:
         strided = ", ".join(f"{n}={plan[n]}/{da.sizes[n]}"
-                            + (f" {isel[n]}" if n in isel and len(isel[n]) <= 8 else "")
+                            + (f" {isel[n]}" if n in isel else "")
                             + (f" (of the {cand[n].size} that vary)" if cand[n].size < da.sizes[n] else "")
                             for _, n in stride_dims)
         spatial = (" | preserved spatial: " + ", ".join(d for _, d in spatial_dims)) if spatial_dims else ""
@@ -715,6 +728,7 @@ class FieldScan:
     nonfinite: int          # NaN and Inf cells
     varying: dict           # dim -> bool per index: the single time dim's and single vertical dim's indices
                             # holding more than one finite value
+    index_range: dict       # dim -> (min, max) per index over its finite values, for the same dims
 
 
 def scan_field(da, comm=None) -> FieldScan:
@@ -764,7 +778,8 @@ def scan_field(da, comm=None) -> FieldScan:
             comm.Allreduce(MPI.IN_PLACE, hi, op=MPI.MAX)
     finite = not failed and np.isfinite(dmin) and np.isfinite(dmax)
     return FieldScan(range=(float(dmin), float(dmax)) if finite else None, readable=not failed,
-                     nonfinite=int(nonfinite), varying={n: hi > lo for n, (_, lo, hi) in per_index.items()})
+                     nonfinite=int(nonfinite), varying={n: hi > lo for n, (_, lo, hi) in per_index.items()},
+                     index_range={n: (lo, hi) for n, (_, lo, hi) in per_index.items()})
 
 
 def fixed_scale_offset_configs(da, data_range=None):

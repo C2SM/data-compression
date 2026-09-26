@@ -59,6 +59,17 @@ def test_skip_existing_checks_the_drift_against_this_runs_prediction(swept_copy)
     assert "short of the sweep's; rewriting it" in invoke("compress", src, out, "--cr-drift-gate", code=1).output
 
 
+def test_pipeline_goes_on_with_a_superseded_manifest(swept_copy):
+    """An explicit pipeline needs no winner: a manifest a later sweep superseded still supplies the gates."""
+    src, out = swept_copy
+    m = json.loads((out / "manifest_t.json").read_text())
+    m["sweep_state_digest"] = "other"
+    (out / "manifest_t.json").write_text(json.dumps(m))
+    invoke("compress", src, out, code=1)  # the winner is not trusted
+    res = invoke("compress", src, out, "--vars", "t", "--pipeline", json.dumps(m["best"]["pipeline"]))
+    assert "--pipeline takes only its gates and chunk geometry" in res.output and "[verify-gate] t: PASS" in res.output
+
+
 def test_an_array_without_a_record_is_rewritten(swept_copy):
     src, out = swept_copy
     store = out / (os.path.basename(src)[:-3] + ".zarr")

@@ -651,7 +651,8 @@ Zero error at a ratio of 1.6: the price of "no error at all", next to 7.6 for a 
 
 **Only some codecs.** `--compressor-class`, `--filter-class` and `--serializer-class` each restrict one stage
 to one family, for example `--compressor-class zstd --serializer-class pcodec`. `none` means "leave this
-stage out". For serializers, `all` includes plain bytes and `none` is plain bytes alone.
+stage out". For compressors and filters `all` never leaves the stage out (except `--without-lossy`, which keeps no
+filter for a float field); for serializers, `all` includes plain bytes and `none` is plain bytes alone.
 
 **Protect the physics.** Three gates go beyond average error:
 
@@ -681,8 +682,8 @@ instead: a ratio of 9.1 rather than 12.0, which is what portability costs here. 
 everything already, so nothing is re-run. An array that was written earlier with such a codec is rewritten.
 
 **Back to NetCDF.** `dc_toolkit from_zarr_to_netcdf STORE.zarr --out file.nc` writes the store's fields to a
-NetCDF file. A `compress` store holds only the fields, with their dimension names but no coordinate values
-or attributes (units), so the file has none either.
+NetCDF file (an existing file needs `--overwrite`). A `compress` store holds only the fields, with their dimension names and
+attributes (units) but no coordinate values, so the file has no coordinates either.
 
 ---
 

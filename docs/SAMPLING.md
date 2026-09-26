@@ -77,7 +77,7 @@ Both keep at least 3 time steps and 3 levels. For the native R02B10 `qc` field (
 | 10 GiB | 32 | 4 × 8 = 10.0 GiB | 5 × 6 = 9.4 GiB |
 | 30 GiB | 96 | 8 × 12 | 8 × 12 |
 
-The 30 GiB row needs 10 ranks per node or fewer (the cap of step 2). A 2-D field has no levels to split: the R02B10
+The 30 GiB row needs 10 ranks per node or fewer (the cap of step 4). A 2-D field has no levels to split: the R02B10
 `tot_prec` (96 quarter-hourly steps, 30 GiB) keeps 3 time steps at 1 GiB and 6 at 2 GiB.
 
 ### 4. Which indices
@@ -102,6 +102,11 @@ that varies on 2 levels only keeps those 2. The log line says what was kept:
 
 and adds `(of the 80 that vary)` after the levels in the cloud field's case.
 
+With `--phys-min` or `--phys-max` the sample also reaches the field's approach to the bound: when no chosen time
+step or level holds the field's lowest (highest) value, the chosen index nearest to the one that does is swapped for
+it, so the bounds gate sees what `compress` will verify on the whole field. Geopotential with `--phys-min 0` comes
+nearest 0 at the ground: the lowest level replaces the deepest midpoint (20, 60, 119 instead of 20, 60, 100).
+
 ### 5. Scan, read, share
 
 Before the sample is built, all ranks read the whole field once, block by block (the blocks split across the ranks,
@@ -112,7 +117,7 @@ one in memory per rank, a failed read retried once). The scan finds:
   `--phys-min` or `--phys-max` is reported (the bounds gate counts only the cells a pipeline moves across);
 - the number of NaN and Inf cells. When the field holds any, the codecs that cannot give them back
   (FixedScaleOffset, zfp, Delta on floats, EBCC) are left out, wherever the NaN lie;
-- for the time dimension and the vertical dimension (when the field has one of each), the indices on which the field
+- for the time dimension and for the vertical dimension (each when the field has exactly one such dimension), the indices on which the field
   takes more than one finite value: the candidates of step 4.
 
 A field that cannot be read in full is skipped (an error when it was named with `--field-to-compress`), and a field

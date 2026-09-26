@@ -1,5 +1,7 @@
 """Every command end to end on the bundled TIGGE file, one rank, in-process."""
 import json
+import os
+import pathlib
 import re
 import shutil
 
@@ -67,6 +69,7 @@ def test_manifest_records_provenance_and_the_state(swept):
     from dc_toolkit import utils_cli
     assert m["sweep_state_digest"] == utils_cli.state_digest(state)
     assert m["provenance"]["dc_toolkit"] and m["num_rows"] == 30 and m["num_filtered"] == 30 - m["num_passed"]
+    assert all(os.path.isabs(p) for p in (m["where_to_write"], *m["outputs"].values()))
     assert {"code", "bounds", "metric_definitions", "row_columns", "env"} <= set(state)
 
 
@@ -125,6 +128,11 @@ def test_compress_failures_exit_1(tigge, sweep_copy, tmp_path):
     invoke("compress", tigge, sweep_copy, "--vars", "t,zz", code=1)
     assert json.loads((sweep_copy / "batch_manifest.json").read_text())["results"]["zz"]["status"] == "no-pipeline"
     invoke("merge_compressed_fields", tigge, tmp_path / "nowhere", code=1)
+    (tmp_path / "bare" / STORE).mkdir(parents=True)  # a directory named like the store, not a store
+    assert "not a zarr store" in invoke("merge_compressed_fields", tigge, tmp_path / "bare", code=1).output
+    assert "is not a zarr store" in invoke("open_zarr_and_inspect", tmp_path / "bare" / STORE, code=1).output
+    assert "does not exist" in invoke("from_zarr_to_netcdf", sweep_copy / STORE, "--out", tmp_path / "no" / "x.nc",
+                                      code=1).output
     (tmp_path / "empty").mkdir()
     invoke("compress", tigge, tmp_path / "empty", code=1)
 
@@ -157,15 +165,35 @@ def test_conversions_round_trip(tigge, tmp_path):
     invoke("from_nc_to_zarr", tigge, "--out", z)
     invoke("from_nc_to_zarr", tigge, "--out", z, code=1)  # exists, no --overwrite
     invoke("from_zarr_to_netcdf", z, "--out", nc)
+    invoke("from_zarr_to_netcdf", z, "--out", nc, code=1)  # exists, no --overwrite
+    invoke("from_zarr_to_netcdf", z, "--out", nc, "--overwrite")
     src, back = xr.open_dataset(tigge), xr.open_dataset(nc)
     for var in ("t", "q"):
         assert np.array_equal(src[var].values, back[var].values, equal_nan=True)
 
 
+def test_the_round_trip_keeps_the_declared_fill(fields, tmp_path):
+    """A from_nc_to_zarr store back to netCDF keeps the source's _FillValue (-9.99e-08), not xarray's NaN."""
+    invoke("from_nc_to_zarr", fields["nan"], "--out", tmp_path / "nan.zarr")
+    invoke("from_zarr_to_netcdf", tmp_path / "nan.zarr", "--out", tmp_path / "back.nc")
+    raw = {p: xr.open_dataset(p, mask_and_scale=False)["sst"] for p in (fields["nan"], str(tmp_path / "back.nc"))}
+    src, back = raw.values()
+    assert back.attrs["_FillValue"] == src.attrs["_FillValue"] and np.array_equal(src.values, back.values)
+
+
+def test_the_default_round_trip_does_not_overwrite_the_source(tigge_copy, tmp_path):
+    """from_nc_to_zarr X.nc makes X.zarr; from_zarr_to_netcdf X.zarr defaults to X.nc, the source."""
+    before = pathlib.Path(tigge_copy).read_bytes()
+    invoke("from_nc_to_zarr", tigge_copy)
+    out = invoke("from_zarr_to_netcdf", tigge_copy[:-3] + ".zarr", code=1).output
+    assert "Output already exists" in out and pathlib.Path(tigge_copy).read_bytes() == before
+
+
 def test_compressed_store_back_to_netcdf(tigge, sweep_copy, tmp_path):
     invoke("compress", tigge, sweep_copy)
     invoke("from_zarr_to_netcdf", sweep_copy / STORE, "--out", tmp_path / "c.nc")
-    assert set(xr.open_dataset(tmp_path / "c.nc").data_vars) == {"t", "q"}
+    back = xr.open_dataset(tmp_path / "c.nc")
+    assert set(back.data_vars) == {"t", "q"} and back["t"].attrs["units"] == xr.open_dataset(tigge)["t"].attrs["units"]
 
 
 def test_sweep_of_a_zarr_input(tigge, tmp_path):

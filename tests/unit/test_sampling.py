@@ -60,6 +60,25 @@ def test_midpoints_among_the_levels_that_vary():
     assert list(s.height.values) == [53, 80, 106] and list(s.time.values) == [1, 4, 6]
 
 
+def test_extremes_swap_in_the_index_nearest_a_bound():
+    lo = np.arange(120)[::-1].astype(float)  # the lowest value on the last level
+    s = utils.build_representative_sample(da3(), int(3.2 * SLAB), rank=1, extremes={"height": [lo]})
+    assert list(s.height.values) == [20, 60, 119]
+    s = utils.build_representative_sample(da3(), int(3.2 * SLAB), rank=1, extremes={"height": [np.zeros(120)]})
+    assert list(s.height.values) == [20, 60, 100]  # attained by a chosen level already: unchanged
+    s = utils.build_representative_sample(da3(), int(3.2 * SLAB), rank=1, candidates={"height": np.arange(40, 120)},
+                                          extremes={"height": [lo]})
+    assert list(s.height.values) == [53, 80, 119]
+    hi_at_118 = np.arange(120).astype(float)  # a second extreme (a maximum, passed negated) on the level before
+    hi_at_118[118] = 200
+    s = utils.build_representative_sample(da3(), int(3.2 * SLAB), rank=1, extremes={"height": [lo, -hi_at_118]})
+    assert list(s.height.values) == [20, 118, 119]  # both bounds kept: the second swap spares the first
+    hi_at_100 = np.arange(120).astype(float)
+    hi_at_100[100] = 200
+    s = utils.build_representative_sample(da3(), int(3.2 * SLAB), rank=1, extremes={"height": [lo, -hi_at_100]})
+    assert list(s.height.values) == [20, 100, 119]
+
+
 def test_all_candidates_kept_when_they_fit():
     s = utils.build_representative_sample(da3(), int(40 * SLAB), rank=1, candidates={"height": np.array([3, 7])})
     assert list(s.height.values) == [3, 7]

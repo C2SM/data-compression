@@ -81,6 +81,15 @@ def test_header_only_rank_csvs_keep_the_metrics_numeric(tmp_path):
     assert list(utils_cli.reusable_rows(prev, None, opts, thr)) == [True]
 
 
+def test_an_unreadable_rank_csv_fails_the_consolidation(tmp_path):
+    """Results without a rank's rows would pass for complete; only a resume sets the file aside."""
+    (tmp_path / "config_space_t_rank0.csv").write_bytes(b"\xff\xfe\x00garbage\x00" * 8)
+    with pytest.raises(click.ClickException, match="run the sweep again with --resume"):
+        utils_cli.read_rank_csvs(tmp_path, "t")
+    assert len(utils_cli.read_rank_csvs(tmp_path, "t", quarantine=True)) == 0
+    assert (tmp_path / "config_space_t_rank0.csv.unreadable").is_file()
+
+
 def test_measurement_digest_is_stable():
     assert utils_cli.measurement_digest() == utils_cli.measurement_digest() and len(utils_cli.measurement_digest()) == 16
 
@@ -154,6 +163,13 @@ def test_a_lock_from_another_cluster_is_alive(monkeypatch):
     assert not utils_cli._lock_owner_alive({"slurm_job_id": "5", "slurm_step_id": "0", "slurm_cluster": "there"})
 
 
+def test_lock_owner_text():
+    assert utils_cli._lock_owner_text({"host": "h", "pid": 1, "slurm_job_id": "7", "slurm_step_id": "2",
+                                       "slurm_cluster": "c", "time": "t"}) == "host h, pid 1, Slurm step 7.2 on c, since t"
+    assert utils_cli._lock_owner_text({"host": "h", "pid": 1, "slurm_job_id": "7", "time": "t"}) == "host h, pid 1, Slurm job 7, since t"
+    assert utils_cli._lock_owner_text({"host": "h", "pid": 1, "time": "t"}) == "host h, pid 1, since t"
+
+
 def test_a_lock_of_this_very_step_is_an_earlier_incarnation(monkeypatch):
     """A requeued job reruns its steps under the same ids: their old locks are stale unless the pid lives here."""
     monkeypatch.delenv("SLURM_CLUSTER_NAME", raising=False)
@@ -196,7 +212,7 @@ def _store_with(path, names):
     return g
 
 
-def test_promote_replaces_and_consolidate_discards_leftovers(tmp_path):
+def test_promote_replaces_and_consolidate_discards_leftovers(tmp_path, capsys):
     merged = tmp_path / "d.zarr"
     _store_with(merged, ["t"])
     utils_cli.consolidate_store(str(merged))
@@ -208,6 +224,9 @@ def test_promote_replaces_and_consolidate_discards_leftovers(tmp_path):
     _store_with(utils_cli.staging_path(str(merged)), ["q"])  # a killed run's unfinished write
     assert utils_cli.consolidate_store(str(merged)) == ["t"]
     assert not utils_cli.staging_path(str(merged)).exists()
+    _store_with(utils_cli.staging_path(str(merged)), [])  # a failed gate leaves only the staging group's zarr.json
+    capsys.readouterr()
+    assert utils_cli.consolidate_store(str(merged)) == ["t"] and "discarding" not in capsys.readouterr().out
 
 
 def test_promote_of_a_new_array_drops_the_listing(tmp_path):

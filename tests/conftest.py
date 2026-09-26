@@ -57,7 +57,7 @@ def fields(tmp_path_factory):
     def smooth(t):
         return 285 + 15 * np.cos(LAT) + 3 * np.sin(2 * LON + 0.3 * t) * np.cos(LAT) ** 2
 
-    paths = {k: str(out / f"{k}.nc") for k in ("edge", "nan", "icon", "map", "ens", "diag")}
+    paths = {k: str(out / f"{k}.nc") for k in ("edge", "nan", "icon", "map", "ens", "diag", "geo")}
     xr.Dataset({  # constant, all-zero, constant uint8, all-NaN
         "const": (("time", "height", "lat", "lon"), np.full((4, 5, 46, 90), 273.15, "f4")),
         "zeros": (("time", "height", "lat", "lon"), np.zeros((4, 5, 46, 90), "f4")),
@@ -68,7 +68,7 @@ def fields(tmp_path_factory):
     sst = np.stack([smooth(t) for t in range(6)]).astype("f4")  # an SST whose land cells are NaN fill
     sst[:, (np.sin(3 * LON) * np.cos(LAT) > 0.35) | (np.abs(lat)[:, None] > 75)] = np.nan
     xr.Dataset({"sst": (("time", "lat", "lon"), sst, {"units": "K"})},
-               coords={"time": _tcoord(6), **ll}).to_netcdf(paths["nan"])
+               coords={"time": _tcoord(6), **ll}).to_netcdf(paths["nan"], encoding={"sst": {"_FillValue": np.float32(-9.99e-08)}})
 
     T, H, N = 8, 30, 5000  # ICON-like columns; slab 20 kB, minimum sample 3 x 3 slabs
     qc = np.zeros((T, H, N), "f4")
@@ -98,6 +98,11 @@ def fields(tmp_path_factory):
         d[t, (t + 1) % 8] = rng.normal(0, 1, 500)
     xr.Dataset({"d": (("time", "height", "ncells"), d)},
                coords={"time": _tcoord(8), "height": _hcoord(8)}).to_netcdf(paths["diag"])
+
+    geo = (1000.0 * (11 - np.arange(12))[None, :, None] + rng.normal(0, 3, (4, 12, 500))).astype("f4")
+    geo[:, 11] = np.linspace(0.001, 5.0, 500, dtype="f4")  # geopotential-like: nearest 0 on the lowest level only
+    xr.Dataset({"geo": (("time", "height", "ncells"), geo, {"units": "m2 s-2", "valid_min": np.nan, "code": 6})},
+               coords={"time": _tcoord(4), "height": _hcoord(12)}).to_netcdf(paths["geo"])
     return paths
 
 

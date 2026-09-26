@@ -238,7 +238,9 @@ _VERIFY_THRESHOLD_OPTIONS = [
 @click.option("--pipeline", default=None,
               help="Write the --vars fields with this pipeline instead of the sweep's best: a JSON object "
                    "with compressor, filter and serializer, or the path of a file holding one; a "
-                   "manifest_{var}.json works directly.")
+                   "manifest_{var}.json works directly.  A manifest_{var}.json in WHERE_TO_WRITE still supplies "
+                   "the verify gate's thresholds and bounds and the chunk geometry, even one a later sweep "
+                   "superseded.")
 @click.option("--stock-codecs-only", is_flag=True, default=False,
               help="Write only pipelines a zarr client without dc_toolkit can decode: when the sweep's best uses a codec "
                    "that needs dc_toolkit's zarr.codecs entry point (numcodecs.zfpy_flat, numcodecs.ebcc_filter), "
@@ -257,7 +259,8 @@ _VERIFY_THRESHOLD_OPTIONS = [
               help="Skip a field the store already holds as this run would write it: same source file "
                    "(path, size, mtime), pipeline, chunks and verify gate, and under --cr-drift-gate a ratio "
                    "within --cr-drift-tol; rewrite it otherwise.  A field only appears there once its write and "
-                   "gates succeeded, so failed or interrupted fields are retried.")
+                   "gates succeeded (or --no-verify-gate let it through; a gating run rewrites it), so failed or "
+                   "interrupted fields are retried.")
 @click.option("--continue-on-error/--no-continue-on-error", default=True, show_default=True,
               help="Log and go on when a field fails instead of stopping at the first failure.  "
                    "The exit status is 1 either way when any field failed.")
@@ -335,6 +338,8 @@ def from_nc_to_zarr(ctx, **_):
 @click.argument("zarr_path", type=click.Path(exists=True, dir_okay=True, file_okay=False))
 @click.option("--out", "out_nc", type=click.Path(dir_okay=False), default=None,
               help="Output NetCDF file (default: input path with .nc).")
+@click.option("--overwrite/--no-overwrite", default=False, show_default=True,
+              help="Replace an existing output (the default output of a store from_nc_to_zarr made is its source file).")
 @click.option("--max-size", default="50GB", callback=utils_cli.size_option_callback, show_default=True,
               help="Refuse to write when the logical output exceeds this size.")
 @click.option("--compression", type=click.Choice(["zlib", "none"], case_sensitive=False), default="zlib",

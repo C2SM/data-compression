@@ -24,6 +24,8 @@ def test_range_nonfinite_and_varying():
     assert scan.readable and scan.range == (-2.0, 5.0) and scan.nonfinite == 3
     assert list(scan.varying["time"]) == [False, True, False, False]
     assert list(scan.varying["height"]) == [False, False, False, True, False, False]
+    lo, hi = scan.index_range["height"]
+    assert (lo[3], hi[3]) == (-2.0, 5.0) and (lo[0], hi[0]) == (0.0, 0.0) and (lo[4], hi[4]) == (0.0, 0.0)
 
 
 @pytest.mark.parametrize("fill, want", [(0.0, (0.0, 0.0)), (np.nan, None)])

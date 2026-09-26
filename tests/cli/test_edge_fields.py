@@ -72,6 +72,22 @@ def test_a_field_varying_on_few_levels_is_sampled_there(fields, tmp_path):
     assert "height=3/30 [0, 1, 2] (of the 3 that vary)" in out
 
 
+def test_a_bounded_field_is_sampled_where_it_nears_the_bound(fields, tmp_path):
+    """The lowest level, where geopotential comes nearest 0, replaces the deepest midpoint under --phys-min 0, so
+    the sweep's bounds gate sees the cells compress verifies on the whole field."""
+    space = ("--compressor-class", "none", "--filter-class", "none", "--serializer-class", "zfpy",
+             "--l1-threshold", "0.01", "--eval-data-size-limit", "1KB")
+    out = invoke("evaluate_combos", fields["geo"], "--where-to-write", tmp_path, "--phys-min", "0", *space).output
+    assert "strided time=3/4 [0, 2, 3], height=3/12 [2, 6, 11]" in out
+    out = invoke("compress", fields["geo"], tmp_path, "--no-verify-gate").output  # the winner keeps the bound
+    assert "[verify-gate] geo: PASS" in out or "n_bounds=0" in out
+    invoke("from_zarr_to_netcdf", tmp_path / "geo.zarr", "--out", tmp_path / "back.nc")
+    attrs = xr.open_dataset(tmp_path / "back.nc")["geo"].attrs  # the NaN attribute stays out of the store
+    assert attrs["units"] == "m2 s-2" and attrs["code"] == 6 and "valid_min" not in attrs
+    out = invoke("evaluate_combos", fields["geo"], "--where-to-write", tmp_path / "unbounded", *space).output
+    assert "height=3/12 [2, 6, 10]" in out
+
+
 def test_named_field_whose_sample_does_not_vary_is_an_error(fields, tmp_path):
     out = invoke("evaluate_combos", fields["diag"], "--where-to-write", tmp_path, "--field-to-compress", "d",
                  "--l1-threshold", "0.01", "--eval-data-size-limit", "1KB", code=1).output
