@@ -622,6 +622,27 @@ The height and width are those of your (lat, lon) frame: the last two numbers of
 above 2047 takes the largest divisor of it between 32 and 2047, as a sweep does). An EBCC pipeline from a sweep can
 also be reused through `--pipeline path/to/manifest_t.json`, as long as the frame size is the same.
 
+### Fields that sit on a bound
+
+EBCC keeps every cell within its error bound, but not within the field's range. After encoding a tile it
+shifts the whole tile by its mean error: the tile's mean comes out exact, and so do none of its zeros. The dry
+cells of a precipitation field come back slightly negative, or all slightly positive. Two settings keep
+that out of a store:
+
+- `--phys-min 0` (section 9): the sweep drops every pipeline that moves a cell below 0 on the sample, and
+  `compress` checks every cell of the field again;
+- `export EBCC_DISABLE_MEAN_ADJUSTMENT=1` for `evaluate_combos` and `compress` alike: EBCC no longer shifts
+  the tile, and a tile it stores as JPEG 2000 alone stays within its own minimum and maximum, most of its
+  zeros exactly 0. A tile that also carries EBCC's correction layer can still undershoot by up to the error
+  bound, so keep `--phys-min`. The mean is no longer exact (the bias gate still applies), and the files
+  come out slightly smaller: EBCC stops holding back 1 % of the bound for the shift.
+
+The library only checks that the variable exists: `=0` switches the shift off too, and only
+`unset EBCC_DISABLE_MEAN_ADJUSTMENT` brings it back. `srun` hands it to every rank (Open MPI's `mpirun`
+across nodes needs `-x EBCC_DISABLE_MEAN_ADJUSTMENT`). The manifest and `sweep_state_{var}.json` record
+EBCC's variables: `--resume` does not mix rows measured with and without it, and `compress` warns when its
+environment differs from the sweep's.
+
 ### Reading an EBCC store
 
 An EBCC array can only be opened where `dc_toolkit[ebcc]` is installed. See section 9 if your store must

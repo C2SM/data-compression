@@ -160,6 +160,11 @@ refuses it up front when the field has `NaN`/`Inf` or values beyond float32, is 
 filter, or has a frame the tile does not divide.  Keep `--eval-data-size-limit` small on EBCC sweeps: a 5 GB sample takes
 about an hour per EBCC combo per core.
 
+EBCC also reads switches from the environment ([its README](https://github.com/spcl/EBCC#extra-configurations-through-environment-variables));
+the toolkit passes them through, records them in the manifest and the sweep state, and warns when `compress` runs
+with other values than the sweep.  For a field that sits on a bound (precipitation), export
+`EBCC_DISABLE_MEAN_ADJUSTMENT=1` for both commands and keep `--phys-min 0`: see [docs/intro.md](docs/intro.md), section 8.
+
 ## Reading a store without dc_toolkit
 
 Every codec `compress` writes decodes in a zarr client without dc_toolkit (given numcodecs, `pcodec` and `zfpy`) except two, which exist only through

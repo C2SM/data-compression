@@ -27,6 +27,9 @@
 #                            indentation, blank lines and # lines are ignored)
 #   MAX_EVALS=N              cap the codec space (quick test runs)
 #   WITH_EBCC=1              add the EBCC combos (float (lat, lon) fields; needs the ebcc package)
+#   EBCC_DISABLE_MEAN_ADJUSTMENT=1  EBCC's own switch, passed through with the rest of the environment: keeps
+#                            a tile EBCC stores as JPEG 2000 alone within its range (docs/intro.md,
+#                            section 8); any value switches the shift off, unset it to go back
 #   COMPRESS=1               write each swept field with its best pipeline and verify it (one task)
 #   STOCK_CODECS_ONLY=1      with COMPRESS=1: only pipelines a zarr client without dc_toolkit decodes
 #   REWRITE_EXISTING=1       with COMPRESS=1: rewrite a field the store already holds as requested
@@ -86,6 +89,7 @@ JOB_END=${SLURM_JOB_END_TIME:-}     # epoch seconds; empty outside a job, which 
 echo "[santis.run] topology : up to ${SLURM_NTASKS_PER_NODE:-32} rank(s)/node x ${SLURM_JOB_NUM_NODES:-?} node(s), one shared sample per node"
 echo "[santis.run] data root: $DYAMOND_DATA_ROOT"
 echo "[santis.run] knobs    : MAX_EVALS='${MAX_EVALS}' WITH_EBCC=${WITH_EBCC:-0} COMPRESS=${COMPRESS:-0} STOCK_CODECS_ONLY=${STOCK_CODECS_ONLY:-0} REWRITE_EXISTING=${REWRITE_EXISTING:-0}"
+env | grep "^EBCC_" | sed "s/^/[santis.run] ebcc env : /"
 
 # ---------------------------------------------------------------------------
 # Field list
