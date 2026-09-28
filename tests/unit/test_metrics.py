@@ -54,6 +54,8 @@ def _chunk_bytes(codec, x, pipeline):
 @pytest.mark.parametrize("codec", [utils.ZFPYRank(mode=2, rate=8), utils.ZFPYFlat(mode=2, rate=8)])
 def test_zfp_encoders_fold_on_both_zarr_pipelines(codec):
     """zarr's synchronous codec pipeline (an opt-in) encodes through _encode_sync: the fold must hold there too."""
+    if not hasattr(zarr.core.codec_pipeline, "FusedCodecPipeline"):  # zarr 3.1, which Python 3.11 resolves
+        pytest.skip(f"zarr {zarr.__version__} has no synchronous codec pipeline")
     x = np.random.default_rng(4).normal(size=(1, 3, 70000)).astype("f4")  # zfp cannot take 70000 cells at 3-D
     assert _chunk_bytes(codec, x, "FusedCodecPipeline") == _chunk_bytes(codec, x, "BatchedCodecPipeline")
 
