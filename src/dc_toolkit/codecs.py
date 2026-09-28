@@ -1,6 +1,7 @@
 """The zarr codecs dc_toolkit adds: ZFPY at a chunk's own rank or flattened to 1-D, and EBCC.  A zarr
 client reads their arrays through the "zarr.codecs" entry points without MPI or the rest of the package."""
 import asyncio
+import ctypes
 import importlib
 import math
 import os
@@ -16,7 +17,10 @@ from zarr.registry import register_codec
 os.environ.setdefault("EBCC_LOG_LEVEL", "4")  # the C library logs to stderr; 4 = errors only
 try:
     importlib.import_module("ebcc.zarr_filter")  # registers "ebcc_filter" with numcodecs
+    from ebcc import EBCC_FILTER_PATH
     from ebcc.filter_wrapper import EBCC_Filter
+    # EBCC's encoders apply EBCC_LOG_LEVEL, its decoder does not: a process that only reads would log each chunk.
+    getattr(ctypes.CDLL(EBCC_FILTER_PATH), "log_set_level_from_env", lambda: None)()
     EBCC_AVAILABLE = True
 except Exception:  # not installed, or a broken install (its C library missing): the other codecs still load
     EBCC_AVAILABLE = False

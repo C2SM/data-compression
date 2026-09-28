@@ -1,10 +1,14 @@
 """Codec spaces, pairing rules and pipeline identity (the JSON --resume, the manifests and compress key on)."""
 import json
+import os
+import subprocess
+import sys
 
 import click
 import numpy as np
 import pytest
 import xarray as xr
+import zarr
 from zarr.codecs import numcodecs as nc
 
 from dc_toolkit import utils, utils_cli
@@ -97,6 +101,20 @@ def test_ebcc_round_trips_through_its_json():
     key = utils.pipeline_json(None, None, ebcc)
     assert utils.pipeline_json(*utils.pipeline_from_dict(json.loads(key))) == key
     assert not utils.pipeline_is_stock(json.loads(key))
+
+
+@pytest.mark.ebcc
+def test_a_process_that_only_reads_ebcc_logs_nothing(tmp_path):
+    """EBCC's decoder ignores EBCC_LOG_LEVEL, so dc_toolkit.codecs applies it (default 4, errors only)."""
+    pytest.importorskip("ebcc")
+    path = str(tmp_path / "s.zarr")
+    x = np.linspace(0, 1, 2 * 46 * 90, dtype="f4").reshape(2, 46, 90)
+    zarr.create_array(path, shape=x.shape, dtype=x.dtype, chunks=(1, 46, 90), compressors=None,
+                      serializer=utils.EBCC.from_params(46, 90, 0.01))[...] = x
+    read = f"import zarr; zarr.open_array({path!r}, mode='r')[...]"  # the codec comes through the entry point
+    env = {k: v for k, v in os.environ.items() if k != "EBCC_LOG_LEVEL"}
+    r = subprocess.run([sys.executable, "-c", read], capture_output=True, text=True, env=env, timeout=300)
+    assert r.returncode == 0 and "ebcc_codec.c" not in r.stderr, r.stderr  # every EBCC log line names its source
 
 
 @pytest.mark.parametrize("filt, ser, dtype, ok", [
