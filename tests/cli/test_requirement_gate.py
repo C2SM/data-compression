@@ -1,5 +1,5 @@
 """evaluate_combos --requirements on the bundled TIGGE file: an entry of the community list as a gate, with
-and without an L1 budget, its records, resume, and the inputs it refuses."""
+and without an L1 budget, its records, resume, and the inputs it refuses; compress holds the whole field to it."""
 import json
 import shutil
 
@@ -7,6 +7,7 @@ import numpy as np
 import pandas as pd
 import pytest
 import xarray as xr
+import zarr
 
 from conftest import invoke
 
@@ -14,6 +15,7 @@ pytest.importorskip("compression_recommendations")
 
 T = ("--field-to-compress", "t", "--requirements", "cf-short-name=t,level-kind=pressure")  # 0.05 K or 1 % of the range
 EVALS = ("--max-evals", "60")
+STORE = "tigge_pl_t_q_dx=2_2024_08_02.zarr"
 
 
 @pytest.fixture(scope="module")
@@ -104,3 +106,47 @@ def test_a_limit_of_the_entry_is_sampled_as_a_bound_is(fields, tmp_path):
 def test_refused_inputs(tigge, tmp_path, args, code, message):
     assert message in invoke("evaluate_combos", tigge, "--where-to-write", tmp_path, *args, code=code).output
     assert not list(tmp_path.glob("manifest_*.json"))
+
+
+def _tighten(where, value):
+    """Rewrite the manifest's resolved conditions to one bound on every cell, as another sweep would record it."""
+    path = where / "manifest_t.json"
+    m = json.loads(path.read_text())
+    m["requirements"]["resolved"] = [{"kind": "max-pointwise-absolute-error-bound", "value": value}]
+    path.write_text(json.dumps(m))
+
+
+def test_compress_holds_the_whole_field_to_the_requirement(tigge, sweep_copy):
+    out = invoke("compress", tigge, sweep_copy).output
+    assert "[verify-gate] t: PASS, the whole field meets the requirement." in out
+    asked = json.loads((sweep_copy / "manifest_t.json").read_text())["requirements"]
+    stored = zarr.open_group(str(sweep_copy / STORE), mode="r")["t"]
+    record = json.loads(stored.attrs["dc_toolkit"])
+    assert record["request"]["requirement"] == asked["resolved"] and record["errors"]["N_Req"] == 0
+    batch = json.loads((sweep_copy / "batch_manifest.json").read_text())["results"]["t"]
+    assert record["requirements"] == batch["requirements"] == asked and batch["errors"]["N_Req"] == 0
+    # the list's own checker, given the field and what the store gives back
+    from compression_recommendations import Recommendations
+    check = pytest.importorskip("compression_requirement_checks").check_safety_requirements
+    assert check(original=xr.open_dataset(tigge)["t"].values, reconstructed=stored[...],
+                 requirements=Recommendations.provide.search(markers=asked["markers"]))
+
+
+def test_a_field_that_breaks_the_requirement_stays_out_of_the_store(tigge, sweep_copy):
+    _tighten(sweep_copy, 1e-9)  # the winner is lossy
+    out = invoke("compress", tigge, sweep_copy, code=1).output
+    assert "[verify-gate] FAIL: t: verify gate FAILED (pass_req)" in out
+    assert "requirement: MaxPointwiseAbsoluteErrorBound(1e-09) fails at" in out
+    assert not (sweep_copy / STORE / "t").exists()
+    assert json.loads((sweep_copy / "batch_manifest.json").read_text())["results"]["t"]["status"] == "error"
+    out = invoke("compress", tigge, sweep_copy, "--no-verify-gate").output  # written, and marked
+    assert "(advisory: --no-verify-gate set)" in out
+    assert json.loads(zarr.open_group(str(sweep_copy / STORE), mode="r")["t"].attrs["dc_toolkit"])["errors"]["N_Req"] > 0
+
+
+def test_a_stored_field_is_rewritten_for_another_requirement(tigge, sweep_copy):
+    invoke("compress", tigge, sweep_copy)
+    assert "already in" in invoke("compress", tigge, sweep_copy).output
+    _tighten(sweep_copy, 5.0)
+    out = invoke("compress", tigge, sweep_copy).output
+    assert "its verify gate changed; rewriting it" in out and "[verify-gate] t: PASS" in out

@@ -712,13 +712,15 @@ def verify_thresholds(manifest, overrides=None) -> dict:
 
 def verify_against_manifest(var: str, errors: dict, manifest, overrides=None):
     """Production verify gate: `errors` against verify_thresholds.  The finite and bounds gates need no
-    threshold and always apply.  Returns (status, detail), status "pass", "fail" or "no-thresholds"."""
+    threshold and always apply, as does the sweep's requirement (N_Req, counted with the errors).  Returns
+    (status, detail), status "pass" (detail: what held), "fail" or "no-thresholds"."""
     thr = verify_thresholds(manifest, overrides)
     keep, reasons = evaluate_gates(errors, thr)
-    if keep and not any(math.isfinite(v) for v in thr.values()):
-        return "no-thresholds", ""
+    held = [text for text, on in (
+        ("production error norms are within the sweep thresholds", any(math.isfinite(v) for v in thr.values())),
+        ("the whole field meets the requirement", errors.get("N_Req") is not None)) if on]
     if keep:
-        return "pass", ""
+        return ("pass", " and ".join(held)) if held else ("no-thresholds", "")
     failed = ", ".join(k for k, ok in reasons.items() if not ok)
     detail = (f"{var}: verify gate FAILED ({failed}) | "
               f"L1={fmt3(errors.get('Relative_Error_L1'))} L2={fmt3(errors.get('Relative_Error_L2'))} "
@@ -726,6 +728,10 @@ def verify_against_manifest(var: str, errors: dict, manifest, overrides=None):
               f"q99={fmt3(errors.get('Q99_Rel'))} n_corrupt={errors.get('N_Corrupt', 0)} "
               f"n_bounds={errors.get('N_Bounds', 0)} | thresholds: "
               + " ".join(f"{k}={thr[k]:.3e}" for k in GATE_KEYS))
+    if not reasons["pass_req"]:
+        detail += (f" | requirement: {utils.requirement_text(manifest['requirements']['resolved'])} fails at "
+                   f"{errors['N_Req']} cell(s); absolute error: mean {fmt3(errors.get('Mean_Abs_Error'))}, "
+                   f"largest {fmt3(errors.get('Max_Abs_Error'))}")
     return "fail", detail
 
 
@@ -740,7 +746,7 @@ def verify_gate_verdict(var: str, out: dict, manifest, opts):
         click.echo(f"[verify-gate] {var}: no thresholds (none in manifest_{var}.json and no --l1-threshold ...): "
                    f"the error norms are advisory; the finite and bounds gates passed.")
     elif status == "pass":
-        click.echo(f"[verify-gate] {var}: PASS, production error norms are within the sweep thresholds.")
+        click.echo(f"[verify-gate] {var}: PASS, {detail}.")
     elif opts.verify_gate:
         click.echo(f"[verify-gate] FAIL: {detail}")
     else:
@@ -909,7 +915,7 @@ def write_concurrency(block_bytes: int, inner_bytes: int, nblocks: int, opts, va
     return max(1, min(int(opts.threads), nblocks, fit))
 
 
-def persist_field(da, var: str, merged_path: str, combo, opts, layout, q99_abs, bounds, tasks: int) -> dict:
+def persist_field(da, var: str, merged_path: str, combo, opts, layout, q99_abs, bounds, requirement, tasks: int) -> dict:
     """Write one field, chunked in read_blocks, with `combo` into the staging store, `tasks` blocks at a
     time, creating the merged store if needed.  Returns ratio, errors, eucd, geometry and timing."""
     inner_chunks, shards = layout
@@ -936,7 +942,8 @@ def persist_field(da, var: str, merged_path: str, combo, opts, layout, q99_abs, 
         with dask.config.set(num_workers=tasks):
             ratio, errors, eucd = utils.persist_with_codec_pipeline(
                 da, store, component=var, codec_kwargs=utils.codec_pipeline_kwargs(*combo),
-                inner_chunks=inner_chunks, shards=shards, verify=opts.verify, q99_abs=q99_abs, bounds=bounds)
+                inner_chunks=inner_chunks, shards=shards, verify=opts.verify, q99_abs=q99_abs, bounds=bounds,
+                requirement=requirement)
     finally:
         close_store(store)
     return {"ratio": float(ratio), "errors": errors, "eucd": eucd,
@@ -1959,8 +1966,8 @@ def source_identity(path) -> dict:
 
 def compress_plan(da, var: str, cand: dict, manifest, opts):
     """(combo, layout, request).  `request` identifies the array this run would write: source file, field,
-    pipeline, layout and the verify gate's thresholds and bounds; compress records it on the array and
-    --skip-existing compares it."""
+    pipeline, layout and the verify gate's thresholds, bounds and requirement (the sweep's resolved
+    conditions); compress records it on the array and --skip-existing compares it."""
     if da.ndim == 0:
         raise click.ClickException(f"{var} is a scalar; compress writes arrays with at least one dim")
     combo = pipeline_codecs(cand["pipeline"], var)
@@ -1974,7 +1981,8 @@ def compress_plan(da, var: str, cand: dict, manifest, opts):
         "inner_chunks": layout[0], "shards": layout[1],
         "thresholds": verify_thresholds(manifest, overrides) if opts.verify else None,
         "bounds": gate_bounds(m.get("phys_min"), m.get("phys_max"), m.get("phys_slack")) if opts.verify else None,
-        "q99_abs": m.get("q99_abs") if opts.verify else None})
+        "q99_abs": m.get("q99_abs") if opts.verify else None,
+        "requirement": (m.get("requirements") or {}).get("resolved") if opts.verify else None})
     return combo, layout, request
 
 
@@ -1999,8 +2007,9 @@ def stored_mismatch(merged_path: str, var: str, request: dict, predicted, opts):
     _, drift, direction = evaluate_cr_drift(record.get("ratio"), predicted, opts.cr_drift_tol)
     if opts.cr_drift_gate and direction == "under":
         return f"its ratio falls {-drift:.0%} short of the sweep's"
-    changed = [k for k in request if k not in ("thresholds", "bounds", "q99_abs") and stored.get(k) != request[k]]
-    if opts.verify and any(stored.get(k) != request[k] for k in ("thresholds", "bounds", "q99_abs")):
+    gate = ("thresholds", "bounds", "q99_abs", "requirement")
+    changed = [k for k in request if k not in gate and stored.get(k) != request[k]]
+    if opts.verify and any(stored.get(k) != request[k] for k in gate):
         changed.append("verify gate")
     return f"its {', '.join(changed)} changed" if changed else None
 
@@ -2018,8 +2027,9 @@ def compress_one(da, var: str, cand: dict, manifest, merged_path: str, opts, com
     m = manifest or {}
     q99_abs = m.get("q99_abs") if opts.verify else None
     bounds = gate_bounds(m.get("phys_min"), m.get("phys_max"), m.get("phys_slack")) if opts.verify else None
+    asked = m["requirements"] if request["requirement"] else None  # the sweep's record of the requirement checked here
     try:
-        out = persist_field(da, var, merged_path, combo, opts, layout, q99_abs, bounds, tasks)
+        out = persist_field(da, var, merged_path, combo, opts, layout, q99_abs, bounds, request["requirement"], tasks)
         summary = f"{var}: {cand['name']} -> ratio={out['ratio']:.3f}"
         if opts.verify:
             summary += f" L1_rel={out['errors']['Relative_Error_L1']:.3e} eucd={out['eucd']:.3e}"
@@ -2048,7 +2058,7 @@ def compress_one(da, var: str, cand: dict, manifest, merged_path: str, opts, com
                        + ("" if direction == "under" else "  (better than predicted; informational)"))
         entry = {
             "status": "ok", "name": cand["name"], "pipeline": cand["pipeline"], "source": cand["source"],
-            "verify_gate": verify_status, "cr_drift_status": direction,
+            "verify_gate": verify_status, "requirements": asked, "cr_drift_status": direction,
             "ratio": out["ratio"],
             "predicted_ratio": (float(predicted) if predicted is not None else None),
             "cr_drift": (float(drift) if drift is not None else None),
@@ -2064,8 +2074,8 @@ def compress_one(da, var: str, cand: dict, manifest, merged_path: str, opts, com
             attrs = json_safe({k: v for k, v in da.attrs.items() if isinstance(v, (str, int, np.integer))
                                or (isinstance(v, (float, np.floating)) and math.isfinite(v))})
             zarr.open_array(store=staging, path=var, mode="r+").update_attributes({**attrs, "dc_toolkit": json.dumps(
-                json_safe({"request": request, "verify_gate": verify_status, "ratio": out["ratio"],
-                           "errors": entry["errors"], "written_by": provenance(),
+                json_safe({"request": request, "verify_gate": verify_status, "requirements": asked,
+                           "ratio": out["ratio"], "errors": entry["errors"], "written_by": provenance(),
                            "time": time.strftime("%Y-%m-%dT%H:%M:%S")}), sort_keys=True)})
         finally:
             close_store(staging)

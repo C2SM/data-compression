@@ -115,7 +115,8 @@ _VERIFY_OPTIONS = [
     click.option("--verify-gate/--no-verify-gate", default=True, show_default=True,
                  help="With --verify, fail a field whose production norms exceed the sweep thresholds in "
                       "manifest_{var}.json, or whose round trip moved a cell across the sweep's physical "
-                      "bounds or changed its finiteness or NaN/Inf kind (the gradient gate is sweep-only).  "
+                      "bounds, changed its finiteness or NaN/Inf kind, or breaks the sweep's --requirements "
+                      "at a cell of the whole field (the gradient gate is sweep-only).  "
                       "--no-verify-gate only warns."),
 ]
 
@@ -250,8 +251,8 @@ _VERIFY_THRESHOLD_OPTIONS = [
               help="Write the --vars fields with this pipeline instead of the sweep's best: a JSON object "
                    "with compressor, filter and serializer, or the path of a file holding one; a "
                    "manifest_{var}.json works directly.  A manifest_{var}.json in WHERE_TO_WRITE still supplies "
-                   "the verify gate's thresholds and bounds and the chunk geometry, even one a later sweep "
-                   "superseded.")
+                   "the verify gate's thresholds, bounds and requirement and the chunk geometry, even one a "
+                   "later sweep superseded.")
 @click.option("--stock-codecs-only", is_flag=True, default=False,
               help="Write only pipelines a zarr client without dc_toolkit can decode: when the sweep's best uses a codec "
                    "that needs dc_toolkit's zarr.codecs entry point (numcodecs.zfpy_flat, numcodecs.ebcc_filter), "

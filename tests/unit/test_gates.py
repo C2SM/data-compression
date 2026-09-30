@@ -84,6 +84,17 @@ def test_verify_gate(errors, overrides, status):
     assert utils_cli.verify_against_manifest("t", errors, manifest, overrides)[0] == status
 
 
+def test_verify_gate_with_a_requirement_needs_no_threshold():
+    manifest = {"requirements": {"resolved": [{"kind": "max-pointwise-absolute-error-bound", "value": 0.05}]}}
+    assert utils_cli.verify_against_manifest("t", {**OK, "N_Req": 0}, manifest) == (
+        "pass", "the whole field meets the requirement")
+    status, detail = utils_cli.verify_against_manifest("t", {**OK, "N_Req": 7, "Max_Abs_Error": 0.5}, manifest)
+    assert status == "fail" and "(pass_req)" in detail
+    assert "MaxPointwiseAbsoluteErrorBound(0.05) fails at 7 cell(s)" in detail and "largest 5.000e-01" in detail
+    assert utils_cli.verify_against_manifest("t", {**OK, "N_Req": 0}, manifest, {"l1": 0.01}) == (
+        "pass", "production error norms are within the sweep thresholds and the whole field meets the requirement")
+
+
 @pytest.mark.parametrize("achieved, predicted, status", [(5.0, None, "skip"), (5.0, 5.0, "ok"), (3.0, 5.0, "under"),
                                                          (8.0, 5.0, "over"), (5.0, math.inf, "skip")])
 def test_cr_drift(achieved, predicted, status):
