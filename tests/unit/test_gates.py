@@ -22,7 +22,7 @@ def test_all_gates_pass():
 @pytest.mark.parametrize("metric, value, gate", [
     ("Relative_Error_L1", 0.02, "pass_l1"), ("Relative_Error_L2", 0.03, "pass_l2"),
     ("Relative_Error_Linf", 0.2, "pass_linf"), ("Bias_Rel", 0.01, "pass_bias"), ("N_Corrupt", 1, "pass_finite"),
-    ("N_Bounds", 1, "pass_bounds")])
+    ("N_Bounds", 1, "pass_bounds"), ("N_Req", 1, "pass_req")])
 def test_each_gate_fails_on_its_own(metric, value, gate):
     keep, reasons = utils_cli.evaluate_gates({**OK, metric: value}, THR)
     assert not keep and [k for k, ok in reasons.items() if not ok] == [gate]
@@ -52,6 +52,14 @@ def test_derived_thresholds():
     assert utils_cli.derive_thresholds(opts) == {"l1": 0.01, "l2": 0.02, "linf": math.inf, "bias": 0.005, "q99": 0.02}
 
 
+def test_without_an_l1_budget_a_gate_needs_a_threshold_of_its_own():
+    """--requirements alone: nothing to derive the other budgets from."""
+    opts = SimpleNamespace(l1_threshold=None, l2_threshold=None, linf_threshold=0.5, bias_threshold=None,
+                           q99_threshold=None, l2_gate=True, linf_gate=True, bias_gate=True, extremes_sensitive=False)
+    assert utils_cli.derive_thresholds(opts) == {"l1": math.inf, "l2": math.inf, "linf": 0.5, "bias": math.inf,
+                                                 "q99": math.inf}
+
+
 def test_verify_thresholds_without_a_manifest_follow_the_sweep_multiples():
     assert utils_cli.verify_thresholds(None, {"l1": 0.01, "l2": None}) == {
         "l1": 0.01, "l2": 0.02, "linf": 0.1, "bias": 0.005, "q99": math.inf}
@@ -74,6 +82,17 @@ def test_verify_gate(errors, overrides, status):
     manifest = {"effective_thresholds": {"l1": 0.01, "l2": 0.02, "linf": 0.1, "bias": 0.005, "q99": None},
                 "phys_min": None, "phys_max": None, "phys_slack": 0.0}
     assert utils_cli.verify_against_manifest("t", errors, manifest, overrides)[0] == status
+
+
+def test_verify_gate_with_a_requirement_needs_no_threshold():
+    manifest = {"requirements": {"resolved": [{"kind": "max-pointwise-absolute-error-bound", "value": 0.05}]}}
+    assert utils_cli.verify_against_manifest("t", {**OK, "N_Req": 0}, manifest) == (
+        "pass", "the whole field meets the requirement")
+    status, detail = utils_cli.verify_against_manifest("t", {**OK, "N_Req": 7, "Max_Abs_Error": 0.5}, manifest)
+    assert status == "fail" and "(pass_req)" in detail
+    assert "MaxPointwiseAbsoluteErrorBound(0.05) fails at 7 cell(s)" in detail and "largest 5.000e-01" in detail
+    assert utils_cli.verify_against_manifest("t", {**OK, "N_Req": 0}, manifest, {"l1": 0.01}) == (
+        "pass", "production error norms are within the sweep thresholds and the whole field meets the requirement")
 
 
 @pytest.mark.parametrize("achieved, predicted, status", [(5.0, None, "skip"), (5.0, 5.0, "ok"), (3.0, 5.0, "under"),

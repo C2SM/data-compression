@@ -39,7 +39,10 @@ version = '0.0'
 [project.optional-dependencies]
 # EBCC needs cmake, a C/C++ toolchain and HDF5 headers at build time.
 ebcc = ["ebcc[zarr] @ git+https://github.com/spcl/EBCC.git@d99377f71e6854ec57f793f106f7ba75ae31fed5"]
-test = ["pytest >=8"]
+# The ESiWACE3 community list behind evaluate_combos --requirements; an alpha whose bounds still move, so pinned.
+recommendations = ["compression-recommendations ==0.1.0a2"]
+# compression-requirement-checks is the community list's own checker: the reference for the requirement count.
+test = ["pytest >=8", "compression-requirement-checks ==0.1.0a2"]
 
 [project.scripts]
 dc_toolkit = 'dc_toolkit.cli:cli'

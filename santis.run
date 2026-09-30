@@ -21,8 +21,8 @@
 #   DYAMOND_DATA_ROOT        parent dir of the Data_Dyamond_PostProcessed* trees (required)
 #   RESULTS_BASE             output root (default ./res_folder_dyamond_<job id>); an earlier run's root
 #                            continues it: its combos are reused and re-gated with the current thresholds
-#                            unless the input, sample, chunking, bounds, measuring code or library
-#                            versions changed, and a combo that killed its rank is retried alone
+#                            unless the input, sample, chunking, bounds, requirement, measuring code or
+#                            library versions changed, and a combo that killed its rank is retried alone
 #   FIELDS_FILE              replaces the list below: one entry per line, same format (quotes,
 #                            indentation, blank lines and # lines are ignored)
 #   MAX_EVALS=N              cap the codec space (quick test runs)
@@ -107,7 +107,10 @@ env | grep "^EBCC_" | sed "s/^/[santis.run] ebcc env : /"
 #   fields reach the cap and carry --extremes-sensitive.
 #   GATE FLAGS go to evaluate_combos as they are: --phys-min/--phys-max for bounded
 #   fields (with --phys-tolerance for one that sits on its bound), --gradient-gate for
-#   fields whose gradients matter.
+#   fields whose gradients matter, --requirements NAME-KEY=NAME,level-kind=LEVEL for a
+#   field that is a variable of the community list, in its units and on its level kind
+#   (docs/intro.md, section 10; needs the "recommendations" extra in venv/).  L1 may
+#   then be empty: the requirement gates alone.
 LIST=(
     # R02B06, 3-D
     "R02B06|out_1_1|remap_qv_20220225T000000Z.nc|qv|qv|0.01|2GiB|32|--gradient-gate --gradient-threshold 0.1 --gradient-shortcircuit --extremes-sensitive --phys-min 0"
@@ -168,7 +171,7 @@ for i in "${!LIST[@]}"; do
     IFS='|' read -r RES_TAG STREAM FNAME IVAR VAR L1_THRESHOLD SAMPLE RANKS GATES <<<"${LIST[$i]}"
     SAMPLE=${SAMPLE:-$DEFAULT_SAMPLE}; RANKS=${RANKS:-$DEFAULT_RANKS}
 
-    if [[ -z "$VAR" || ! "$L1_THRESHOLD" =~ ^[0-9.]+([eE][-+]?[0-9]+)?$ || ! "$RANKS" =~ ^[1-9][0-9]*$ ]]; then
+    if [[ -z "$VAR" || ! "$L1_THRESHOLD" =~ ^([0-9.]+([eE][-+]?[0-9]+)?)?$ || ! "$RANKS" =~ ^[1-9][0-9]*$ ]]; then
         echo "[$((i+1))/$n_total] SKIP malformed entry (RES|STREAM|FILE|IVAR|VAR|L1|...): ${LIST[$i]}"
         n_skip=$((n_skip+1)); PROBLEMS+=("SKIP  ${LIST[$i]}  (malformed)")
         continue
@@ -187,7 +190,7 @@ for i in "${!LIST[@]}"; do
     echo "[$((i+1))/$n_total] $SUBDIR"
     echo "  input    : $INPUT"
     echo "  field    : $IVAR"
-    echo "  l1 thresh: $L1_THRESHOLD"
+    echo "  l1 thresh: ${L1_THRESHOLD:-(none)}"
     echo "  sample   : $SAMPLE, $RANKS rank(s)/node"
     echo "  gates    : ${GATES:-(defaults)}"
     echo "  outdir   : $OUTDIR"
@@ -199,15 +202,16 @@ for i in "${!LIST[@]}"; do
     fi
     mkdir -p "$OUTDIR"
 
-    # $GATES is unquoted on purpose (several flags).  --ntasks is explicit: the job's
-    # SLURM_NTASKS would otherwise override --ntasks-per-node.
+    # $GATES is unquoted on purpose (several flags), and so is the L1 flag, left out of an
+    # entry without a budget.  --ntasks is explicit: the job's SLURM_NTASKS would otherwise
+    # override --ntasks-per-node.
     srun --unbuffered --nodes="$SLURM_JOB_NUM_NODES" --ntasks=$(( SLURM_JOB_NUM_NODES * RANKS )) \
          --ntasks-per-node="$RANKS" --cpus-per-task=1 dc_toolkit \
          evaluate_combos \
          "$INPUT" \
          --where-to-write              "$OUTDIR" \
          --field-to-compress           "$IVAR" \
-         --l1-threshold                "$L1_THRESHOLD" \
+         ${L1_THRESHOLD:+--l1-threshold "$L1_THRESHOLD"} \
          --eval-data-size-limit        "$SAMPLE" \
          $GATES "${EXTRA_FLAGS[@]}" \
          2>&1 | stdbuf -oL -eL tee "$OUTDIR/run.log"

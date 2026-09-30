@@ -102,10 +102,11 @@ that varies on 2 levels only keeps those 2. The log line says what was kept:
 
 and adds `(of the 80 that vary)` after the levels in the cloud field's case.
 
-With `--phys-min` or `--phys-max` the sample also reaches the field's approach to the bound: when no chosen time
-step or level holds the field's lowest (highest) value, the chosen index nearest to the one that does is swapped for
-it, so the bounds gate sees what `compress` will verify on the whole field. Geopotential with `--phys-min 0` comes
-nearest 0 at the ground: the lowest level replaces the deepest midpoint (20, 60, 119 instead of 20, 60, 100).
+With `--phys-min` or `--phys-max`, or a `--requirements` entry that carries limits, the sample also reaches the
+field's approach to the bound: when no chosen time step or level holds the field's lowest (highest) value, the chosen
+index nearest to the one that does is swapped for it, so the gate sees what `compress` will verify on the whole
+field. Geopotential with `--phys-min 0` comes nearest 0 at the ground: the lowest level replaces the deepest midpoint
+(20, 60, 119 instead of 20, 60, 100).
 
 ### 5. Scan, read, share
 
@@ -141,8 +142,8 @@ verify gate re-checks the errors, and the CR-drift check compares the ratio with
 ### 7. Resume
 
 `sweep_state_{var}.json` records what the recorded rows were measured on, the sample included: its shape, dtype and a
-digest of its bytes, the sampling policy and vertical floor (and the bounds, the code that measures and the library
-versions). A change starts the field over. The full-field range is recorded too, but a pipeline fitted to it
+digest of its bytes, the sampling policy and vertical floor (and the bounds, the requirement, the code that measures
+and the library versions). A change starts the field over. The full-field range is recorded too, but a pipeline fitted to it
 carries it in its JSON, so another range changes only those pipelines. The budget depends on the ranks per node through the memory cap, so resuming a large field with another rank
 count can give another sample, and restart the field.
 

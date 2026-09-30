@@ -38,6 +38,7 @@ def test_help_of_every_command():
 
 
 @pytest.mark.parametrize("args", [
+    ("evaluate_combos", "{tigge}", "--where-to-write", "{tmp}"),  # neither --l1-threshold nor --requirements
     ("evaluate_combos", "{tigge}", "--where-to-write", "{tmp}", "--l1-threshold", "nan"),
     ("evaluate_combos", "{tigge}", "--where-to-write", "{tmp}", "--l1-threshold", "0.01", "--phys-min", "inf"),
     ("compress", "{tigge}", "{tmp}", "--vars", "t", "--pipeline", "{{}}", "--linf-threshold", "-inf"),
