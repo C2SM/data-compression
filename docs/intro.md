@@ -3,7 +3,8 @@
 This guide takes you from an empty laptop to compressed climate data you can trust. You will install
 `dc_toolkit`, let it search for the best way to compress a field (`evaluate_combos`), write the compressed
 store (`compress`), check what the compression did to your data, and then learn the shortcuts: compressing
-with a pipeline of your own, using EBCC, and keeping physics safe.
+with a pipeline of your own, using EBCC, keeping physics safe, and holding a field to what the community
+recommends for it.
 
 Everything runs on the small sample file that ships with the repository, so you can follow along without
 any data of your own. Each step takes seconds.
@@ -19,9 +20,10 @@ any data of your own. Each step takes seconds.
 7. [Compress without a sweep: a pipeline of your own](#7-compress-without-a-sweep-a-pipeline-of-your-own)
 8. [EBCC](#8-ebcc)
 9. [Steering the search](#9-steering-the-search)
-10. [Your own files on a laptop](#10-your-own-files-on-a-laptop)
-11. [Troubleshooting](#11-troubleshooting)
-12. [Cheat sheet](#12-cheat-sheet)
+10. [Community requirements as the gate](#10-community-requirements-as-the-gate)
+11. [Your own files on a laptop](#11-your-own-files-on-a-laptop)
+12. [Troubleshooting](#12-troubleshooting)
+13. [Cheat sheet](#13-cheat-sheet)
 
 ---
 
@@ -165,6 +167,9 @@ A pipeline is **kept** only if it passes every gate, and the winner is the kept 
 compression ratio. All errors are relative to the magnitude of the field, which matters more than you might
 expect; section 5 shows why.
 
+For a variable the community has written a requirement for ("every cell within 0.05 K"), that requirement
+can take the budget's place: section 10.
+
 ---
 
 ## 3. Your first sweep: `evaluate_combos`
@@ -183,7 +188,7 @@ mpirun -n 8 dc_toolkit evaluate_combos "$FILE" \
 | `"$FILE"` | the file to read: `.nc`, `.grib` or `.zarr`, recognised by its extension |
 | `--where-to-write` | the directory for the results; created if missing |
 | `--field-to-compress t` | sweep only the variable `t`; leave it out to sweep every field of the file |
-| `--l1-threshold 0.005` | the error budget (required) |
+| `--l1-threshold 0.005` | the error budget (required, unless `--requirements` sets the gate: section 10) |
 | `--max-evals 300` | try 300 pipelines spread evenly over the grid (the same 300 on every run): a quick first look |
 
 The interesting lines of the output:
@@ -206,7 +211,7 @@ within the budget shrinks `t` by a factor of 37.
 
 On a laptop the output usually also has a `[memcheck] auto-shrunk sample budget ...` line above these: the
 default budget of 5 GB does not fit beside eight working sets in a laptop's memory, so the sweep lowers it.
-That is expected; section 10 explains the memory.
+That is expected; section 11 explains the memory.
 
 ### What was written
 
@@ -252,9 +257,9 @@ lzma(preset=9) | bitround(keepbits=52) | zfpy_flat(mode=2, rate=8)  37.354618  0
 
 Keep an eye on that last column: `linf_rel` says the worst cell is off by 4.5 %. Section 5 comes back to it.
 
-The columns worth knowing: `ratio`, the relative errors `l1_rel`, `l2_rel`, `linf_rel`, `bias_rel`, one
-`pass_*` column per gate, and `keep`. The `pipeline` column holds the JSON of each row, ready to be reused
-(section 7).
+The columns worth knowing: `ratio`, the relative errors `l1_rel`, `l2_rel`, `linf_rel`, `bias_rel`, the mean
+and the largest error in the field's own units, `mean_abs_err` and `max_abs_err`, one `pass_*` column per
+gate, and `keep`. The `pipeline` column holds the JSON of each row, ready to be reused (section 7).
 
 ---
 
@@ -376,7 +381,7 @@ Compression Ratio: 7.866 | Relative L1 Error: 5.486e-05 | Euclidean Distance: 2.
 ```
 
 All 17 127 pipelines for `t`, in under a minute on eight cores, because the sample field is tiny; on real
-fields expect minutes to hours, depending on the sample size (section 10). The full search also found a
+fields expect minutes to hours, depending on the sample size (section 11). The full search also found a
 better pipeline than the quick look did: 7.87 against 7.64 at the same budget. `--max-evals` is for getting
 your bearings, not for the final answer.
 
@@ -708,7 +713,231 @@ attributes (units) but no coordinate values, so the file has no coordinates eith
 
 ---
 
-## 10. Your own files on a laptop
+## 10. Community requirements as the gate
+
+Until now *you* chose the budget, and section 5 took two tries to find one that means something in kelvin.
+For many variables somebody has already written down what a lossy compressor may do to them: the
+[community recommendations](https://compression-recommendations.readthedocs.io/en/latest/recommendations/)
+of the ESiWACE3 project, a list of 242 entries for ERA5 variables, such as "2 m temperature: every cell
+within 0.05 K" or "total precipitation: a mean error of at most 1e-05 m, and nothing below 0".
+**`--requirements`** makes one entry of that list the gate of a sweep.
+
+The list compresses nothing and recommends no compressor. It says what must hold; the sweep finds the
+pipeline with the best ratio among those for which it holds.
+
+### Install the list
+
+```bash
+pip install -e ".[recommendations]"          # inside the venv; a few seconds
+```
+
+This installs the list as a small Python package, `compression-recommendations`, at one pinned version: the
+list is young, and its bounds still move from one version to the next.
+
+### Name the entry
+
+An entry is found under a **name** and a **level kind**, which are what its line on the list's page starts with:
+
+```text
+((CfStandardName(air_temperature) or CfShortName(t) or GribShortName(t)) and LevelKind(pressure)) -> ...
+```
+
+| Part of `--requirements` | What to give |
+|---|---|
+| one name: `cf-standard-name=...`, `cf-short-name=...` or `grib-short-name=...` | the name as the list spells it: `air_temperature`, `t`, `2t`, ... |
+| `level-kind=...` | `single` for a field with one value per grid point (the surface, 2 m, 10 m, a column total), `pressure` for a field on pressure levels |
+
+The bundled file holds temperature on a pressure level:
+
+```bash
+mpirun -n 8 dc_toolkit evaluate_combos "$FILE" --where-to-write "$OUT/req" --field-to-compress t \
+    --requirements "cf-short-name=t,level-kind=pressure" --max-evals 300
+```
+
+```text
+[gates] thresholds (relative): L1=off L2=off Linf=off bias=off q99=off | bounds=[None, None] | gradient=off
+[requirements] compression-recommendations 0.1.0-a2: ((CfStandardName(air_temperature) or CfShortName(t) or GribShortName(t)) and LevelKind(pressure)) -> (MaxPointwiseAbsoluteErrorBound(0.05) or MaxPointwiseRangeRelativeErrorBound(0.01))
+[var] t | units=K | relative L1 threshold=off
+[requirements] t (units=K) is checked against (MaxPointwiseAbsoluteErrorBound(0.05) or MaxPointwiseAbsoluteErrorBound(0.863516)), the range-relative bounds x the field's range 86.3516
+best pipeline: lzma(preset=3) | quantize(digits=4, dtype=float64) | zfpy(mode=2, rate=8)
+Compression Ratio: 8.912 | Relative L1 Error: 1.133e-04 | Euclidean Distance: 6.328e+00
+```
+
+Reading it top to bottom:
+
+- There is no `--l1-threshold`, so the relative gates are off and the requirement decides alone.
+- The first `[requirements]` line is the entry, as the list prints it: every cell within 0.05 K, **or** within
+  1 % of the field's value range.
+- The second one is what the sweep checks. This field spans 86.35 K, so "1 % of the range" is 0.86 K; with an
+  "or", the looser of the two bounds is the one that counts.
+- The winner shrinks `t` by 8.9 and is within 0.86 K at every cell. No budget had to be guessed.
+
+Humidity has an entry too, of another kind: `--field-to-compress q --requirements
+"cf-short-name=q,level-kind=pressure"` holds every cell within 1 % of *its own value*
+(`MaxPointwiseRelativeErrorBound(0.01)`), and finds `bz2(level=9) | bitround(keepbits=7) | -` at a ratio of 8.4.
+
+### Your part: the right entry
+
+`dc_toolkit` looks the entry up under the name and the level kind **exactly as you typed them**. It takes
+nothing from your file, neither the variable's name nor its attributes, and it never settles for a near
+match:
+
+```text
+Error: --requirements cf-short-name=t,level-kind=single: no entry matches in compression-recommendations 0.1.0-a2 (https://compression-recommendations.readthedocs.io/en/latest/recommendations/)
+```
+
+That is deliberate. The list describes ERA5 variables, and whether an entry fits *your* field is a judgement
+about your data that no program can make for you. Check three things:
+
+- **The variable.** A short name can mean something else in another model: the list's `w` is the vertical
+  velocity in Pa/s, not the vertical wind in m/s that many models call `w`.
+- **The units.** The bounds are in the units of the list's variable (total precipitation `tp` in metres, cloud
+  cover `tcc` as a fraction of 1), and neither the list's page nor the package states them. The sweep prints
+  your field's `units` beside the conditions so that you can compare. The one mismatch it can see by itself
+  is a field whose own values lie beyond the entry's limits:
+
+  ```text
+  [requirements] WARNING: t spans [232.938, 319.289], beyond the entry's limits [0, 1]: is the field in the units of the list?
+  ```
+
+- **The level kind.** A name can have an entry for each kind (`z` has two), and a field on model levels has
+  none.
+
+`--requirements` needs `--field-to-compress`, since an entry describes one variable.
+
+### What is checked
+
+The list's page and the log use one notation:
+
+| The entry says | A pipeline passes when |
+|---|---|
+| `MaxPointwiseAbsoluteErrorBound(0.05)` | every cell is off by at most 0.05, in the field's units |
+| `MaxPointwiseRelativeErrorBound(0.01)` | every cell is off by at most 1 % of its own value, so a zero comes back as zero |
+| `MaxPointwiseRangeRelativeErrorBound(0.01)` | every cell is off by at most 1 % of the field's value range |
+| `MeanAbsoluteErrorBound(1e-05)` | the mean error is at most 1e-05, in the field's units |
+| `MeanRelativeErrorBound(0.01)` | the mean error is at most 1 % of the mean magnitude (what `--l1-threshold 0.01` checks), and every zero comes back as zero |
+| `MeanRangeRelativeErrorBound(0.01)` | the mean error is at most 1 % of the field's value range |
+| `DataLimits(minimum=0)` | a cell within the limits stays within them |
+| `Isovalue(0.5)` | every cell stays on its side of the value |
+| `MissingValue(255)` | the sentinel stays where it is, and no other cell turns into it |
+| `Lossless` | every value comes back bit for bit |
+
+`and` means all of them, `or` at least one, decided cell by cell. A missing value (`NaN`) must stay missing
+and a number must stay a number, as in every sweep (section 2).
+
+Two points the list leaves open are settled like this:
+
+- **The value range** is that of the whole field in your file, all its time steps and levels, which the
+  sweep measures before it starts. The bound becomes one absolute number, and the sample and the stored
+  field are held to the same one.
+- **A mean** is taken over the sample in the sweep, like every error a sweep measures, and over the whole
+  field by `compress`.
+
+The list comes with a checker of its own (`compression-requirement-checks`). It decides in exact fractions,
+far too slowly for a sweep, so the toolkit counts in float64 instead, and its test suite compares the two on
+every entry of the list: they give the same verdict. The differences are at the margin: an error within the
+last bit of a float64 of its bound can fall on either side; the toolkit does not compare the payload bits of
+a `NaN`; and it fails a number that comes back as `NaN` or `Inf`, which version 0.1.0a2 of the checker lets
+through.
+
+### Look at the results
+
+Every row of the parquet now carries `n_req`, the number of cells at which the entry's conditions fail, and
+its verdict `pass_req` (`n_req` is 0), beside the mean and the largest error in the field's units:
+
+```python
+import os, pandas as pd
+
+df = pd.read_parquet(os.path.expanduser("~/dc_tutorial/req/results_t.parquet"))
+df = df.sort_values(["ratio", "name"], ascending=[False, True])
+cols = ["name", "ratio", "mean_abs_err", "max_abs_err", "n_req", "pass_req"]
+print(len(df), "tried,", df["keep"].sum(), "kept")
+print(df[cols].head(1).to_string(index=False))                # the best ratio of all
+print(df[df["keep"]][cols].head(1).to_string(index=False))    # the best ratio that is kept
+```
+
+```text
+300 tried, 264 kept
+                                                                           name     ratio  mean_abs_err  max_abs_err  n_req  pass_req
+zstd(level=12) | quantize(digits=13, dtype=float64) | zfpy(mode=3, precision=8) 74.412266      2.944243    25.253413  13580     False
+                                                                     name    ratio  mean_abs_err  max_abs_err  n_req  pass_req
+lzma(preset=3) | quantize(digits=4, dtype=float64) | zfpy(mode=2, rate=8) 8.911861      0.032153     0.552573      0      True
+```
+
+The pipeline with the best ratio is off by up to 25 K and breaks the requirement at 13 580 of the field's
+16 380 cells. The winner is off by 0.03 K on average and by 0.55 K at worst. Without `--max-evals` the full
+search finds `bz2(level=3) | bitround(keepbits=11) | -` at a ratio of 9.3.
+
+### Write the field
+
+```bash
+dc_toolkit compress "$FILE" "$OUT/req"
+```
+
+```text
+[compress] t: lzma(preset=3) | quantize(digits=4, dtype=float64) | zfpy(mode=2, rate=8) -> ratio=8.912 L1_rel=1.133e-04 eucd=6.328e+00  (0.1s)
+[verify-gate] t: PASS, the whole field meets the requirement.
+```
+
+`compress` takes no option for this and does not need the package: the manifest carries the conditions, with
+the numbers the sweep derived. It counts the failing cells again, over the **whole field** and from the real
+store. One failing cell fails the field (`verify gate FAILED (pass_req)`), and nothing is left in the store.
+
+The store then says what it was held to:
+
+```python
+import json, os, zarr
+
+store = os.path.expanduser("~/dc_tutorial/req/tigge_pl_t_q_dx=2_2024_08_02.zarr")
+record = json.loads(zarr.open_group(store, mode="r")["t"].attrs["dc_toolkit"])
+print(record["requirements"]["entry"])
+print("list", record["requirements"]["list"]["version"], "| failing cells:", record["errors"]["N_Req"],
+      "| largest error:", round(record["errors"]["Max_Abs_Error"], 3))
+```
+
+```text
+((CfStandardName(air_temperature) or CfShortName(t) or GribShortName(t)) and LevelKind(pressure)) -> (MaxPointwiseAbsoluteErrorBound(0.05) or MaxPointwiseRangeRelativeErrorBound(0.01))
+list 0.1.0-a2 | failing cells: 0 | largest error: 0.553
+```
+
+`manifest_t.json` holds the same under `requirements`: what you asked for (`markers`), the list's version,
+the entry and its conditions, the range, and the numbers that were checked (`resolved`).
+
+### With the other gates
+
+| You give | A pipeline is kept when it |
+|---|---|
+| `--requirements` alone | meets the requirement; the L1, L2, Linf and bias gates are off |
+| `--requirements` and `--l1-threshold` | meets the requirement **and** stays within the budget and the gates derived from it (section 2) |
+| `--requirements` and, say, `--linf-threshold` | meets the requirement and that one threshold |
+
+With neither `--requirements` nor `--l1-threshold` the sweep does not start: it asks for one of the two.
+
+The remaining options combine as before: `--gradient-gate`, `--phys-min` and `--phys-max`, `--with-ebcc`,
+the codec classes. `--extremes-sensitive` needs its `--q99-threshold` when there is no `--l1-threshold` to
+derive it from.
+
+An entry's limits (`DataLimits`) are part of the requirement. They are checked whether or not you also pass
+`--phys-min` and `--phys-max`, and when you do, both apply. `--phys-tolerance` loosens only your own bounds,
+never the entry's: a pipeline that moves a dry cell of a precipitation field below 0, by however little, does
+not meet `DataLimits(minimum=0)`.
+
+### Another requirement, another sweep
+
+A new `--l1-threshold` costs nothing, because the gates are re-applied to the recorded errors (section 5).
+`n_req` is different: it was counted against one entry. With another entry, or after an update of the list
+that changed this one, the field is measured again and the previous results are kept as `*.previous`:
+
+```text
+[resume] t: the recorded rows were measured with another requirement; starting this field from scratch.
+```
+
+An update of the list that left your entry as it was resumes as usual. `compress` writes a field again when
+the store holds it under another requirement.
+
+---
+
+## 11. Your own files on a laptop
 
 **The sample.** The sweep does not run on the whole field but on a representative sample of at most
 `--eval-data-size-limit` (default `5GB`, or less after `[memcheck] auto-shrunk`): whole horizontal fields at
@@ -741,12 +970,13 @@ starting fewer ranks, for example `mpirun -n 4`.
 **Interruptions.** Pressing Ctrl-C loses only the pipelines being evaluated at that moment: run the same
 command again and the sweep continues where it stopped (`[resume] N of M combo(s) ... already recorded`). It
 starts over only when something that affects the measurements changed: the file, the sample (its size, its
-sampling settings or its values), the chunk settings, the physical bounds, the toolkit's measuring code, or the
-versions of the compression libraries (EBCC's tuning environment variables included); the previous results
-are then kept as `*.previous`. A pipeline that crashes the whole program (rare) is tried alone at the end of
-the next run, and left out if it crashes again. An auto-shrunk sample is sized for
-the number of ranks, so resume with the same `mpirun -n`: a different count can build a different sample (when
-the field is larger than the budget), which starts the field over. `--no-resume` forces a fresh start.
+sampling settings or its values), the chunk settings, the physical bounds, the requirement (section 10), the
+toolkit's measuring code, or the versions of the compression libraries (EBCC's tuning environment variables
+included); the previous results are then kept as `*.previous`. A pipeline that crashes the whole program
+(rare) is tried alone at the end of the next run, and left out if it crashes again. An auto-shrunk sample is
+sized for the number of ranks, so resume with the same `mpirun -n`: a different count can build a different
+sample (when the field is larger than the budget), which starts the field over. `--no-resume` forces a fresh
+start.
 
 **Fields with NaN.** Cells that are NaN in your file (fill values, masked land or sea) are left out of every
 error norm, and a pipeline must give them back as NaN. The sweep counts them over the whole field first; when
@@ -758,7 +988,7 @@ field that failed, or whose pipeline, budget or source file changed, is written 
 
 ---
 
-## 11. Troubleshooting
+## 12. Troubleshooting
 
 | You see | It means | Do this |
 |---|---|---|
@@ -767,14 +997,18 @@ field that failed, or whose pipeline, budget or source file changed, is written 
 | `Unsupported file format` | the extension is not `.nc`, `.grib` or `.zarr` | rename the file; the format is chosen from the extension |
 | `Field x not found in dataset. Available fields: [...]` | a typo in `--field-to-compress` | pick a name from the list it prints |
 | `--with-ebcc needs the ebcc package` | EBCC is not installed | `pip install -e ".[ebcc]"` (section 8) |
+| `give --l1-threshold, --requirements, or both` | the sweep has no gate to keep pipelines by | pass a budget (section 2), a community requirement (section 10), or both |
+| `--requirements needs the compression-recommendations package` | the list is not installed | `pip install -e ".[recommendations]"` (section 10) |
+| `--requirements ...: no entry matches` | the list has no entry under that name and level kind as typed; nothing is guessed | copy the name and the level kind from [the list](https://compression-recommendations.readthedocs.io/en/latest/recommendations/); a variable that is not on it needs a budget of your own |
+| `[requirements] WARNING: x spans [...], beyond the entry's limits` | the field's own values lie outside what the entry allows: most likely other units than the list's, or another variable | check the entry and the units (section 10) |
 | `--serializer-class ebcc has nothing for this field: ...` | the field is not a float (lat, lon) grid, or no tile fits its frame (section 8) | sweep it without EBCC |
 | `invalid pipeline ... (e.g. FixedScaleOffset->ZFPY, ...)` | one of the pairings section 7 lists as refused | fix that pairing: `bitround` before `zfpy` only with the full mantissa, no `fixedscaleoffset` before `zfpy` (or before 8-bit `pcodec`), EBCC with no compressor and at most the `astype` filter |
-| `[verify-gate] FAIL` and exit status 1 | the written field exceeds the budget, or its pipeline changed missing values (`pass_finite`) or moved values beyond `--phys-min`/`--phys-max` (`pass_bounds`) | loosen the budget, or choose a more careful pipeline (for `pass_finite`, one without `fixedscaleoffset` and `zfpy`); nothing was left in the store |
+| `[verify-gate] FAIL` and exit status 1 | the written field exceeds the budget, or its pipeline changed missing values (`pass_finite`), moved values beyond `--phys-min`/`--phys-max` (`pass_bounds`) or breaks the sweep's requirement at a cell (`pass_req`) | loosen the budget, or choose a more careful pipeline (for `pass_finite`, one without `fixedscaleoffset` and `zfpy`; for `pass_req`, a larger `--eval-data-size-limit` shows the sweep more of the field); nothing was left in the store |
 | `[verify-gate] ... no thresholds ...: the error norms are advisory` | `--pipeline` without a budget | add `--l1-threshold` if you want the norms enforced |
 | `t already in ... as requested; skipping.` | the store already holds the field as this run would write it | add `--no-skip-existing` to write it anyway |
 | `... does not match sweep_state_t.json ...` | a later sweep of the field has not finished | run that `evaluate_combos` again; `compress` uses only the last sweep's winner |
 | `another sweep of t is writing into ...` | a sweep of the same field into the same directory is running | wait for it; if none runs, remove the lock file the message names |
-| `[resume] ... starting this field from scratch` | the file, sample, chunking, bounds, measuring code or library versions changed | nothing; the recorded results do not match, so the field is measured again |
+| `[resume] ... starting this field from scratch` | the file, sample, chunking, bounds, requirement, measuring code or library versions changed | nothing; the recorded results do not match, so the field is measured again |
 | `[memcheck] REFUSING ...` | too little memory is free at that moment: for a sweep, for the sample (twice it on the first rank); for `compress`, for one block of the write | close other programs, or lower `--eval-data-size-limit` (sweep) or `--shard-mib` (compress) |
 | `[memcheck] FATAL: the smallest sample of 'x' ... does not fit` | the field's smallest sample (3 time steps × 3 levels) and the ranks' working sets need more memory than the machine has | start fewer ranks (`mpirun -n`) |
 | `[sample] raised the sample budget ...` | the limit is below the field's smallest sample | nothing: a smaller sample would not show the field's time steps and levels |
@@ -786,7 +1020,7 @@ field that failed, or whose pipeline, budget or source file changed, is written 
 
 ---
 
-## 12. Cheat sheet
+## 13. Cheat sheet
 
 ```bash
 # every new terminal
@@ -810,6 +1044,9 @@ dc_toolkit compress FILE DIR --vars VAR --pipeline other_sweep/manifest_VAR.json
 # EBCC
 mpirun -n 8 dc_toolkit evaluate_combos FILE --where-to-write DIR --field-to-compress VAR --l1-threshold 0.0005 --with-ebcc
 mpirun -n 8 dc_toolkit evaluate_combos FILE --where-to-write DIR --field-to-compress VAR --l1-threshold 0.0005 --serializer-class ebcc
+
+# a community requirement as the gate (pip install -e ".[recommendations]"); --l1-threshold is then optional
+mpirun -n 8 dc_toolkit evaluate_combos FILE --where-to-write DIR --field-to-compress VAR --requirements "grib-short-name=2t,level-kind=single"
 
 # lossless only                           ... --without-lossy
 # a store any Zarr reader opens           dc_toolkit compress FILE DIR --stock-codecs-only
