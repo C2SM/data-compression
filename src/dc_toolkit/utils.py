@@ -17,6 +17,7 @@ import time
 import warnings
 from collections import defaultdict
 from dataclasses import dataclass
+from functools import reduce
 from itertools import product
 from pathlib import Path
 from typing import Optional, Tuple
@@ -897,7 +898,8 @@ def pipeline_name(compressor, filt, serializer) -> str:
 METRIC_DEFINITIONS = ("N_Corrupt: cells whose class (finite, NaN, +Inf, -Inf) the round trip changes",
                       "N_Bounds: cells the round trip moves from inside the physical bounds (with the slack) to outside",
                       "Q99_Rel: cells with |x| >= the q99 cut, taken over the non-zero values when the plain one is 0",
-                      "Grad_Rel: finite differences along the horizontal dims, else the non-leading ones")
+                      "Grad_Rel: finite differences along the horizontal dims, else the non-leading ones",
+                      "N_Req: cells at which the requirement fails, its mean conditions decided over the whole field")
 
 
 def _info_bytes(info) -> Tuple[int, int]:
@@ -955,18 +957,126 @@ def _zarr_roundtrip(sample_np, dims, codec_kwargs, chunks):
     return decoded, count_bytes / count_bytes_stored
 
 
+# ---- Requirements (optional): the conditions of one entry of the community list --
+# utils_cli.lookup_requirement takes them from the compression-recommendations package as plain dicts:
+# {"kind": "any" | "all", "requirements": [...]} around leaves such as
+# {"kind": "max-pointwise-absolute-error-bound", "value": 0.05}.  The conditions of a list hold together.
+# They judge the cells finite in both arrays, in float64; the others are N_Corrupt's, which asks of a NaN
+# that it stays one, whatever its payload.
+_REQ_MEAN = ("mean-absolute-error-bound", "mean-relative-error-bound")  # decided by the sums of the whole field
+_REQ_VALUE = ("data-limits", "isovalue", "missing-value", "lossless")   # judge the decoded values themselves
+_REQ_ERROR = ("max-pointwise-absolute-error-bound", "max-pointwise-relative-error-bound")
+_REQ_RANGE = ("max-pointwise-range-relative-error-bound", "mean-range-relative-error-bound")  # resolved to absolute
+
+
+def requirement_leaves(conditions):
+    """The leaf conditions of `conditions`, in order."""
+    for node in conditions:
+        if node["kind"] in ("any", "all"):
+            yield from requirement_leaves(node["requirements"])
+        else:
+            yield node
+
+
+def resolve_requirement(conditions, span: float) -> list:
+    """`conditions` as the gate checks them: a bound relative to the value range becomes absolute for a
+    field spanning `span`.  Raises ValueError for a condition the gate cannot check: a kind it does not
+    know, or a number that is not finite."""
+    out = []
+    for node in conditions:
+        kind = node["kind"]
+        if kind in ("any", "all"):
+            out.append({"kind": kind, "requirements": resolve_requirement(node["requirements"], span)})
+        elif (kind not in _REQ_MEAN + _REQ_VALUE + _REQ_ERROR + _REQ_RANGE
+              or not all(math.isfinite(v) for k, v in node.items() if k != "kind")):
+            raise ValueError(f"dc_toolkit cannot check the condition {node}")
+        elif kind in _REQ_RANGE:
+            out.append({"kind": kind.replace("range-relative", "absolute"), "value": node["value"] * span})
+        else:
+            out.append(dict(node))
+    return out
+
+
+def requirement_text(conditions) -> str:
+    """`conditions` on one line, in the notation of the list's own pages (numbers to six digits)."""
+    def text(node):
+        kind = node["kind"]
+        if kind in ("any", "all"):
+            parts = [text(n) for n in node["requirements"]] or [str(kind == "all")]
+            return parts[0] if len(parts) == 1 else "(" + (" or " if kind == "any" else " and ").join(parts) + ")"
+        args = ", ".join(f"{v:g}" if k == "value" else f"{k}={v:g}" for k, v in node.items() if k != "kind")
+        return "".join(w.capitalize() for w in kind.split("-")) + (f"({args})" if args else "")
+    return " and ".join(map(text, conditions))
+
+
+def _req_masks(conditions, o, x, kinds) -> dict:
+    """{id(leaf): cells at which it holds} for the leaves of `kinds`.  The _REQ_VALUE kinds take the original
+    and the decoded values, the _REQ_ERROR ones their absolute value and the absolute error."""
+    def holds(leaf):
+        kind, v = leaf["kind"], leaf.get("value")
+        if kind == "data-limits":  # a cell within the limits stays within them
+            lo, hi = leaf.get("minimum", -math.inf), leaf.get("maximum", math.inf)
+            return (o < lo) | (o > hi) | ((x >= lo) & (x <= hi))
+        if kind == "isovalue":
+            return ((x < v) == (o < v)) & ((x > v) == (o > v))
+        if kind == "missing-value":
+            return (x == v) == (o == v)
+        if kind == "lossless":
+            return (x == o) & (np.signbit(x) == np.signbit(o))
+        return x <= (v if kind == _REQ_ERROR[0] else o * v)
+    return {id(leaf): holds(leaf) for leaf in requirement_leaves(conditions) if leaf["kind"] in kinds}
+
+
+def _req_failing(conditions, masks, o_abs, e_abs):
+    """Cells of a chunk at which `conditions` fail, given the leaf `masks`: one count per way the mean
+    conditions can turn out, which only the sums of the whole field decide (_req_count picks the count)."""
+    means = [leaf for leaf in requirement_leaves(conditions) if leaf["kind"] in _REQ_MEAN]
+    if any(leaf["kind"] == _REQ_MEAN[1] for leaf in means):  # an exact zero stays one, whatever the mean
+        zero = o_abs == 0
+        kept = zero & (e_abs == 0)
+        zero_rule = {False: kept, True: ~zero | kept}
+
+    def holds(node, met):
+        kind = node["kind"]
+        if kind in ("any", "all"):
+            parts = [holds(n, met) for n in node["requirements"]]
+            arrays = [p for p in parts if np.ndim(p)]
+            if any(bool(p) == (kind == "any") for p in parts if not np.ndim(p)):  # a mean condition decides
+                return kind == "any"
+            return reduce(np.logical_or if kind == "any" else np.logical_and, arrays) if arrays else kind == "all"
+        if kind == _REQ_MEAN[0]:
+            return met[id(node)]
+        return zero_rule[met[id(node)]] if kind == _REQ_MEAN[1] else masks[id(node)]
+
+    counts = []
+    for case in product((False, True), repeat=len(means)):
+        ok = holds({"kind": "all", "requirements": conditions}, dict(zip(map(id, means), case)))
+        counts.append(o_abs.size - int(np.count_nonzero(ok)) if np.ndim(ok) else 0 if ok else o_abs.size)
+    return np.array(counts, dtype=np.int64)
+
+
+def _req_count(conditions, acc: dict) -> int:
+    """N_Req from the sums of the whole field: the count of the case its mean conditions end in."""
+    means = [leaf for leaf in requirement_leaves(conditions) if leaf["kind"] in _REQ_MEAN]
+    met = tuple(bool(acc["l1_err"] <= leaf["value"] * acc["n_valid" if leaf["kind"] == _REQ_MEAN[0] else "l1_ori"])
+                for leaf in means)
+    cases = list(product((False, True), repeat=len(means)))
+    return int(np.broadcast_to(acc["n_req"], len(cases))[cases.index(met)])
+
+
 _ACC_INIT = {"l1_err": 0.0, "l2_err_sq": 0.0, "linf_err": 0.0, "signed_err": 0.0, "l1_ori": 0.0,
              "l2_ori_sq": 0.0, "linf_ori": 0.0, "q99_err": 0.0, "q99_ori": 0.0, "n_valid": 0, "n_corrupt": 0,
-             "n_bounds": 0, "decoded_min": math.inf, "decoded_max": -math.inf,
+             "n_bounds": 0, "n_req": 0, "decoded_min": math.inf, "decoded_max": -math.inf,
              "source_min": math.inf, "source_max": -math.inf}
 _ACC_MAX = ("linf_err", "linf_ori", "decoded_max", "source_max")
 _ACC_MIN = ("decoded_min", "source_min")
 
 
-def _error_sums(orig_all, decoded_all, chunks, q99_abs=None, bounds=None) -> dict:
+def _error_sums(orig_all, decoded_all, chunks, q99_abs=None, bounds=None, requirement=None) -> dict:
     """Accumulators of the error metrics, chunk by chunk, over the cells finite in both arrays; n_corrupt
     counts the cells whose class (finite, NaN, +Inf, -Inf) differs, n_bounds those inside `bounds` (low, high) in the original and
-    outside in the decoded array, source_min/max span the finite original.  `q99_abs` None skips the tail."""
+    outside in the decoded array, source_min/max span the finite original.  `q99_abs` None skips the tail.
+    With `requirement` (resolved conditions), n_req counts the cells at which they fail (_req_failing)."""
     acc = dict(_ACC_INIT)
     with np.errstate(invalid="ignore"):
         for sl in _iter_chunk_slices(orig_all.shape, chunks):
@@ -996,12 +1106,17 @@ def _error_sums(orig_all, decoded_all, chunks, q99_abs=None, bounds=None) -> dic
             if bounds is not None:
                 lo, hi = bounds
                 acc["n_bounds"] += int(np.count_nonzero((o_abs >= lo) & (o_abs <= hi) & ((e_abs < lo) | (e_abs > hi))))
+            if requirement is not None:  # while e_abs still holds the decoded values
+                masks = _req_masks(requirement, o_abs, e_abs, _REQ_VALUE)
             e_abs -= o_abs
             acc["signed_err"] += float(e_abs.sum()); acc["l2_err_sq"] += float(np.dot(e_abs, e_abs))
             np.abs(e_abs, out=e_abs); np.abs(o_abs, out=o_abs)
             acc["l1_err"] += float(e_abs.sum()); acc["linf_err"] = max(acc["linf_err"], float(e_abs.max(initial=0.0)))
             acc["l1_ori"] += float(o_abs.sum()); acc["l2_ori_sq"] += float(np.dot(o_abs, o_abs))
             acc["linf_ori"] = max(acc["linf_ori"], float(o_abs.max(initial=0.0)))
+            if requirement is not None:
+                masks.update(_req_masks(requirement, o_abs, e_abs, _REQ_ERROR))
+                acc["n_req"] = acc["n_req"] + _req_failing(requirement, masks, o_abs, e_abs)
             if q99_abs is not None:
                 ext = o_abs >= q99_abs
                 if ext.any():
@@ -1018,9 +1133,9 @@ def _merge_sums(parts) -> dict:
     return acc
 
 
-def _errors_from_sums(acc: dict, want_q99: bool):
+def _errors_from_sums(acc: dict, want_q99: bool, requirement=None):
     """(errors dict, L2 error) from _error_sums accumulators; raises CombinationProducedNonFiniteError when a
-    norm overflowed."""
+    norm overflowed.  Mean_Abs_Error and Max_Abs_Error are in the field's units."""
     if not all(map(math.isfinite, (acc["l1_err"], acc["l2_err_sq"], acc["linf_err"]))):
         raise CombinationProducedNonFiniteError(
             f"non-finite error accumulators after masking (l1_err={acc['l1_err']}, "
@@ -1032,12 +1147,15 @@ def _errors_from_sums(acc: dict, want_q99: bool):
         "Relative_Error_L2": _rel(l2_err, l2_ori),
         "Relative_Error_Linf": _rel(acc["linf_err"], acc["linf_ori"]),
         "Bias_Rel": _rel(abs(acc["signed_err"]), acc["l1_ori"]),
+        "Mean_Abs_Error": acc["l1_err"] / n_valid if n_valid else float("nan"),
+        "Max_Abs_Error": float(acc["linf_err"]) if n_valid else float("nan"),
         "Decoded_Min": float(acc["decoded_min"]) if n_valid else float("nan"),
         "Decoded_Max": float(acc["decoded_max"]) if n_valid else float("nan"),
         "Source_Min": float(acc["source_min"]) if finite_src else float("nan"),
         "Source_Max": float(acc["source_max"]) if finite_src else float("nan"),
         "N_Corrupt": int(acc["n_corrupt"]),
         "N_Bounds": int(acc["n_bounds"]),
+        "N_Req": _req_count(requirement, acc) if requirement is not None else None,
         "N_Valid": int(n_valid),
         "Q99_Rel": _rel(acc["q99_err"], acc["q99_ori"]) if want_q99 else None,
     }
@@ -1046,17 +1164,19 @@ def _errors_from_sums(acc: dict, want_q99: bool):
 
 def evaluate_codec_pipeline(sample_np: np.ndarray, dims, codec_kwargs: dict, chunks,
                             q99_abs: float | None = None, bounds=None, compute_gradient: bool = False,
-                            gradient_axes=None, precheck_thresholds: dict | None = None):
+                            gradient_axes=None, precheck_thresholds: dict | None = None, requirement=None):
     """Round-trip `sample_np` through a pipeline in memory; returns (compression_ratio, errors_dict,
     euclidean_distance).  Fill (non-finite in the original) is left out of every norm; a cell whose class
     the round trip changes (data turned NaN/Inf, fill turned into data, NaN into Inf) is corruption,
-    counted in N_Corrupt; with `bounds` (low, high), N_Bounds counts the cells moved outside them.  With
+    counted in N_Corrupt; with `bounds` (low, high), N_Bounds counts the cells moved outside them; with
+    `requirement` (resolve_requirement), N_Req counts the cells at which its conditions fail.  With
     `precheck_thresholds`, combos failing a cheap gate skip the gradient metric, one more pass over the sample."""
     decoded, ratio = _zarr_roundtrip(sample_np, dims, codec_kwargs, chunks)
     want_q99 = q99_abs is not None and math.isfinite(q99_abs)
     with Timer("eval.metrics"):
         errors, l2_err = _errors_from_sums(
-            _error_sums(sample_np, decoded, chunks, q99_abs if want_q99 else None, bounds), want_q99)
+            _error_sums(sample_np, decoded, chunks, q99_abs if want_q99 else None, bounds, requirement),
+            want_q99, requirement)
     do_grad = compute_gradient
     if compute_gradient and precheck_thresholds is not None:
         do_grad = all(within_limit(errors[m], precheck_thresholds.get(t)) for m, t in CHEAP_GATES)
@@ -1116,7 +1236,7 @@ def _gradient_rel_l1(orig: np.ndarray, decoded: np.ndarray, axes=None, max_elems
 # =============================================================================
 
 def persist_with_codec_pipeline(da, store, component: str, codec_kwargs: dict, inner_chunks, shards,
-                                verify: bool = True, q99_abs=None, bounds=None):
+                                verify: bool = True, q99_abs=None, bounds=None, requirement=None):
     """Write dask-backed `da`, whose blocks hold whole write units (shards, else inner chunks), to `store`
     at `component`, one task per block: with `verify` the task re-reads what it wrote and adds up the error
     sums of its block, so the field is read once.  Returns (compression_ratio, errors, euclidean_distance),
@@ -1133,7 +1253,7 @@ def persist_with_codec_pipeline(da, store, component: str, codec_kwargs: dict, i
     def write(block, region):
         z[region] = block
         return _error_sums(np.asarray(block), z[region], inner_chunks, q99_abs if want_q99 else None,
-                           bounds) if verify else None
+                           bounds, requirement) if verify else None
 
     starts = [np.concatenate(([0], np.cumsum(c)[:-1])) for c in data.chunks]
     tasks = [dask.delayed(write)(block, tuple(slice(int(s[i]), int(s[i] + c[i]))
@@ -1144,7 +1264,7 @@ def persist_with_codec_pipeline(da, store, component: str, codec_kwargs: dict, i
     count_bytes, count_bytes_stored = _info_bytes(z.info_complete())
     if not verify:
         return count_bytes / count_bytes_stored, None, None
-    errors, l2_err = _errors_from_sums(_merge_sums(parts), want_q99)
+    errors, l2_err = _errors_from_sums(_merge_sums(parts), want_q99, requirement)
     return count_bytes / count_bytes_stored, errors, l2_err
 
 

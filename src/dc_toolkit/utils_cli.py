@@ -139,9 +139,12 @@ def measurement_digest() -> str:
     """Digest of the code that turns a pipeline into a result row (docstrings and comments aside): a change
     to it voids the recorded rows through sweep_state_{var}.json."""
     h = hashlib.blake2b(digest_size=8)
-    h.update(repr((utils._ACC_INIT, utils._ACC_MAX, utils._ACC_MIN, utils.CHEAP_GATES)).encode())
+    h.update(repr((utils._ACC_INIT, utils._ACC_MAX, utils._ACC_MIN, utils.CHEAP_GATES, utils._REQ_MEAN,
+                   utils._REQ_VALUE, utils._REQ_ERROR, utils._REQ_RANGE)).encode())
     for obj in (utils._zarr_roundtrip, utils._info_bytes, utils._iter_chunk_slices, utils._error_sums,
                 utils._merge_sums, utils._errors_from_sums, utils._rel, utils.within_limit,
+                utils.requirement_leaves, utils.resolve_requirement, utils._req_masks, utils._req_failing,
+                utils._req_count,
                 utils.evaluate_codec_pipeline, utils._gradient_rel_l1, utils._gradient_pieces,
                 utils._classify_sample_dims, utils._is_time_like_coord, utils._is_vertical_like_coord,
                 utils._is_vertical_like_dim, utils.horizontal_axes, utils._compute_inner_chunk_shape,
