@@ -22,7 +22,7 @@ def test_all_gates_pass():
 @pytest.mark.parametrize("metric, value, gate", [
     ("Relative_Error_L1", 0.02, "pass_l1"), ("Relative_Error_L2", 0.03, "pass_l2"),
     ("Relative_Error_Linf", 0.2, "pass_linf"), ("Bias_Rel", 0.01, "pass_bias"), ("N_Corrupt", 1, "pass_finite"),
-    ("N_Bounds", 1, "pass_bounds")])
+    ("N_Bounds", 1, "pass_bounds"), ("N_Req", 1, "pass_req")])
 def test_each_gate_fails_on_its_own(metric, value, gate):
     keep, reasons = utils_cli.evaluate_gates({**OK, metric: value}, THR)
     assert not keep and [k for k, ok in reasons.items() if not ok] == [gate]
@@ -50,6 +50,14 @@ def test_derived_thresholds():
     opts = SimpleNamespace(l1_threshold=0.01, l2_threshold=None, linf_threshold=None, bias_threshold=None,
                            q99_threshold=None, l2_gate=True, linf_gate=False, bias_gate=True, extremes_sensitive=True)
     assert utils_cli.derive_thresholds(opts) == {"l1": 0.01, "l2": 0.02, "linf": math.inf, "bias": 0.005, "q99": 0.02}
+
+
+def test_without_an_l1_budget_a_gate_needs_a_threshold_of_its_own():
+    """--requirements alone: nothing to derive the other budgets from."""
+    opts = SimpleNamespace(l1_threshold=None, l2_threshold=None, linf_threshold=0.5, bias_threshold=None,
+                           q99_threshold=None, l2_gate=True, linf_gate=True, bias_gate=True, extremes_sensitive=False)
+    assert utils_cli.derive_thresholds(opts) == {"l1": math.inf, "l2": math.inf, "linf": 0.5, "bias": math.inf,
+                                                 "q99": math.inf}
 
 
 def test_verify_thresholds_without_a_manifest_follow_the_sweep_multiples():

@@ -28,6 +28,7 @@ def test_special_fields_end_on_every_rank(mpiexec, fields, tmp_path):
     ("diag", ("--field-to-compress", "d", "--eval-data-size-limit", "1KB"), "the sample holds the single value 0"),
     ("icon", ("--field-to-compress", "qc", "--inner-chunk-mib", "1000000"), "[memcheck] FATAL: the smallest sample"),
     ("icon", ("--field-to-compress", "qc", "--memory-threshold", "0.5"), "another sweep of qc is writing"),
+    ("icon", ("--field-to-compress", "qc", "--requirements", "qc"), "one name and the level kind"),  # rank 0 alone looks it up
 ])
 def test_an_early_end_reaches_every_rank(mpiexec, fields, tmp_path, file, extra, message):
     if "another sweep" in message:  # a lock held by a live process outside Slurm

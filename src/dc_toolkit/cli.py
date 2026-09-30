@@ -141,9 +141,11 @@ _VERIFY_OPTIONS = [
 @_OVERSUBSCRIPTION_OPTION
 @utils_cli.add_options(_CHUNK_OPTIONS)
 @_MEMORY_OPTION
-@click.option("--l1-threshold", type=click.FloatRange(min=0.0), required=True,
+@click.option("--l1-threshold", type=click.FloatRange(min=0.0), default=None,
               callback=utils_cli.finite_option_callback,
-              help="Relative L1 error budget (e.g. 0.005 = 0.5%).  The anchor for the other gates.")
+              help="Relative L1 error budget (e.g. 0.005 = 0.5%).  The anchor for the other gates, and "
+                   "mandatory unless --requirements is given: without it the L1 gate is off, and the L2, "
+                   "Linf, bias and q99 gates are on only with a threshold of their own.")
 @click.option("--l2-threshold", type=click.FloatRange(min=0.0), default=None,
               callback=utils_cli.finite_option_callback,
               help="Relative L2 budget (default: 2 x L1).")
@@ -172,6 +174,15 @@ _VERIFY_OPTIONS = [
               help="Slack for --phys-min/--phys-max as a fraction of the field's value range: a lossy codec "
                    "rings past a bound the field sits on by a hair. Stored in the manifest as an absolute "
                    "value, so compress's verify gate applies the same slack.")
+@click.option("--requirements", default=None,
+              help="Gate the combos on one entry of the ESiWACE3 community recommendations (the optional "
+                   "compression-recommendations package, a list of ERA5 variables): its name and its level "
+                   "kind, e.g. grib-short-name=2t,level-kind=single.  The name key is cf-standard-name, "
+                   "cf-short-name or grib-short-name, the level kind single or pressure; both are looked up "
+                   "as typed, never taken from the file, so the entry and its units are yours to match to "
+                   "the field.  Needs --field-to-compress.  A bound the entry gives relative to the value "
+                   "range uses the range of the whole field; its limits are checked beside --phys-min and "
+                   "--phys-max, and --phys-tolerance does not loosen them.")
 @click.option("--gradient-gate/--no-gradient-gate", default=False, show_default=True,
               help="Enable the spatial-gradient gate: finite differences along the horizontal dims, or the "
                    "non-leading dims of a field without any (one more pass over the sample per combo; for "
@@ -196,7 +207,7 @@ _VERIFY_OPTIONS = [
 @click.option("--resume/--no-resume", default=True, show_default=True,
               help="Skip combos already recorded in config_space_{var}_rank*.csv: their metrics are reused "
                    "and the gates re-applied with the current thresholds.  A change to what "
-                   "sweep_state_{var}.json records (file, sample, sampling and chunk settings, bounds, "
+                   "sweep_state_{var}.json records (file, sample, sampling and chunk settings, bounds, requirement, "
                    "measuring code, row layout, metric definitions, library versions, EBCC's env vars) restarts the "
                    "field, keeping the previous results as *.previous.  A combo in flight when a rank died "
                    "is evaluated alone on the next run, and left out if it kills the rank again.")

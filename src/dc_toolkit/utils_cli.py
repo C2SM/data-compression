@@ -585,21 +585,26 @@ def check_memory_headroom(required_bytes: int, label: str, threshold: float = 0.
 # 3. GATES & THRESHOLDS
 # =============================================================================
 # Thresholds are RELATIVE errors; the L2, Linf, bias and q99 ones default to multiples of --l1-threshold;
-# off means +inf.
+# off means +inf.  A requirement (--requirements) is a gate of its own, in the field's units.
 
 _L2_MULT_DEFAULT = 2.0     # RMS may run ~2x the mean-abs budget
 _LINF_MULT_DEFAULT = 10.0
 _BIAS_MULT_DEFAULT = 0.5   # at most half the budget may be one-directional
 _Q99_MULT_DEFAULT = 2.0
 GATE_KEYS = ("l1", "l2", "linf", "bias", "q99")
+_REQ_NAME_KEYS = ("cf-standard-name", "cf-short-name", "grib-short-name")
+_REQ_LIST_URL = "https://compression-recommendations.readthedocs.io/en/latest/recommendations/"
 
 
 def derive_thresholds(opts) -> dict:
+    """Without --l1-threshold (a sweep gated by --requirements) a gate is on only with a threshold of its own."""
+    l1 = opts.l1_threshold
+
     def pick(value, mult, enabled):
-        if not enabled:
+        if not enabled or (value is None and l1 is None):
             return math.inf
-        return float(value) if value is not None else mult * opts.l1_threshold
-    return {"l1": float(opts.l1_threshold),
+        return float(value) if value is not None else mult * l1
+    return {"l1": math.inf if l1 is None else float(l1),
             "l2": pick(opts.l2_threshold, _L2_MULT_DEFAULT, opts.l2_gate),
             "linf": pick(opts.linf_threshold, _LINF_MULT_DEFAULT, opts.linf_gate),
             "bias": pick(opts.bias_threshold, _BIAS_MULT_DEFAULT, opts.bias_gate),
@@ -614,14 +619,46 @@ def gate_bounds(phys_min, phys_max, phys_slack=0.0):
     return (-math.inf if phys_min is None else phys_min - slack, math.inf if phys_max is None else phys_max + slack)
 
 
+def lookup_requirement(text: str) -> dict:
+    """--requirements: the entry of the community list (the compression-recommendations package) under one
+    name and one level kind, both looked up as typed; nothing is taken from the dataset.  Returns {markers,
+    list, entry, conditions}: what was asked, the list's version, the entry as the list prints it and its
+    conditions as plain dicts (utils.resolve_requirement)."""
+    pairs = [tuple(s.strip() for s in part.split("=", 1)) for part in text.split(",")]
+    markers = dict(p for p in pairs if len(p) == 2 and p[1])
+    if len(pairs) != 2 or len(markers) != 2 or "level-kind" not in markers or not set(markers) & set(_REQ_NAME_KEYS):
+        raise click.ClickException(f"--requirements takes one name and the level kind, e.g. grib-short-name=2t,"
+                                   f"level-kind=single (name keys: {', '.join(_REQ_NAME_KEYS)}); got '{text}'")
+    try:
+        from compression_recommendations import Recommendations
+    except ImportError as e:
+        raise click.ClickException(f"--requirements needs the compression-recommendations package ({e}): "
+                                   f"pip install -e '.[recommendations]'")
+    provided = Recommendations.provide
+    found = [r for r in provided.recommendations if r.matches(markers=markers)]
+    if len(found) != 1:
+        raise click.ClickException(
+            f"--requirements {text}: "
+            + (f"{len(found)} entries match ({'; '.join(r.humanise() for r in found)})" if found else "no entry matches")
+            + f" in compression-recommendations {provided.version} ({_REQ_LIST_URL})")
+    entry, conditions = found[0].humanise(), [r.get_config() for r in found[0].requirements]
+    try:
+        utils.resolve_requirement(conditions, 0.0)
+    except ValueError as e:
+        raise click.ClickException(f"--requirements {text}: {e} ({entry})")
+    return {"markers": markers, "list": {"version": str(provided.version), "commit": provided.metadata.get("commit")},
+            "entry": entry, "conditions": conditions}
+
+
 def evaluate_gates(errors: dict, thr: dict, *, grad_threshold=None, grad_gate=False):
     """(keep, {"pass_<gate>": bool}) for one metrics dict, for the sweep and the verify gate.  A None metric
-    or +inf limit passes.  The bounds are applied when the metrics are measured: N_Bounds counts the cells a
-    round trip moves across them."""
+    or +inf limit passes.  The bounds and the requirement are applied when the metrics are measured: N_Bounds
+    counts the cells a round trip moves across the bounds, N_Req those at which the requirement fails."""
     reasons = {f"pass_{t}": utils.within_limit(errors.get(m), thr.get(t)) for m, t in utils.CHEAP_GATES}
     reasons["pass_q99"] = utils.within_limit(errors.get("Q99_Rel"), thr.get("q99"))
     reasons["pass_finite"] = int(errors.get("N_Corrupt") or 0) == 0
     reasons["pass_bounds"] = int(errors.get("N_Bounds") or 0) == 0
+    reasons["pass_req"] = int(errors.get("N_Req") or 0) == 0
     reasons["pass_grad"] = utils.within_limit(errors.get("Grad_Rel"), grad_threshold) if grad_gate else True
     return all(reasons.values()), reasons
 
@@ -655,6 +692,10 @@ def q99_cut(sample_np: np.ndarray):
 
 def fmt3(x) -> str:
     return f"{x:.3e}" if isinstance(x, float) else "n/a"
+
+
+def fmt_limit(x) -> str:
+    return f"{x:.3e}" if math.isfinite(x) else "off"
 
 
 def verify_thresholds(manifest, overrides=None) -> dict:
@@ -943,6 +984,7 @@ class SweepContext:
     leaders: object      # one rank per node; COMM_NULL on the others
     node_id: int
     n_nodes: int
+    requirement: object  # None, or lookup_requirement's dict; _sweep_variable_body adds its range and resolved
 
 
 def sweep_setup(opts) -> SweepContext:
@@ -956,8 +998,16 @@ def sweep_setup(opts) -> SweepContext:
         raise click.ClickException("--with-ebcc needs the ebcc package: pip install -e '.[ebcc]'")
     if opts.phys_min is not None and opts.phys_max is not None and opts.phys_min > opts.phys_max:
         raise click.ClickException(f"--phys-min {opts.phys_min:g} is above --phys-max {opts.phys_max:g}.")
+    if opts.l1_threshold is None and opts.requirements is None:
+        raise click.UsageError("give --l1-threshold, --requirements, or both.")
+    if opts.l1_threshold is None and opts.q99_threshold is None and opts.extremes_sensitive:
+        raise click.ClickException("--extremes-sensitive needs --q99-threshold when no --l1-threshold sets its default.")
+    if opts.requirements is not None and opts.field_to_compress is None:
+        raise click.ClickException("--requirements describes one variable: name it with --field-to-compress.")
     comm = MPI.COMM_WORLD
     rank, size = comm.Get_rank(), comm.Get_size()
+    requirement = comm.bcast(lookup_requirement(opts.requirements) if rank == 0 and opts.requirements is not None
+                             else None, root=0)
     node_comm, ranks_on_node, local_rank = utils.detect_node_topology(comm)
     leaders = comm.Split(0 if local_rank == 0 else MPI.UNDEFINED, key=rank)
     node_id = node_comm.bcast(leaders.Get_rank() if local_rank == 0 else None, root=0)
@@ -976,15 +1026,17 @@ def sweep_setup(opts) -> SweepContext:
     thr = derive_thresholds(opts)
     if rank == 0:
         click.echo(version_banner("evaluate_combos"))
-        fmt = lambda x: "off" if not math.isfinite(x) else f"{x:.3e}"  # noqa: E731
         grad = (f"on@{opts.gradient_threshold:.3e} (shortcircuit={'on' if opts.gradient_shortcircuit else 'OFF'})"
                 if opts.gradient_gate else "off")
-        click.echo(f"[gates] thresholds (relative): L1={thr['l1']:.3e} L2={fmt(thr['l2'])} "
-                   f"Linf={fmt(thr['linf'])} bias={fmt(thr['bias'])} q99={fmt(thr['q99'])} | "
+        click.echo(f"[gates] thresholds (relative): L1={fmt_limit(thr['l1'])} L2={fmt_limit(thr['l2'])} "
+                   f"Linf={fmt_limit(thr['linf'])} bias={fmt_limit(thr['bias'])} q99={fmt_limit(thr['q99'])} | "
                    f"bounds=[{opts.phys_min}, {opts.phys_max}]"
                    f"{f' +-{opts.phys_tolerance:g} of range' if getattr(opts, 'phys_tolerance', 0) else ''} | gradient={grad}")
+        if requirement:
+            click.echo(f"[requirements] compression-recommendations {requirement['list']['version']}: "
+                       f"{requirement['entry']}")
     return SweepContext(comm, rank, size, ranks_on_node, cores_avail, thr, node_comm, local_rank, leaders,
-                        node_id, n_nodes)
+                        node_id, n_nodes, requirement)
 
 
 def sweep_variables(ds, field, rank: int) -> list:
@@ -1046,14 +1098,18 @@ def sweep_sample_limit(var: str, da, opts, sweep: SweepContext) -> int:
 
 def sweep_build_sample(da, limit: int, scan, opts, sweep: SweepContext):
     """Collective.  Rank 0 builds the sample from the time steps and levels on which the field varies
-    (scan.varying), reaching the ones where it comes nearest a gated bound, and each node maps one shared
-    copy (shared_sample_window); the dim coords travel along so every rank classifies the dims alike.
-    Returns (sample_np, sample_da, win); the caller frees win, collectively."""
+    (scan.varying), reaching the ones where it comes nearest a gated bound (--phys-min/--phys-max, or a limit
+    of the requirement), and each node maps one shared copy (shared_sample_window); the dim coords travel
+    along so every rank classifies the dims alike.  Returns (sample_np, sample_da, win); the caller frees win,
+    collectively."""
     comm, rank = sweep.comm, sweep.rank
     if rank == 0:
         candidates = {d: np.flatnonzero(v) for d, v in scan.varying.items() if v.any() and not v.all()}
-        extremes = {d: ([lo] if opts.phys_min is not None else []) + ([-hi] if opts.phys_max is not None else [])
-                    for d, (lo, hi) in scan.index_range.items()}
+        limits = [leaf for leaf in utils.requirement_leaves((sweep.requirement or {}).get("conditions", ()))
+                  if leaf["kind"] == "data-limits"]
+        low = opts.phys_min is not None or any("minimum" in leaf for leaf in limits)
+        high = opts.phys_max is not None or any("maximum" in leaf for leaf in limits)
+        extremes = {d: ([lo] if low else []) + ([-hi] if high else []) for d, (lo, hi) in scan.index_range.items()}
         try:
             local = utils.build_representative_sample(da, limit, rank=rank, policy=opts.sampling_policy,
                                                       vertical_floor=opts.vertical_floor,
@@ -1140,7 +1196,7 @@ def read_rank_csvs(where_to_write, var: str, quarantine: bool = False) -> pd.Dat
 def sweep_recorded_rows(var, sample_np, q99_abs, fso_range, bounds, opts, sweep: SweepContext):
     """Collective: (reused pipelines, crashes, state digest), decided on rank 0 before any rank opens its
     CSV.  Without --resume, or when sweep_state_{var}.json differs from this run's (dataset, sample,
-    sampling and chunk settings, bounds, measuring code, row layout, metric definitions, library versions),
+    sampling and chunk settings, bounds, requirement, measuring code, row layout, metric definitions, library versions),
     the per-rank CSVs go and the previous results, manifest and plan are kept as *.previous; else the rows
     carrying every metric the current gates need are reused (failed combos never are).  `crashes` maps each
     pipeline in flight when an earlier run died to how often, and whether it died evaluated alone (then it
@@ -1154,7 +1210,8 @@ def sweep_recorded_rows(var, sample_np, q99_abs, fso_range, bounds, opts, sweep:
             "sampling_policy": opts.sampling_policy, "vertical_floor": opts.vertical_floor,
             "inner_chunk_mib": opts.inner_chunk_mib, "spatial_split": opts.spatial_split,
             "sample_digest": hashlib.blake2b(memoryview(sample_np).cast("B"), digest_size=16).hexdigest(),
-            "bounds": bounds, "metric_definitions": utils.METRIC_DEFINITIONS, "code": measurement_digest(),
+            "bounds": bounds, "requirement": (sweep.requirement or {}).get("resolved"),
+            "metric_definitions": utils.METRIC_DEFINITIONS, "code": measurement_digest(),
             "row_columns": PARTIAL_CSV_COLUMNS, "env": env_versions()}, default=str))
         digest = state_digest(state)
         state_path = where / f"sweep_state_{var}.json"
@@ -1303,7 +1360,8 @@ def sweep_evaluators(var, sample_np, sample_da, q99_abs, bounds, opts, sweep: Sw
         ratio, errors, eucd = utils.evaluate_codec_pipeline(
             sample_np, sample_da.dims, utils.codec_pipeline_kwargs(*cfg), chunks=chunks, q99_abs=q99_abs,
             bounds=bounds, compute_gradient=opts.gradient_gate, gradient_axes=grad_axes if opts.gradient_gate else None,
-            precheck_thresholds=sweep.thresholds if (opts.gradient_gate and opts.gradient_shortcircuit) else None)
+            precheck_thresholds=sweep.thresholds if (opts.gradient_gate and opts.gradient_shortcircuit) else None,
+            requirement=(sweep.requirement or {}).get("resolved"))
         return {"name": utils.pipeline_name(*cfg), "compressor": utils.codec_label(compressor),
                 "filter": utils.codec_label(filt), "serializer": utils.codec_label(serializer),
                 "pipeline": utils.pipeline_json(*cfg),
@@ -1326,9 +1384,9 @@ def drop_partial_last_line(path) -> None:
 
 PARTIAL_CSV_COLUMNS = [
     "name", "compressor", "filter", "serializer", "pipeline",
-    "ratio", "l1_rel", "l2_rel", "linf_rel", "bias_rel", "q99_rel", "grad_rel",
-    "decoded_min", "decoded_max", "n_corrupt", "n_bounds", "eucd",
-    "pass_l1", "pass_l2", "pass_linf", "pass_bias", "pass_q99", "pass_bounds", "pass_grad", "pass_finite",
+    "ratio", "l1_rel", "l2_rel", "linf_rel", "bias_rel", "q99_rel", "grad_rel", "mean_abs_err", "max_abs_err",
+    "decoded_min", "decoded_max", "n_corrupt", "n_bounds", "n_req", "eucd",
+    "pass_l1", "pass_l2", "pass_linf", "pass_bias", "pass_q99", "pass_bounds", "pass_req", "pass_grad", "pass_finite",
     "keep",
 ]
 
@@ -1380,10 +1438,12 @@ def _evaluate_and_record(cfg, mode: str, evaluate_one, gate, pw, fw, jf, failure
             r["name"], r["compressor"], r["filter"], r["serializer"], r["pipeline"],
             r["ratio"], err["Relative_Error_L1"], err["Relative_Error_L2"], err["Relative_Error_Linf"],
             err.get("Bias_Rel"), err.get("Q99_Rel"), err.get("Grad_Rel"),
-            err.get("Decoded_Min"), err.get("Decoded_Max"), err.get("N_Corrupt", 0), err.get("N_Bounds", 0), r["eucd"],
+            err.get("Mean_Abs_Error"), err.get("Max_Abs_Error"),
+            err.get("Decoded_Min"), err.get("Decoded_Max"), err.get("N_Corrupt", 0), err.get("N_Bounds", 0),
+            err.get("N_Req"), r["eucd"],
             reasons["pass_l1"], reasons["pass_l2"], reasons["pass_linf"], reasons["pass_bias"],
-            reasons["pass_q99"], reasons["pass_bounds"], reasons["pass_grad"], reasons["pass_finite"],
-            keep,
+            reasons["pass_q99"], reasons["pass_bounds"], reasons["pass_req"], reasons["pass_grad"],
+            reasons["pass_finite"], keep,
         ])
     jf.seek(0)
     jf.truncate()
@@ -1493,7 +1553,9 @@ def sweep_report_failures(failures, var, sweep: SweepContext) -> int:
 _METRIC_COLUMNS = {
     "l1_rel": "Relative_Error_L1", "l2_rel": "Relative_Error_L2", "linf_rel": "Relative_Error_Linf",
     "bias_rel": "Bias_Rel", "q99_rel": "Q99_Rel", "grad_rel": "Grad_Rel",
+    "mean_abs_err": "Mean_Abs_Error", "max_abs_err": "Max_Abs_Error",
     "decoded_min": "Decoded_Min", "decoded_max": "Decoded_Max", "n_corrupt": "N_Corrupt", "n_bounds": "N_Bounds",
+    "n_req": "N_Req",
 }
 
 
@@ -1547,7 +1609,7 @@ SWEEP_ARG_KEYS = (
     "spatial_split", "compressor_class", "filter_class", "serializer_class", "with_lossy", "with_ebcc",
     "sampling_policy", "vertical_floor", "l1_threshold", "l2_threshold", "linf_threshold", "bias_threshold",
     "q99_threshold", "l2_gate", "linf_gate", "bias_gate", "extremes_sensitive", "phys_min", "phys_max",
-    "phys_tolerance",
+    "phys_tolerance", "requirements",
     "gradient_gate", "gradient_threshold", "resume", "max_evals",
 )
 
@@ -1565,6 +1627,7 @@ def sweep_manifest(var, opts, sweep: SweepContext, *, num_combos, n_rows, n_pass
         "gradient_threshold": float(opts.gradient_threshold) if opts.gradient_gate else None,
         "phys_min": opts.phys_min, "phys_max": opts.phys_max,
         "phys_slack": float(getattr(opts, "phys_slack", 0.0)),
+        "requirements": sweep.requirement,
         "q99_abs": q99_abs,
         "num_combos": int(num_combos), "num_rows": int(n_rows), "num_passed": int(n_passed),
         "num_filtered": int(n_rows - n_passed), "num_failed_total": int(total_failures or 0),
@@ -1585,7 +1648,10 @@ def sweep_variable(da, var: str, opts, sweep: SweepContext, n_vars: int) -> None
     t0 = time.perf_counter()
     if rank == 0:
         click.echo(f"[var] {var} | units={da.attrs.get('units', 'N/A')} | "
-                   f"relative L1 threshold={sweep.thresholds['l1']:.3e}")
+                   f"relative L1 threshold={fmt_limit(sweep.thresholds['l1'])}")
+    if sweep.requirement and da.dtype.kind in "iu" and da.dtype.itemsize == 8:  # before the scan of the field
+        raise click.ClickException(f"--requirements cannot judge {var}: the error pass reads 64-bit integers as "
+                                   f"float64, which does not hold them all.")
     lock = Path(opts.where_to_write) / f"sweep_{var}.lock"
     owner = sweep.comm.bcast(acquire_lock(lock) if rank == 0 else None, root=0)
     if owner:  # before the scan of the whole field; the same on every rank
@@ -1621,12 +1687,29 @@ def _sweep_variable_locked(da, var, opts, sweep: SweepContext, n_vars, t0):
 
 
 def _sweep_variable_body(da, var, opts, sweep: SweepContext, n_vars, t0, sample_np, sample_da, scan):
-    # Collective: every rank runs it, and an early return must be identical on every rank; sets opts.phys_slack.
+    # Collective: every rank runs it, and an early return must be identical on every rank; sets opts.phys_slack
+    # and the requirement's range and resolved conditions (--requirements names one field, so a run has one).
     rank, fso_range = sweep.rank, scan.range
     span = float(fso_range[1] - fso_range[0]) if fso_range else 0.0
     opts.phys_slack = float(getattr(opts, "phys_tolerance", 0.0) or 0.0) * span   # absolute; the manifest carries it
     bounds = gate_bounds(opts.phys_min, opts.phys_max, opts.phys_slack)
+    if sweep.requirement:
+        conditions = sweep.requirement["conditions"]  # bounds relative to the range: absolute, as phys_slack
+        sweep.requirement.update(range=span, resolved=utils.resolve_requirement(conditions, span))
     if rank == 0:
+        if sweep.requirement:
+            resolved = sweep.requirement["resolved"]
+            click.echo(f"[requirements] {var} (units={da.attrs.get('units', 'N/A')}) is checked against "
+                       f"{utils.requirement_text(resolved)}"
+                       + (f", the range-relative bounds x the field's range {span:g}" if resolved != conditions else ""))
+            leaves = list(utils.requirement_leaves(resolved))
+            sentinels = [leaf["value"] for leaf in leaves if leaf["kind"] == "missing-value"]  # beyond the limits by design
+            for leaf in leaves:
+                lo, hi = leaf.get("minimum", -math.inf), leaf.get("maximum", math.inf)
+                if leaf["kind"] == "data-limits" and fso_range and any(
+                        not lo <= v <= hi and v not in sentinels for v in fso_range):
+                    click.echo(f"[requirements] WARNING: {var} spans [{fso_range[0]:g}, {fso_range[1]:g}], beyond the "
+                               f"entry's limits [{lo:g}, {hi:g}]: is the field in the units of the list?")
         if opts.phys_slack:
             click.echo(f"[gates] {var}: bounds slack {opts.phys_slack:g} ({opts.phys_tolerance:g} of the range {span:g})")
         if bounds and fso_range and (fso_range[0] < bounds[0] or fso_range[1] > bounds[1]):
@@ -1715,7 +1798,7 @@ def _sweep_field(da, var, opts, sweep: SweepContext, n_vars, t0, sample_np, samp
         click.echo(f"best pipeline: {best['name']}\nCompression Ratio: {best['ratio']:.3f} | "
                    f"Relative L1 Error: {best['l1_rel']:.3e} | Euclidean Distance: {best['eucd']:.3e}")
     else:
-        click.echo("[sweep] no combos passed the threshold filter.")
+        click.echo("[sweep] no combos passed the gates.")
     manifest = sweep_manifest(var, opts, sweep, num_combos=len(config_space), n_rows=n_rows, n_passed=n_passed,
                               total_failures=(total_failures or 0) + len(crashed), crashed=crashed,
                               seconds=time.perf_counter() - t0, parquet_path=parquet_path, best=best,

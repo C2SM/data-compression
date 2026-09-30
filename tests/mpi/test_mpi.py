@@ -36,6 +36,20 @@ def test_results_do_not_depend_on_the_rank_count(by_ranks, n, var):
     assert len(list(by_ranks[n].glob(f"config_space_{var}_rank*.csv"))) == n
 
 
+def test_a_requirement_is_the_same_on_every_rank(mpiexec, tigge, tmp_path):
+    """Rank 0 looks the entry up; every rank counts against the same conditions."""
+    pytest.importorskip("compression_recommendations")
+    frames = []
+    for n in (1, 2):
+        r = run(mpiexec(n) + ["dc_toolkit", "evaluate_combos", tigge, "--where-to-write", tmp_path / str(n),
+                              "--field-to-compress", "q", "--requirements", "cf-short-name=q,level-kind=pressure",
+                              "--max-evals", "40"])
+        assert r.returncode == 0, r.stdout[-3000:] + r.stderr[-3000:]
+        frames.append(pd.read_parquet(tmp_path / str(n) / "results_q.parquet").sort_values("pipeline").reset_index(drop=True))
+    pd.testing.assert_frame_equal(*frames)
+    assert 0 < frames[0]["pass_req"].sum() < 40 and r.stdout.count("[requirements] q (units=") == 1
+
+
 def test_failed_read_reaches_every_rank(mpiexec):
     r = run(mpiexec(2) + [sys.executable, HERE / "scan_fault.py"], timeout=120)
     assert r.returncode == 0 and "PASS" in r.stdout, r.stdout + r.stderr

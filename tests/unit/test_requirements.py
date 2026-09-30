@@ -1,5 +1,9 @@
 """The requirement count (N_Req): each kind of condition, mean conditions decided over the whole field, and
-the verdict of the community list's own checker on every entry of the list."""
+the verdict of the community list's own checker on every entry of the list; the lookup behind --requirements."""
+import json
+import sys
+
+import click
 import dask.array as dsa
 import numpy as np
 import pytest
@@ -7,7 +11,7 @@ import xarray as xr
 import zarr
 from zarr.codecs import numcodecs as nc
 
-from dc_toolkit import utils
+from dc_toolkit import utils, utils_cli
 
 MAX_ABS, MAX_REL = "max-pointwise-absolute-error-bound", "max-pointwise-relative-error-bound"
 MEAN_ABS, MEAN_REL = "mean-absolute-error-bound", "mean-relative-error-bound"
@@ -215,3 +219,55 @@ def test_any_tree_of_conditions_gets_the_verdict_of_the_checker():
             assert _holds(x, y, [condition]) == theirs, (condition, dtype, amplitude)
             verdicts[theirs] += 1
     assert min(verdicts.values()) > 300, verdicts
+
+
+@pytest.mark.parametrize("text", [
+    "t", "cf-short-name=t", "level-kind=pressure", "cf-short-name=t,level=pressure", "name=t,level-kind=pressure",
+    "cf-short-name=t,grib-short-name=t", "cf-short-name=,level-kind=pressure",
+    "cf-short-name=t,level-kind=pressure,tags=x", "cf-short-name=t,cf-short-name=q,level-kind=pressure"])
+def test_the_lookup_takes_one_name_and_the_level_kind(text):
+    with pytest.raises(click.ClickException, match="one name and the level kind"):
+        utils_cli.lookup_requirement(text)
+
+
+def test_the_lookup_names_the_missing_package(monkeypatch):
+    monkeypatch.setitem(sys.modules, "compression_recommendations", None)
+    with pytest.raises(click.ClickException, match=r"pip install -e '\.\[recommendations\]'"):
+        utils_cli.lookup_requirement("cf-short-name=t,level-kind=pressure")
+
+
+def test_the_lookup_returns_the_entry_as_the_list_gives_it():
+    """compression-recommendations 0.1.0a2, the version pyproject.toml pins."""
+    pytest.importorskip("compression_recommendations")
+    found = utils_cli.lookup_requirement(" grib-short-name = 2t , level-kind = single ")
+    assert found["markers"] == {"grib-short-name": "2t", "level-kind": "single"}
+    assert found["conditions"] == [{"kind": "any", "requirements": [{"kind": "all", "requirements": [
+        {"kind": MAX_ABS, "value": 0.05}]}]}]
+    assert "GribShortName(2t)" in found["entry"] and found["list"]["version"]
+    assert json.loads(json.dumps(found)) == found   # plain data: it travels to the ranks and into the manifest
+
+
+@pytest.mark.parametrize("text", ["cf-short-name=nope,level-kind=single", "cf-short-name=t,level-kind=single",
+                                  "cf-short-name=t,level-kind=surface", "cf-short-name=T,level-kind=pressure"])
+def test_the_lookup_never_settles_for_a_near_match(text):
+    """t is an entry on pressure levels only; nothing is tried in another case, level or name key."""
+    pytest.importorskip("compression_recommendations")
+    with pytest.raises(click.ClickException, match="no entry matches"):
+        utils_cli.lookup_requirement(text)
+
+
+def test_every_name_of_the_list_selects_one_entry_the_gate_can_check():
+    """A name and its level kind never match two entries (z exists on single and on pressure levels), and the
+    gate knows every kind of condition the list uses."""
+    provided = pytest.importorskip("compression_recommendations").Recommendations.provide
+
+    def leaves(node):
+        return [leaf for f in node.get("filters", ()) for leaf in leaves(f)] or [node]
+
+    for entry in provided.recommendations:
+        found = [leaf for f in entry.get_config()["filters"] for leaf in leaves(f)]
+        level = next(leaf["value"] for leaf in found if leaf["kind"] == "level-kind")
+        for leaf in found:
+            if leaf["kind"] != "level-kind":
+                got = utils_cli.lookup_requirement(f"{leaf['kind']}={leaf['value']},level-kind={level}")
+                assert got["entry"] == entry.humanise()
