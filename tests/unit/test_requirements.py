@@ -101,6 +101,21 @@ def test_range_relative_bounds_become_absolute():
         "(MaxPointwiseAbsoluteErrorBound(0.5) or MeanAbsoluteErrorBound(1)) and DataLimits(minimum=0)"
 
 
+def test_a_unit_factor_converts_what_the_list_gives_in_units():
+    """The list's metres for a field in kg m-2 (mm): bounds relative to a value or to the range have no units."""
+    conditions = [{"kind": "any", "requirements": [
+        {"kind": MEAN_ABS, "value": 1e-05}, {"kind": MAX_ABS, "value": 0.002}, {"kind": MEAN_REL, "value": 0.01},
+        {"kind": "max-pointwise-range-relative-error-bound", "value": 0.01}]},
+        {"kind": "data-limits", "minimum": 0.0, "maximum": 0.5}, {"kind": "isovalue", "value": 0.25}, {"kind": "lossless"}]
+    assert utils.requirement_text(utils.requirement_in_units(conditions, 1000.0)) == (
+        "(MeanAbsoluteErrorBound(0.01) or MaxPointwiseAbsoluteErrorBound(2) or MeanRelativeErrorBound(0.01) or "
+        "MaxPointwiseRangeRelativeErrorBound(0.01)) and DataLimits(minimum=0, maximum=500) and Isovalue(250) and Lossless")
+    assert conditions[0]["requirements"][0]["value"] == 1e-05      # the list's own conditions stay as they are
+    assert utils.requirement_in_units(conditions, None) is conditions
+    with pytest.raises(ValueError, match="sentinel"):              # a code, not a quantity
+        utils.requirement_in_units([{"kind": "all", "requirements": [{"kind": "missing-value", "value": 255}]}], 1000.0)
+
+
 @pytest.mark.parametrize("condition", [
     {"kind": "max-pointwise-quadratic-error-bound", "value": 1, "minimum": 0, "maximum": 1},  # a kind the list has, unused
     {"kind": "median-range-relative-error-bound", "value": 0.1},
@@ -163,12 +178,14 @@ def _holds(x, y, conditions) -> bool:
 def test_every_entry_of_the_list_gets_the_verdict_of_its_own_checker():
     """dc_toolkit counts in float64, chunk by chunk; compression-requirement-checks decides in exact fractions
     over the whole array.  They must agree on every entry, from an exact copy to a reconstruction far off, so
-    that each entry is seen to hold and to fail."""
+    that each entry is seen to hold and to fail.  The same field in units 1024 times smaller (a power of two
+    scales every number exactly) gets that verdict from the entry converted with the unit factor."""
     provided = pytest.importorskip("compression_recommendations").Recommendations.provide
     check = pytest.importorskip("compression_requirement_checks").check_safety_requirements
     rng = np.random.default_rng(11)
     for i, entry in enumerate(provided.recommendations):
         conditions = [r.get_config() for r in entry.requirements]
+        sentinel = any(leaf["kind"] == "missing-value" for leaf in utils.requirement_leaves(conditions))
         bound = max((leaf["value"] for leaf in utils.requirement_leaves(conditions)
                      if leaf["kind"] in (MAX_ABS, MEAN_ABS)), default=0.0)  # a field some decades above it, if any
         scale = bound * 10.0 ** rng.uniform(0, 3) if bound else 10.0 ** rng.uniform(-6, 5)
@@ -178,6 +195,9 @@ def test_every_entry_of_the_list_gets_the_verdict_of_its_own_checker():
             y = _reconstruction(rng, x, amplitude, keep_zeros=k % 2 == 0)
             theirs = check(original=x, reconstructed=y, requirements=entry.requirements)
             assert _holds(x, y, conditions) == theirs, (entry.humanise(), k)
+            if not sentinel:
+                assert _holds(x * 1024, y * 1024, utils.requirement_in_units(conditions, 1024.0)) == theirs, \
+                    (entry.humanise(), k)
             verdicts.add(theirs)
         assert verdicts == {True, False}, entry.humanise()
 

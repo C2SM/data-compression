@@ -60,8 +60,34 @@ def test_resume_reuses_the_rows_of_the_same_requirement(tigge, sweep_copy, swept
     pd.testing.assert_frame_equal(a, b)
 
 
+def test_a_unit_factor_converts_the_entry_to_the_units_of_the_field(tigge, tmp_path, swept):
+    """As if t were in units 400 times smaller than the entry's kelvin: its 0.05 becomes 20, the looser bound
+    now that the one relative to the range (0.86) has no units to convert."""
+    out = invoke("evaluate_combos", tigge, "--where-to-write", tmp_path, *T, *EVALS,
+                 "--requirements-unit-factor", "400").output
+    m = json.loads((tmp_path / "manifest_t.json").read_text())
+    req, df = m["requirements"], pd.read_parquet(tmp_path / "results_t.parquet")
+    assert req["unit_factor"] == m["args"]["requirements_unit_factor"] == 400
+    assert req["conditions"] == json.loads((swept[0] / "manifest_t.json").read_text())["requirements"]["conditions"]
+    assert (f"is checked against (MaxPointwiseAbsoluteErrorBound(20) or MaxPointwiseAbsoluteErrorBound("
+            f"{0.01 * req['range']:g})), the range-relative bounds x the field's range {req['range']:g}, "
+            f"the entry's bounds and limits x 400 (--requirements-unit-factor)") in out
+    assert (df["pass_req"] == (df["max_abs_err"] <= 20)).all()
+    assert pd.read_parquet(swept[0] / "results_t.parquet")["pass_req"].sum() < df["pass_req"].sum() < len(df)
+
+
+def test_a_unit_factor_leaves_an_entry_without_units_as_it_is(tigge, tmp_path):
+    """q is held within 1 % of its own value: the factor has no number to convert, and the recorded rows stay."""
+    q = ("--field-to-compress", "q", "--requirements", "cf-short-name=q,level-kind=pressure", "--max-evals", "10")
+    invoke("evaluate_combos", tigge, "--where-to-write", tmp_path, *q)
+    out = invoke("evaluate_combos", tigge, "--where-to-write", tmp_path, *q, "--requirements-unit-factor", "1000").output
+    assert "MaxPointwiseRelativeErrorBound(0.01); --requirements-unit-factor 1000 changes none of the entry's numbers" in out
+    assert "[resume] 10 of 10 combo(s) of 'q' are already recorded" in out
+
+
 @pytest.mark.parametrize("gates", [("--l1-threshold", "0.005"),  # no requirement any more
-                                   ("--requirements", "cf-short-name=q,level-kind=pressure")])
+                                   ("--requirements", "cf-short-name=q,level-kind=pressure"),
+                                   (*T[2:], "--requirements-unit-factor", "400")])  # the entry in other units
 def test_another_requirement_restarts_the_field(tigge, sweep_copy, gates):
     """N_Req was counted against the conditions in sweep_state_t.json, as N_Bounds against the bounds."""
     out = invoke("evaluate_combos", tigge, "--where-to-write", sweep_copy, "--field-to-compress", "t", *EVALS,
@@ -102,6 +128,11 @@ def test_a_limit_of_the_entry_is_sampled_as_a_bound_is(fields, tmp_path):
     ((*T, "--extremes-sensitive"), 1, "--extremes-sensitive needs --q99-threshold"),
     (("--field-to-compress", "t", "--requirements", "t"), 1, "one name and the level kind"),
     (("--field-to-compress", "t", "--requirements", "cf-short-name=t,level-kind=single"), 1, "no entry matches"),
+    (("--field-to-compress", "t", "--l1-threshold", "0.005", "--requirements-unit-factor", "1000"), 1,
+     "--requirements-unit-factor converts the entry of --requirements"),
+    ((*T, "--requirements-unit-factor", "0"), 2, "Invalid value for '--requirements-unit-factor'"),
+    (("--field-to-compress", "t", "--requirements", "cf-short-name=slt,level-kind=single",
+      "--requirements-unit-factor", "1000"), 1, "a unit factor cannot convert the sentinel"),
 ])
 def test_refused_inputs(tigge, tmp_path, args, code, message):
     assert message in invoke("evaluate_combos", tigge, "--where-to-write", tmp_path, *args, code=code).output
