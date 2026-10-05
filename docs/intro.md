@@ -800,10 +800,53 @@ about your data that no program can make for you. Check three things:
   [requirements] WARNING: t spans [232.938, 319.289], beyond the entry's limits [0, 1]: is the field in the units of the list?
   ```
 
+  A field that holds the list's variable in other units takes a factor: see the next heading.
+
 - **The level kind.** A name can have an entry for each kind (`z` has two), and a field on model levels has
   none.
 
 `--requirements` needs `--field-to-compress`, since an entry describes one variable.
+
+### A field in other units
+
+Models often store a variable of the list in other units than ERA5 does. The entry still applies once its
+numbers are converted, and **`--requirements-unit-factor`** converts them: give the number of *your field's*
+units that make **one unit of the list's variable**.
+
+| The list's variable | Your field | `--requirements-unit-factor` |
+|---|---|---|
+| precipitation `tp` in m | kg m-2, which is mm | `1000` |
+| cloud cover `tcc` as a fraction of 1 | % | `100` |
+| pressure `msl` in Pa | hPa | `0.01` |
+
+For precipitation in kg m-2:
+
+```bash
+mpirun -n 8 dc_toolkit evaluate_combos precip.nc --where-to-write out --field-to-compress tp \
+    --requirements "grib-short-name=tp,level-kind=single" --requirements-unit-factor 1000
+```
+
+```text
+[requirements] compression-recommendations 0.1.0-a2: ((CfShortName(tp) or GribShortName(tp)) and LevelKind(single)) -> (MeanAbsoluteErrorBound(1e-05) and DataLimits(minimum=0.0))
+[requirements] tp (units=kg m-2) is checked against MeanAbsoluteErrorBound(0.01) and DataLimits(minimum=0), the entry's bounds and limits x 1000 (--requirements-unit-factor)
+```
+
+The first line is the entry as the list has it, in metres. The second is what the field is held to: a mean
+error of 1e-05 m is 0.01 kg m-2. Without the factor the sweep takes the entry's numbers as they are and holds
+the field to a mean error of 1e-05 kg m-2, a thousand times stricter than the list asks. Nothing warns about
+that, because the entry's only limit, 0, is the same in both units.
+
+- **What is converted** is what the entry gives in units: a bound on the absolute error, limits and an
+  isovalue. A bound relative to a cell's value or to the value range has no units and stays as it is.
+- **What is not covered.** A sentinel (`MissingValue`) is a code and not a quantity, so an entry with one takes
+  no factor. Units that differ by an offset (°C for K) are not a factor: a bound on the absolute error is the
+  same in both, a limit or a bound relative to the value is not.
+- **The factor is yours to state**, like the entry: it is never read from the `units` attribute. Converting
+  the units does not make two variables the same one. Whether your field is the list's variable (for
+  precipitation: an amount over the same kind of period, not a rate) remains your judgement.
+
+The manifest and the store record the factor beside the entry (`unit_factor`), and the converted numbers are
+part of the requirement: another factor, another sweep.
 
 ### What is checked
 
@@ -900,8 +943,9 @@ print("list", record["requirements"]["list"]["version"], "| failing cells:", rec
 list 0.1.0-a2 | failing cells: 0 | largest error: 0.553
 ```
 
-`manifest_t.json` holds the same under `requirements`: what you asked for (`markers`), the list's version,
-the entry and its conditions, the range, and the numbers that were checked (`resolved`).
+`manifest_t.json` holds the same under `requirements`: what you asked for (`markers`, and `unit_factor` when
+you gave one), the list's version, the entry and its conditions, the range, and the numbers that were checked
+(`resolved`).
 
 ### With the other gates
 
@@ -1000,7 +1044,8 @@ field that failed, or whose pipeline, budget or source file changed, is written 
 | `give --l1-threshold, --requirements, or both` | the sweep has no gate to keep pipelines by | pass a budget (section 2), a community requirement (section 10), or both |
 | `--requirements needs the compression-recommendations package` | the list is not installed | `pip install -e ".[recommendations]"` (section 10) |
 | `--requirements ...: no entry matches` | the list has no entry under that name and level kind as typed; nothing is guessed | copy the name and the level kind from [the list](https://compression-recommendations.readthedocs.io/en/latest/recommendations/); a variable that is not on it needs a budget of your own |
-| `[requirements] WARNING: x spans [...], beyond the entry's limits` | the field's own values lie outside what the entry allows: most likely other units than the list's, or another variable | check the entry and the units (section 10) |
+| `[requirements] WARNING: x spans [...], beyond the entry's limits` | the field's own values lie outside what the entry allows: most likely other units than the list's, or another variable | check the entry and the units; `--requirements-unit-factor` converts an entry to the field's units (section 10) |
+| `--requirements ...: a unit factor cannot convert the sentinel` | the entry names a missing-value code, which has no units | leave out `--requirements-unit-factor`: such an entry describes categories |
 | `--serializer-class ebcc has nothing for this field: ...` | the field is not a float (lat, lon) grid, or no tile fits its frame (section 8) | sweep it without EBCC |
 | `invalid pipeline ... (e.g. FixedScaleOffset->ZFPY, ...)` | one of the pairings section 7 lists as refused | fix that pairing: `bitround` before `zfpy` only with the full mantissa, no `fixedscaleoffset` before `zfpy` (or before 8-bit `pcodec`), EBCC with no compressor and at most the `astype` filter |
 | `[verify-gate] FAIL` and exit status 1 | the written field exceeds the budget, or its pipeline changed missing values (`pass_finite`), moved values beyond `--phys-min`/`--phys-max` (`pass_bounds`) or breaks the sweep's requirement at a cell (`pass_req`) | loosen the budget, or choose a more careful pipeline (for `pass_finite`, one without `fixedscaleoffset` and `zfpy`; for `pass_req`, a larger `--eval-data-size-limit` shows the sweep more of the field); nothing was left in the store |
@@ -1048,6 +1093,7 @@ mpirun -n 8 dc_toolkit evaluate_combos FILE --where-to-write DIR --field-to-comp
 # a community requirement as the gate (pip install -e ".[recommendations]"); --l1-threshold is then optional
 mpirun -n 8 dc_toolkit evaluate_combos FILE --where-to-write DIR --field-to-compress VAR --requirements "grib-short-name=2t,level-kind=single"
 
+# an entry for a field in other units     ... --requirements-unit-factor 1000   (kg m-2 under an entry in m)
 # lossless only                           ... --without-lossy
 # a store any Zarr reader opens           dc_toolkit compress FILE DIR --stock-codecs-only
 # look inside a store                     dc_toolkit open_zarr_and_inspect STORE.zarr

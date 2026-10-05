@@ -108,9 +108,10 @@ env | grep "^EBCC_" | sed "s/^/[santis.run] ebcc env : /"
 #   GATE FLAGS go to evaluate_combos as they are: --phys-min/--phys-max for bounded
 #   fields (with --phys-tolerance for one that sits on its bound), --gradient-gate for
 #   fields whose gradients matter, --requirements NAME-KEY=NAME,level-kind=LEVEL for a
-#   field that is a variable of the community list, in its units and on its level kind
-#   (docs/intro.md, section 10; needs the "recommendations" extra in venv/).  L1 may
-#   then be empty: the requirement gates alone.
+#   field that is a variable of the community list, in its units (else with
+#   --requirements-unit-factor, e.g. 1000 for kg m-2 under an entry in m) and on its
+#   level kind (docs/intro.md, section 10; needs the "recommendations" extra in venv/).
+#   L1 may then be empty: the requirement gates alone.
 LIST=(
     # R02B06, 3-D
     "R02B06|out_1_1|remap_qv_20220225T000000Z.nc|qv|qv|0.01|2GiB|32|--gradient-gate --gradient-threshold 0.1 --gradient-shortcircuit --extremes-sensitive --phys-min 0"
