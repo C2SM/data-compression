@@ -181,9 +181,17 @@ _VERIFY_OPTIONS = [
                    "kind, e.g. grib-short-name=2t,level-kind=single.  The name key is cf-standard-name, "
                    "cf-short-name or grib-short-name, the level kind single or pressure; both are looked up "
                    "as typed, never taken from the file, so the entry and its units are yours to match to "
-                   "the field.  Needs --field-to-compress.  A bound the entry gives relative to the value "
+                   "the field (--requirements-unit-factor for a field in other units).  Needs "
+                   "--field-to-compress.  A bound the entry gives relative to the value "
                    "range uses the range of the whole field; its limits are checked beside --phys-min and "
                    "--phys-max, and --phys-tolerance does not loosen them.")
+@click.option("--requirements-unit-factor", type=click.FloatRange(min=0.0, min_open=True), default=None,
+              callback=utils_cli.finite_option_callback,
+              help="For a field in other units than the variable of the --requirements entry: how many of the "
+                   "field's units make one unit of the list's, e.g. 1000 for precipitation in kg m-2 (mm) under "
+                   "an entry in m.  The entry's absolute error bounds, limits and isovalue are multiplied by "
+                   "it; bounds relative to a value or to the range have no units and stay.  Yours to state, "
+                   "like the entry: it is never derived from the file.")
 @click.option("--gradient-gate/--no-gradient-gate", default=False, show_default=True,
               help="Enable the spatial-gradient gate: finite differences along the horizontal dims, or the "
                    "non-leading dims of a field without any (one more pass over the sample per combo; for "

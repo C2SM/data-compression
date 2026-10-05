@@ -619,11 +619,11 @@ def gate_bounds(phys_min, phys_max, phys_slack=0.0):
     return (-math.inf if phys_min is None else phys_min - slack, math.inf if phys_max is None else phys_max + slack)
 
 
-def lookup_requirement(text: str) -> dict:
+def lookup_requirement(text: str, unit_factor=None) -> dict:
     """--requirements: the entry of the community list (the compression-recommendations package) under one
     name and one level kind, both looked up as typed; nothing is taken from the dataset.  Returns {markers,
-    list, entry, conditions}: what was asked, the list's version, the entry as the list prints it and its
-    conditions as plain dicts (utils.resolve_requirement)."""
+    list, entry, unit_factor, conditions}: what was asked, the list's version, the entry as the list prints
+    it, --requirements-unit-factor and the entry's conditions as plain dicts (utils.resolve_requirement)."""
     pairs = [tuple(s.strip() for s in part.split("=", 1)) for part in text.split(",")]
     markers = dict(p for p in pairs if len(p) == 2 and p[1])
     if len(pairs) != 2 or len(markers) != 2 or "level-kind" not in markers or not set(markers) & set(_REQ_NAME_KEYS):
@@ -643,11 +643,11 @@ def lookup_requirement(text: str) -> dict:
             + f" in compression-recommendations {provided.version} ({_REQ_LIST_URL})")
     entry, conditions = found[0].humanise(), [r.get_config() for r in found[0].requirements]
     try:
-        utils.resolve_requirement(conditions, 0.0)
+        utils.resolve_requirement(utils.requirement_in_units(conditions, unit_factor), 0.0)
     except ValueError as e:
         raise click.ClickException(f"--requirements {text}: {e} ({entry})")
     return {"markers": markers, "list": {"version": str(provided.version), "commit": provided.metadata.get("commit")},
-            "entry": entry, "conditions": conditions}
+            "entry": entry, "unit_factor": unit_factor, "conditions": conditions}
 
 
 def evaluate_gates(errors: dict, thr: dict, *, grad_threshold=None, grad_gate=False):
@@ -1011,10 +1011,12 @@ def sweep_setup(opts) -> SweepContext:
         raise click.ClickException("--extremes-sensitive needs --q99-threshold when no --l1-threshold sets its default.")
     if opts.requirements is not None and opts.field_to_compress is None:
         raise click.ClickException("--requirements describes one variable: name it with --field-to-compress.")
+    if opts.requirements_unit_factor is not None and opts.requirements is None:
+        raise click.ClickException("--requirements-unit-factor converts the entry of --requirements: give one.")
     comm = MPI.COMM_WORLD
     rank, size = comm.Get_rank(), comm.Get_size()
-    requirement = comm.bcast(lookup_requirement(opts.requirements) if rank == 0 and opts.requirements is not None
-                             else None, root=0)
+    requirement = comm.bcast(lookup_requirement(opts.requirements, opts.requirements_unit_factor)
+                             if rank == 0 and opts.requirements is not None else None, root=0)
     node_comm, ranks_on_node, local_rank = utils.detect_node_topology(comm)
     leaders = comm.Split(0 if local_rank == 0 else MPI.UNDEFINED, key=rank)
     node_id = node_comm.bcast(leaders.Get_rank() if local_rank == 0 else None, root=0)
@@ -1616,7 +1618,7 @@ SWEEP_ARG_KEYS = (
     "spatial_split", "compressor_class", "filter_class", "serializer_class", "with_lossy", "with_ebcc",
     "sampling_policy", "vertical_floor", "l1_threshold", "l2_threshold", "linf_threshold", "bias_threshold",
     "q99_threshold", "l2_gate", "linf_gate", "bias_gate", "extremes_sensitive", "phys_min", "phys_max",
-    "phys_tolerance", "requirements",
+    "phys_tolerance", "requirements", "requirements_unit_factor",
     "gradient_gate", "gradient_threshold", "resume", "max_evals",
 )
 
@@ -1700,15 +1702,20 @@ def _sweep_variable_body(da, var, opts, sweep: SweepContext, n_vars, t0, sample_
     span = float(fso_range[1] - fso_range[0]) if fso_range else 0.0
     opts.phys_slack = float(getattr(opts, "phys_tolerance", 0.0) or 0.0) * span   # absolute; the manifest carries it
     bounds = gate_bounds(opts.phys_min, opts.phys_max, opts.phys_slack)
-    if sweep.requirement:
-        conditions = sweep.requirement["conditions"]  # bounds relative to the range: absolute, as phys_slack
+    if sweep.requirement:  # in the field's units, then bounds relative to the range: absolute, as phys_slack
+        factor = sweep.requirement["unit_factor"]
+        conditions = utils.requirement_in_units(sweep.requirement["conditions"], factor)
         sweep.requirement.update(range=span, resolved=utils.resolve_requirement(conditions, span))
     if rank == 0:
         if sweep.requirement:
             resolved = sweep.requirement["resolved"]
             click.echo(f"[requirements] {var} (units={da.attrs.get('units', 'N/A')}) is checked against "
                        f"{utils.requirement_text(resolved)}"
-                       + (f", the range-relative bounds x the field's range {span:g}" if resolved != conditions else ""))
+                       + (f", the range-relative bounds x the field's range {span:g}" if resolved != conditions else "")
+                       + ("" if factor is None else
+                          f", the entry's bounds and limits x {factor:g} (--requirements-unit-factor)"
+                          if conditions != sweep.requirement["conditions"] else
+                          f"; --requirements-unit-factor {factor:g} changes none of the entry's numbers"))
             leaves = list(utils.requirement_leaves(resolved))
             sentinels = [leaf["value"] for leaf in leaves if leaf["kind"] == "missing-value"]  # beyond the limits by design
             for leaf in leaves:

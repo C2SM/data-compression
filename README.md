@@ -187,6 +187,10 @@ dc_toolkit compress input.nc ./out
   the list holds ERA5 variables, its bounds are in their units (which the package does not state), and whether an
   entry fits a field is the user's call.  The sweep prints the entry beside the field's `units`, and warns when
   the field's own values lie beyond the entry's limits.
+- For a field that holds the list's variable in other units, `--requirements-unit-factor` states how many of the
+  field's units make one unit of the list's (`1000` for precipitation in kg m-2 under the entry in m, `100` for
+  cloud cover in % under the entry as a fraction): the entry's absolute error bounds, limits and isovalue are
+  multiplied by it, and its relative bounds stay.  The factor is the user's to state, never read from the file.
 - A pipeline is kept when no cell breaks the entry's conditions (`n_req` is 0, `pass_req`).  A bound relative to the
   value range uses the range of the whole field; a bound on the mean is measured on the sample by the sweep and on
   the whole field by `compress`.  The verdict is that of the list's own checker, `compression-requirement-checks`,

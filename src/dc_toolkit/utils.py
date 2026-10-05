@@ -967,6 +967,7 @@ _REQ_MEAN = ("mean-absolute-error-bound", "mean-relative-error-bound")  # decide
 _REQ_VALUE = ("data-limits", "isovalue", "missing-value", "lossless")   # judge the decoded values themselves
 _REQ_ERROR = ("max-pointwise-absolute-error-bound", "max-pointwise-relative-error-bound")
 _REQ_RANGE = ("max-pointwise-range-relative-error-bound", "mean-range-relative-error-bound")  # resolved to absolute
+_REQ_UNITS = (_REQ_MEAN[0], _REQ_ERROR[0], "data-limits", "isovalue")  # numbers in the units of the list's variable
 
 
 def requirement_leaves(conditions):
@@ -976,6 +977,24 @@ def requirement_leaves(conditions):
             yield from requirement_leaves(node["requirements"])
         else:
             yield node
+
+
+def requirement_in_units(conditions, factor) -> list:
+    """`conditions` for a field in other units than the list's variable: the numbers of the _REQ_UNITS kinds
+    times `factor`, the field's units per unit of the list's (None: as they are).  Raises ValueError for a
+    sentinel, which is a code and not a quantity."""
+    if factor is None:
+        return conditions
+    out = []
+    for node in conditions:
+        kind = node["kind"]
+        if kind in ("any", "all"):
+            out.append({"kind": kind, "requirements": requirement_in_units(node["requirements"], factor)})
+        elif kind == "missing-value":
+            raise ValueError(f"a unit factor cannot convert the sentinel of {node}")
+        else:
+            out.append({k: v * factor if kind in _REQ_UNITS and k != "kind" else v for k, v in node.items()})
+    return out
 
 
 def resolve_requirement(conditions, span: float) -> list:
