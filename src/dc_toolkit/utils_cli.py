@@ -149,7 +149,8 @@ def measurement_digest() -> str:
                 utils._classify_sample_dims, utils._is_time_like_coord, utils._is_vertical_like_coord,
                 utils._is_vertical_like_dim, utils.horizontal_axes, utils._compute_inner_chunk_shape,
                 utils._shrink_order, utils.compute_chunk_shape_for_eval, utils.codec_pipeline_kwargs, utils.ebcc_chunks,
-                codecs.ZFPYRank, codecs.ZFPYFlat, codecs._ZFPYFlatCodec, codecs.EBCC, q99_cut, sweep_evaluators):
+                utils.filter_codecs, codecs.ZFPYRank, codecs.ZFPYFlat, codecs._ZFPYFlatCodec, codecs.EBCC,
+                codecs._ClampCodec, codecs.Clamp, q99_cut, sweep_evaluators):
         tree = ast.parse(textwrap.dedent(inspect.getsource(obj)))
         for node in ast.walk(tree):
             body = getattr(node, "body", None)
@@ -619,6 +620,18 @@ def gate_bounds(phys_min, phys_max, phys_slack=0.0):
     return (-math.inf if phys_min is None else phys_min - slack, math.inf if phys_max is None else phys_max + slack)
 
 
+def clamp_codec(opts, conditions):
+    """The Clamp of --clamp-to-bounds, or None without it: --phys-min/--phys-max and the data-limits of the
+    requirement's `conditions` (in the field's units), the tighter side of each."""
+    if not getattr(opts, "clamp_to_bounds", False):
+        return None
+    limits = [leaf for leaf in utils.requirement_leaves(conditions) if leaf["kind"] == "data-limits"]
+    lo = [v for v in [opts.phys_min] + [leaf.get("minimum") for leaf in limits] if v is not None]
+    hi = [v for v in [opts.phys_max] + [leaf.get("maximum") for leaf in limits] if v is not None]
+    bounds = {"minimum": max(lo) if lo else None, "maximum": min(hi) if hi else None}
+    return utils.Clamp(**{k: v for k, v in bounds.items() if v is not None})
+
+
 def lookup_requirement(text: str, unit_factor=None) -> dict:
     """--requirements: the entry of the community list (the compression-recommendations package) under one
     name and one level kind, both looked up as typed; nothing is taken from the dataset.  Returns {markers,
@@ -837,16 +850,20 @@ def validate_pipeline(combo, da, var: str) -> None:
     if not utils.combo_is_valid(filt, serializer, compressor, dtype=da.dtype):
         raise click.ClickException(
             f"{var}: invalid pipeline {utils.pipeline_name(*combo)} (e.g. FixedScaleOffset->ZFPY, "
-            f"BitRound->ZFPY below the mantissa width, "
-            f"or EBCC with a compressor or a filter other than AsType).")
-    config = getattr(filt, "codec_config", None) or {}
-    for key in ("dtype", "decode_dtype"):
-        if config.get(key) is not None and np.dtype(config[key]) != da.dtype:
-            raise click.ClickException(f"{var}: the pipeline's {utils.codec_label(filt)} was built for "
-                                       f"{config[key]}, not the field's {da.dtype}.")
+            f"BitRound->ZFPY below the mantissa width, EBCC with a compressor or a filter other than AsType, "
+            f"or a clamp anywhere but first in the filter chain and before zfp or EBCC).")
+    chain = utils.filter_codecs(filt)
+    if any(isinstance(f, utils.Clamp) for f in chain) and da.dtype.kind != "f":
+        raise click.ClickException(f"{var}: the pipeline's clamp applies to a float field, not {da.dtype}.")
+    for f in chain:
+        config = getattr(f, "codec_config", None) or {}
+        for key in ("dtype", "decode_dtype"):
+            if config.get(key) is not None and np.dtype(config[key]) != da.dtype:
+                raise click.ClickException(f"{var}: the pipeline's {utils.codec_label(f)} was built for "
+                                           f"{config[key]}, not the field's {da.dtype}.")
     if isinstance(serializer, utils.EBCC):
-        astype = isinstance(filt, utils.zarrcodecs_nc.AsType)
-        input_dtype = np.dtype(filt.codec_config.get("encode_dtype", da.dtype)) if astype else da.dtype
+        astype = next((f for f in chain if isinstance(f, utils.zarrcodecs_nc.AsType)), None)
+        input_dtype = np.dtype(astype.codec_config.get("encode_dtype", da.dtype)) if astype else da.dtype
         if input_dtype != np.float32:
             raise click.ClickException(f"{var}: EBCC needs float32 input, got {input_dtype}"
                                        + (" from the AsType filter." if astype else
@@ -957,8 +974,8 @@ def fso_range_problem(combo, errors):
     """Why the pipeline's FixedScaleOffset cannot hold the written field (the verify pass's Source_Min and
     Source_Max), or None: it does not clip, and a value beyond its range wraps.  The field's extremes are
     scaled in its own dtype, as the codec does; the encoding is monotone, so they decide."""
-    filt = combo[1]
-    if not isinstance(filt, utils.zarrcodecs_nc.FixedScaleOffset) or not errors:
+    filt = next((f for f in utils.filter_codecs(combo[1]) if isinstance(f, utils.zarrcodecs_nc.FixedScaleOffset)), None)
+    if filt is None or not errors:
         return None
     cfg = filt.codec_config
     offset, scale, astype = float(cfg["offset"]), float(cfg["scale"]), np.dtype(cfg["astype"])
@@ -1017,6 +1034,11 @@ def sweep_setup(opts) -> SweepContext:
     rank, size = comm.Get_rank(), comm.Get_size()
     requirement = comm.bcast(lookup_requirement(opts.requirements, opts.requirements_unit_factor)
                              if rank == 0 and opts.requirements is not None else None, root=0)
+    if opts.clamp_to_bounds and opts.phys_min is None and opts.phys_max is None and not any(
+            k in leaf for leaf in utils.requirement_leaves((requirement or {}).get("conditions", ()))
+            if leaf["kind"] == "data-limits" for k in ("minimum", "maximum")):
+        raise click.ClickException("--clamp-to-bounds needs --phys-min, --phys-max, or a --requirements entry "
+                                   "with data limits.")
     node_comm, ranks_on_node, local_rank = utils.detect_node_topology(comm)
     leaders = comm.Split(0 if local_rank == 0 else MPI.UNDEFINED, key=rank)
     node_id = node_comm.bcast(leaders.Get_rank() if local_rank == 0 else None, root=0)
@@ -1040,7 +1062,8 @@ def sweep_setup(opts) -> SweepContext:
         click.echo(f"[gates] thresholds (relative): L1={fmt_limit(thr['l1'])} L2={fmt_limit(thr['l2'])} "
                    f"Linf={fmt_limit(thr['linf'])} bias={fmt_limit(thr['bias'])} q99={fmt_limit(thr['q99'])} | "
                    f"bounds=[{opts.phys_min}, {opts.phys_max}]"
-                   f"{f' +-{opts.phys_tolerance:g} of range' if getattr(opts, 'phys_tolerance', 0) else ''} | gradient={grad}")
+                   f"{f' +-{opts.phys_tolerance:g} of range' if getattr(opts, 'phys_tolerance', 0) else ''}"
+                   f"{' | clamp=on' if opts.clamp_to_bounds else ''} | gradient={grad}")
         if requirement:
             click.echo(f"[requirements] compression-recommendations {requirement['list']['version']}: "
                        f"{requirement['entry']}")
@@ -1220,6 +1243,7 @@ def sweep_recorded_rows(var, sample_np, q99_abs, fso_range, bounds, opts, sweep:
             "inner_chunk_mib": opts.inner_chunk_mib, "spatial_split": opts.spatial_split,
             "sample_digest": hashlib.blake2b(memoryview(sample_np).cast("B"), digest_size=16).hexdigest(),
             "bounds": bounds, "requirement": (sweep.requirement or {}).get("resolved"),
+            "clamp": None if getattr(opts, "clamp", None) is None else opts.clamp.to_dict(),
             "metric_definitions": utils.METRIC_DEFINITIONS, "code": measurement_digest(),
             "row_columns": PARTIAL_CSV_COLUMNS, "env": env_versions()}, default=str))
         digest = state_digest(state)
@@ -1295,11 +1319,12 @@ def reusable_rows(prev: pd.DataFrame, q99_abs, opts, thresholds: dict) -> pd.Ser
     return ok
 
 
-def sweep_config_space(compressors, filters, serializers, max_evals, rank, dtype, all_finite: bool) -> list:
+def sweep_config_space(compressors, filters, serializers, max_evals, rank, dtype, all_finite: bool, clamp=None) -> list:
     """Triples to evaluate: the EBCC ones (none unless `all_finite`, never cut), then the valid non-EBCC
     product, a seeded uniform subset of --max-evals of them when capped (a quick-test knob; a larger cap
     extends a smaller one), shuffled so each node's every-n_nodes-th share mixes cheap and expensive codecs;
-    the seeds depend only on the counts, so --resume keeps the order."""
+    the seeds depend only on the counts, so --resume keeps the order.  With `clamp` (--clamp-to-bounds) the
+    combos with a lossy serializer get it in front of their filter, after the subset is drawn."""
     regular = [s for s in serializers if not isinstance(s, utils.EBCC)]
     total = len(compressors) * len(filters) * len(regular)
     config_space = [(c, f, s) for c, f, s in itertools.product(compressors, filters, regular)
@@ -1315,6 +1340,9 @@ def sweep_config_space(compressors, filters, serializers, max_evals, rank, dtype
     entries, reason = utils.ebcc_sweep_entries(filters, serializers, dtype, all_finite)
     if reason and rank == 0:
         click.echo(f"[ebcc] skipping EBCC combos: {reason}.")
+    if clamp is not None:
+        config_space = [(c, utils.with_clamp(f, clamp) if utils.lossy_serializer(s) else f, s) for c, f, s in config_space]
+        entries = [(c, utils.with_clamp(f, clamp), s) for c, f, s in entries]
     # EBCC first: its combos are the slowest, and a node that claims one last runs long after the others
     perm = np.random.default_rng(seed=(len(config_space) + len(entries)) & 0xFFFFFFFF).permutation(len(config_space))
     return entries + [config_space[i] for i in perm]
@@ -1618,7 +1646,7 @@ SWEEP_ARG_KEYS = (
     "spatial_split", "compressor_class", "filter_class", "serializer_class", "with_lossy", "with_ebcc",
     "sampling_policy", "vertical_floor", "l1_threshold", "l2_threshold", "linf_threshold", "bias_threshold",
     "q99_threshold", "l2_gate", "linf_gate", "bias_gate", "extremes_sensitive", "phys_min", "phys_max",
-    "phys_tolerance", "requirements", "requirements_unit_factor",
+    "phys_tolerance", "clamp_to_bounds", "requirements", "requirements_unit_factor",
     "gradient_gate", "gradient_threshold", "resume", "max_evals",
 )
 
@@ -1636,6 +1664,7 @@ def sweep_manifest(var, opts, sweep: SweepContext, *, num_combos, n_rows, n_pass
         "gradient_threshold": float(opts.gradient_threshold) if opts.gradient_gate else None,
         "phys_min": opts.phys_min, "phys_max": opts.phys_max,
         "phys_slack": float(getattr(opts, "phys_slack", 0.0)),
+        "clamp": None if getattr(opts, "clamp", None) is None else opts.clamp.to_dict(),
         "requirements": sweep.requirement,
         "q99_abs": q99_abs,
         "num_combos": int(num_combos), "num_rows": int(n_rows), "num_passed": int(n_passed),
@@ -1702,10 +1731,12 @@ def _sweep_variable_body(da, var, opts, sweep: SweepContext, n_vars, t0, sample_
     span = float(fso_range[1] - fso_range[0]) if fso_range else 0.0
     opts.phys_slack = float(getattr(opts, "phys_tolerance", 0.0) or 0.0) * span   # absolute; the manifest carries it
     bounds = gate_bounds(opts.phys_min, opts.phys_max, opts.phys_slack)
+    conditions = ()
     if sweep.requirement:  # in the field's units, then bounds relative to the range: absolute, as phys_slack
         factor = sweep.requirement["unit_factor"]
         conditions = utils.requirement_in_units(sweep.requirement["conditions"], factor)
         sweep.requirement.update(range=span, resolved=utils.resolve_requirement(conditions, span))
+    opts.clamp = clamp_codec(opts, conditions)  # the sweep state and the lossy serializers' combos carry it
     if rank == 0:
         if sweep.requirement:
             resolved = sweep.requirement["resolved"]
@@ -1777,7 +1808,12 @@ def _sweep_field(da, var, opts, sweep: SweepContext, n_vars, t0, sample_np, samp
     if opts.with_ebcc and rank == 0:
         tile, reason = utils.ebcc_tile(sample_da)
         click.echo(f"[ebcc] {var}: " + (f"tile {tile[0]}x{tile[1]}" if tile else f"not applicable ({reason})"))
-    config_space = sweep_config_space(*spaces, opts.max_evals, rank, sample_np.dtype, scan.nonfinite == 0)
+    clamp = getattr(opts, "clamp", None)
+    config_space = sweep_config_space(*spaces, opts.max_evals, rank, sample_np.dtype, scan.nonfinite == 0, clamp=clamp)
+    if clamp is not None and rank == 0:
+        n = sum(any(isinstance(f, utils.Clamp) for f in utils.filter_codecs(cfg[1])) for cfg in config_space)
+        click.echo(f"[clamp] {var}: {n} combo(s) with zfp or EBCC decode through {utils.codec_label(clamp)}"
+                   + ("." if n else "; --clamp-to-bounds has nothing to clip in this codec space."))
     keys = [utils.pipeline_json(*cfg) for cfg in config_space]
     culprits = {k for k, c in crashes.items() if c.get("alone")}
     pending = [i for i, key in enumerate(keys) if key not in done and key not in culprits]
@@ -2416,7 +2452,8 @@ def error_plot_panels(da, field: str, combo):
     chunks = "auto"
     if isinstance(serializer, utils.EBCC):  # validate_pipeline already checked dtype/tile/finite
         if da.dtype != np.float32:  # the cast replaces the AsType filter
-            da, filt = da.astype("float32"), None
+            da = da.astype("float32")
+            filt = tuple(f for f in utils.filter_codecs(filt) if not isinstance(f, utils.zarrcodecs_nc.AsType)) or None
         chunks = utils.ebcc_chunks(serializer, da.shape)
     codec_kwargs = utils.codec_pipeline_kwargs(compressor, filt, serializer)
     lon_dim = da.dims[1]

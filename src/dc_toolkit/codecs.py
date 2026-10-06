@@ -1,5 +1,6 @@
-"""The zarr codecs dc_toolkit adds: ZFPY at a chunk's own rank or flattened to 1-D, and EBCC.  A zarr
-client reads their arrays through the "zarr.codecs" entry points without MPI or the rest of the package."""
+"""The zarr codecs dc_toolkit adds: ZFPY at a chunk's own rank or flattened to 1-D, EBCC, and Clamp, a
+decode-side clip to a field's physical bounds.  A zarr client reads their arrays through the "zarr.codecs"
+entry points without MPI or the rest of the package."""
 import asyncio
 import ctypes
 import importlib
@@ -8,10 +9,12 @@ import os
 import struct
 
 import numcodecs
+import numcodecs.abc
+import numcodecs.compat
 import numcodecs.zfpy
 import numpy as np
 from zarr.codecs import numcodecs as zarrcodecs_nc
-from zarr.codecs.numcodecs._codecs import _NumcodecsArrayBytesCodec
+from zarr.codecs.numcodecs._codecs import _NumcodecsArrayArrayCodec, _NumcodecsArrayBytesCodec
 from zarr.registry import register_codec
 
 os.environ.setdefault("EBCC_LOG_LEVEL", "4")  # the C library logs to stderr; 4 = errors only
@@ -75,6 +78,61 @@ class ZFPYFlat(ZFPYRank, codec_name="zfpy_flat"):
 
 
 register_codec("numcodecs.zfpy_flat", ZFPYFlat)   # in-process reads must not depend on the install's entry points
+
+
+# ---- Clamp: the physical bounds, applied on decode -----------------------------
+# A lossy serializer (zfp, EBCC) holds every cell within its error bound but not within the field's
+# range: a dry cell of a precipitation field comes back slightly negative.  Clamp is the identity on
+# encode and clips to [minimum, maximum] on decode, in the field's own dtype; a cell the source holds
+# within the bounds can only come nearer its value, so no error grows, and NaN stays NaN.  It goes first
+# in the filter chain so that it runs last on decode, after the other filters (Delta sums, AsType casts).
+class _ClampCodec(numcodecs.abc.Codec):
+    codec_id = "clamp"
+
+    def __init__(self, minimum=None, maximum=None):
+        bounds = {k: v for k, v in (("minimum", minimum), ("maximum", maximum)) if v is not None}
+        if not bounds:
+            raise ValueError("clamp needs a minimum and/or a maximum")
+        if not all(math.isfinite(float(v)) for v in bounds.values()):
+            raise ValueError(f"clamp bounds must be finite, got {bounds}")
+        if len(bounds) == 2 and float(minimum) > float(maximum):
+            raise ValueError(f"clamp minimum {minimum} is above its maximum {maximum}")
+        self.minimum = None if minimum is None else float(minimum)
+        self.maximum = None if maximum is None else float(maximum)
+
+    def encode(self, buf):
+        return buf
+
+    def decode(self, buf, out=None):
+        arr = numcodecs.compat.ensure_ndarray(buf)
+        if arr.dtype.kind != "f":
+            raise TypeError(f"clamp applies to float arrays, not {arr.dtype}")
+        lo = -np.inf if self.minimum is None else arr.dtype.type(self.minimum)
+        hi = np.inf if self.maximum is None else arr.dtype.type(self.maximum)
+        return numcodecs.compat.ndarray_copy(np.clip(arr, lo, hi), out)
+
+    def get_config(self):
+        return {"id": self.codec_id, **{k: v for k, v in (("minimum", self.minimum), ("maximum", self.maximum))
+                                        if v is not None}}
+
+
+numcodecs.register_codec(_ClampCodec)
+
+
+class Clamp(_NumcodecsArrayArrayCodec, codec_name="clamp"):
+    """zarr v3 wrapper, "numcodecs.clamp" in zarr.json with {"minimum": lo} and/or {"maximum": hi}, as
+    floats: the bounds are part of the pipeline's identity.  Source only: zarr replaces __doc__."""
+
+    def __init__(self, **codec_config):
+        bounds = {k: float(codec_config[k]) for k in ("minimum", "maximum") if codec_config.get(k) is not None}
+        super().__init__(**{**codec_config, **bounds})
+        self._codec  # noqa: B018  (rejects an empty, non-finite or inverted configuration now, not at decode)
+
+    def compute_encoded_size(self, input_byte_length, chunk_spec):
+        return input_byte_length
+
+
+register_codec("numcodecs.clamp", Clamp)
 
 
 # ---- EBCC (optional): JPEG 2000 base layer + error-bounded residual ----------

@@ -36,7 +36,7 @@ from zarr.core.sync import sync as _zarr_sync
 from zarr.codecs import numcodecs as zarrcodecs_nc
 from zarr.registry import get_codec_class
 
-from dc_toolkit.codecs import EBCC, EBCC_AVAILABLE, _EBCC_TILE_MAX, _EBCC_TILE_MIN, ZFPYFlat, ZFPYRank
+from dc_toolkit.codecs import EBCC, EBCC_AVAILABLE, _EBCC_TILE_MAX, _EBCC_TILE_MIN, Clamp, ZFPYFlat, ZFPYRank
 
 
 class CombinationProducedNonFiniteError(Exception):
@@ -803,12 +803,36 @@ def fixed_scale_offset_configs(da, data_range=None):
     return configs
 
 
+def filter_codecs(filt) -> tuple:
+    """The array->array codecs in a pipeline's filter slot: none, one, or the chain --clamp-to-bounds
+    builds (the Clamp, then the filter)."""
+    return () if filt is None else tuple(filt) if isinstance(filt, tuple) else (filt,)
+
+
+def lossy_serializer(serializer) -> bool:
+    """zfp (every mode) and EBCC: they hold an error bound, not the field's range."""
+    return isinstance(serializer, (zarrcodecs_nc.ZFPY, EBCC))
+
+
+def with_clamp(filt, clamp):
+    """`filt` with `clamp` in front of it (None: `filt` as is): first on encode, so last on decode."""
+    return filt if clamp is None else (clamp,) + filter_codecs(filt)
+
+
 def combo_is_valid(filt, serializer, compressor=None, dtype=None) -> bool:
     """Reject pairings that crash, corrupt or gain nothing: FixedScaleOffset's unsigned ints into ZFPY
     (every mode), or 8-bit ones into PCodec; BitRound below the mantissa width into ZFPY, which codes
     its integer bit view lossily so decoding corrupts exponents (checked when `dtype`, the field's, is
     given); EBCC with a compressor (gains nothing) or a filter other than AsType (breaks its error
-    bound; validate_pipeline checks that the cast is to float32)."""
+    bound; validate_pipeline checks that the cast is to float32); a filter chain other than one Clamp
+    in front of at most one filter, before a lossy serializer (the other codecs keep the field's range)."""
+    chain = filter_codecs(filt)
+    if len(chain) > 1 or (chain and isinstance(chain[0], Clamp)):
+        if not (isinstance(chain[0], Clamp) and len(chain) <= 2 and lossy_serializer(serializer)
+                and not any(isinstance(f, Clamp) for f in chain[1:])):
+            return False
+        chain = chain[1:]
+    filt = chain[0] if chain else None
     if isinstance(serializer, EBCC):
         return compressor is None and (filt is None or isinstance(filt, zarrcodecs_nc.AsType))
     if (isinstance(filt, zarrcodecs_nc.BitRound) and isinstance(serializer, zarrcodecs_nc.ZFPY)
@@ -830,35 +854,39 @@ def combo_is_valid(filt, serializer, compressor=None, dtype=None) -> bool:
 def codec_pipeline_kwargs(compressor, filt, serializer) -> dict:
     """zarr.create_array kwargs for a (compressor, filter, serializer) triple; None means none: no
     filter, no compressor (not zarr's default Zstd), the plain bytes serializer."""
-    return {"filters": [filt] if filt is not None else None,
+    return {"filters": list(filter_codecs(filt)) or None,
             "compressors": [compressor] if compressor is not None else None,
             "serializer": "auto" if serializer is None else serializer}
 
 
 # Checked before zarr's registry, which returns stock ZFPY for ZFPYRank's "numcodecs.zfpy".
 _CODEC_CLASSES = {"numcodecs.zfpy": ZFPYRank, "numcodecs.zfpy_flat": ZFPYFlat,
-                  "numcodecs.ebcc_filter": EBCC}
+                  "numcodecs.ebcc_filter": EBCC, "numcodecs.clamp": Clamp}
 # Resolvable only through dc_toolkit's zarr.codecs entry point (README, "Reading a store without dc_toolkit").
-ENTRY_POINT_CODECS = frozenset(("numcodecs.zfpy_flat", "numcodecs.ebcc_filter"))
+ENTRY_POINT_CODECS = frozenset(("numcodecs.zfpy_flat", "numcodecs.ebcc_filter", "numcodecs.clamp"))
 
 
 def pipeline_is_stock(pipeline: dict) -> bool:
     """True when every codec of a pipeline dict decodes in a bare zarr client."""
-    codecs = (pipeline.get(k) for k in ("compressor", "filter", "serializer"))
+    codecs = [c for k in ("compressor", "filter", "serializer")
+              for c in (pipeline.get(k) if isinstance(pipeline.get(k), list) else [pipeline.get(k)])]
     return all(not isinstance(c, dict) or c.get("name") not in ENTRY_POINT_CODECS for c in codecs)
 
 
 def codec_from_dict(d):
     if d is None:
         return None
+    if isinstance(d, list):  # the filter chain of --clamp-to-bounds
+        return tuple(codec_from_dict(c) for c in d)
     cls = _CODEC_CLASSES.get(d["name"]) or get_codec_class(d["name"])
     return cls.from_dict(d)
 
 
 def pipeline_to_dict(compressor, filt, serializer) -> dict:
-    """The identity of a combination: the zarr JSON form of its codecs."""
+    """The identity of a combination: the zarr JSON form of its codecs; a filter chain is a list."""
+    chain = [c.to_dict() for c in filter_codecs(filt)]
     return {"compressor": None if compressor is None else compressor.to_dict(),
-            "filter": None if filt is None else filt.to_dict(),
+            "filter": None if not chain else chain[0] if len(chain) == 1 else chain,
             "serializer": None if serializer is None else serializer.to_dict()}
 
 
@@ -879,6 +907,8 @@ def codec_label(codec) -> str:
     """Label like 'zstd(level=6)', keys sorted so it does not depend on the codec's origin; '-' for None."""
     if codec is None:
         return "-"
+    if isinstance(codec, tuple):
+        return "+".join(map(codec_label, codec))
     if isinstance(codec, EBCC):
         return repr(codec)
     d = codec.to_dict()

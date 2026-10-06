@@ -631,7 +631,7 @@ also be reused through `--pipeline path/to/manifest_t.json`, as long as the fram
 
 EBCC keeps every cell within its error bound, but not within the field's range. After encoding a tile it
 shifts the whole tile by its mean error: the tile's mean comes out exact, and so do none of its zeros. The dry
-cells of a precipitation field come back slightly negative, or all slightly positive. Two settings keep
+cells of a precipitation field come back slightly negative, or all slightly positive. Three settings keep
 that out of a store:
 
 - `--phys-min 0` (section 9): the sweep drops every pipeline that moves a cell below 0 on the sample, and
@@ -640,7 +640,19 @@ that out of a store:
   the tile, and a tile it stores as JPEG 2000 alone stays within its own minimum and maximum, most of its
   zeros exactly 0. A tile that also carries EBCC's correction layer can still undershoot by up to the error
   bound, so keep `--phys-min`. The mean is no longer exact (the bias gate still applies), and the files
-  come out slightly smaller: EBCC stops holding back 1 % of the bound for the shift.
+  come out slightly smaller: EBCC stops holding back 1 % of the bound for the shift;
+- `--clamp-to-bounds`, with `--phys-min 0` (or an entry of section 10 whose limits say it): every EBCC and
+  zfp pipeline gains a `clamp` filter that clips what the codec decodes to the bounds. A cell within the
+  bounds can only come nearer its value, so no error grows, and the undershoot is gone for good: the dry
+  cells come back as exactly 0. The clamp is a codec of the pipeline (`numcodecs.clamp`), so `compress`
+  writes it into the store and every reader with dc_toolkit's codecs applies it (a store that must open
+  without them needs `--stock-codecs-only`, section 9). Cells your file already holds beyond a bound come
+  back on it.
+
+```text
+[clamp] tot_prec: 7 combo(s) with zfp or EBCC decode through clamp(minimum=0.0).
+best pipeline: - | clamp(minimum=0.0) | EBCC(height=2000, width=2000, base_cr=2, max_error_target=0.0654848)
+```
 
 The library only checks that the variable exists: `=0` switches the shift off too, and only
 `unset EBCC_DISABLE_MEAN_ADJUSTMENT` brings it back. `srun` hands it to every rank (Open MPI's `mpirun`
@@ -685,12 +697,13 @@ filter for a float field); for serializers, `all` includes plain bytes and `none
 | Option | Use it when |
 |---|---|
 | `--phys-min 0`, `--phys-max 100` | a value the pipeline moves beyond these bounds is wrong by definition (negative humidity, 101 % cloud cover); values your file already has beyond them do not count. `--phys-tolerance 0.0001` allows a hair of overshoot, as a fraction of the field's range, which lossy codecs produce on fields that sit exactly on a bound. |
+| `--clamp-to-bounds` | the field sits on a bound and zfp or EBCC is wanted: their pipelines clip what they decode to `--phys-min`/`--phys-max` (and the limits of a `--requirements` entry), as a codec of the pipeline that every reader applies; no error grows, the overshoot is gone (section 8) |
 | `--extremes-sensitive` | the rare large values are what matters (precipitation, gusts, CAPE): adds a gate on the top 1 % of values (of the non-zero values, for a field that is 0 almost everywhere) |
 | `--gradient-gate` | differences between neighbouring cells matter (wind, pressure): adds a gate on horizontal gradients (along the other non-leading dims for a field without horizontal ones) |
 
-**A store that opens anywhere.** Two codecs exist only inside `dc_toolkit`: EBCC, and `zfpy_flat`, a variant
-of zfp that regularly wins sweeps. A store that uses either one cannot be opened by a Zarr reader without
-`dc_toolkit` installed. When your data must open anywhere:
+**A store that opens anywhere.** Three codecs exist only inside `dc_toolkit`: EBCC, `zfpy_flat`, a variant
+of zfp that regularly wins sweeps, and the `clamp` of `--clamp-to-bounds`. A store that uses one of them cannot
+be opened by a Zarr reader without `dc_toolkit` installed. When your data must open anywhere:
 
 ```bash
 dc_toolkit compress "$FILE" "$OUT/sweep_ebcc" --stock-codecs-only
@@ -964,7 +977,10 @@ derive it from.
 An entry's limits (`DataLimits`) are part of the requirement. They are checked whether or not you also pass
 `--phys-min` and `--phys-max`, and when you do, both apply. `--phys-tolerance` loosens only your own bounds,
 never the entry's: a pipeline that moves a dry cell of a precipitation field below 0, by however little, does
-not meet `DataLimits(minimum=0)`.
+not meet `DataLimits(minimum=0)`. zfp and EBCC do exactly that on a field that sits on its bound, and it is the
+one thing that keeps them from such an entry: `--clamp-to-bounds` (section 8) clips what they decode to the
+entry's limits (and to `--phys-min`/`--phys-max`, the tighter side of each), with no error growing, so the
+requirement can hold. The clip is written into the store as a codec of the pipeline.
 
 ### Another requirement, another sweep
 
@@ -1094,6 +1110,7 @@ mpirun -n 8 dc_toolkit evaluate_combos FILE --where-to-write DIR --field-to-comp
 mpirun -n 8 dc_toolkit evaluate_combos FILE --where-to-write DIR --field-to-compress VAR --requirements "grib-short-name=2t,level-kind=single"
 
 # an entry for a field in other units     ... --requirements-unit-factor 1000   (kg m-2 under an entry in m)
+# clip zfp and EBCC to the bounds         ... --phys-min 0 --clamp-to-bounds    (or the entry's limits)
 # lossless only                           ... --without-lossy
 # a store any Zarr reader opens           dc_toolkit compress FILE DIR --stock-codecs-only
 # look inside a store                     dc_toolkit open_zarr_and_inspect STORE.zarr
