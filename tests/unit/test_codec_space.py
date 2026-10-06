@@ -194,3 +194,97 @@ def test_validate_pipeline_refuses_another_dtype():
     fso = nc.FixedScaleOffset(offset=0.0, scale=1.0, dtype="float64", astype="uint16")
     with pytest.raises(click.ClickException, match="built for float64"):
         utils_cli.validate_pipeline((None, fso, None), da, "x")
+
+
+def test_clamp_clips_on_decode_only():
+    """Clamp is the identity on encode and clips on decode, in the array's dtype; NaN stays NaN."""
+    c = utils.Clamp(minimum=0)
+    x = np.array([[-1.0, 0.0, 0.5, np.nan, 2.0]], dtype="f4")
+    assert np.array_equal(c._codec.encode(x), x, equal_nan=True)
+    d = c._codec.decode(x.copy())
+    assert d.dtype == x.dtype and np.array_equal(d, [[0.0, 0.0, 0.5, np.nan, 2.0]], equal_nan=True)
+    assert utils.Clamp(maximum=1)._codec.decode(x.copy())[0, -1] == 1.0
+    assert c.to_dict() == {"name": "numcodecs.clamp", "configuration": {"minimum": 0.0}}
+    assert utils.codec_label(utils.Clamp(minimum=0, maximum=100)) == "clamp(maximum=100.0, minimum=0.0)"
+    for bad in ({}, {"minimum": float("nan")}, {"minimum": 1, "maximum": 0}):
+        with pytest.raises(ValueError):
+            utils.Clamp(**bad)
+    with pytest.raises(TypeError, match="float arrays"):
+        c._codec.decode(np.array([1, 2], dtype="i4"))
+
+
+def test_clamp_chain_round_trips_through_zarr_and_its_json():
+    """The clamp is a codec of the pipeline: zarr.json carries it first in the filter chain, so it runs last
+    on decode; no cell's error grows; the JSON identity survives from_dict(to_dict), a chain as a list."""
+    rng = np.random.default_rng(0)
+    f = np.where(rng.random((4, 46, 90)) < 0.3, 0.0, rng.random((4, 46, 90)) * 0.01).astype("f4")
+    zf, zstd = utils.ZFPYRank(mode=4, tolerance=0.01), nc.Zstd(level=3)
+
+    def roundtrip(filt):
+        z = zarr.create_array(store=zarr.storage.MemoryStore(), shape=f.shape, dtype=f.dtype, chunks=(1, 46, 90),
+                              **utils.codec_pipeline_kwargs(zstd, filt, zf))
+        z[...] = f
+        return z[...], [m["name"] for m in z.metadata.to_dict()["codecs"]]
+
+    plain, _ = roundtrip(None)
+    assert plain.min() < 0  # zfp rings below the zeros
+    chains = ((utils.Clamp(minimum=0),), (utils.Clamp(minimum=0), nc.Quantize(digits=3, dtype="float32")))
+    for filt in chains:
+        d, names = roundtrip(filt)
+        assert d.min() == 0 and names[:len(filt)] == [c.to_dict()["name"] for c in filt]
+        key = utils.pipeline_json(zstd, filt, zf)
+        assert utils.pipeline_json(*utils.pipeline_from_dict(json.loads(key))) == key
+        assert not utils.pipeline_is_stock(json.loads(key))
+    d, _ = roundtrip(chains[0])
+    assert (np.abs(d - f) <= np.abs(plain - f)).all()
+    one, two = (json.loads(utils.pipeline_json(zstd, filt, zf))["filter"] for filt in chains)
+    assert one == {"name": "numcodecs.clamp", "configuration": {"minimum": 0.0}}  # a chain of one is that codec
+    assert [c["name"] for c in two] == ["numcodecs.clamp", "numcodecs.quantize"]
+    assert utils.pipeline_name(zstd, chains[1], zf).startswith("zstd(level=3) | clamp(minimum=0.0)+quantize(")
+
+
+def test_clamp_pairing_rules():
+    c, zf, q = utils.Clamp(minimum=0), utils.ZFPYRank(mode=2, rate=8), nc.Quantize(digits=3, dtype="float32")
+    assert utils.combo_is_valid((c,), zf, None) and utils.combo_is_valid((c, q), zf, nc.Zstd(level=3))
+    assert not utils.combo_is_valid((c,), nc.PCodec(level=8), None)  # nothing to clip behind a lossless serializer
+    assert not utils.combo_is_valid((c,), None, None)
+    assert not utils.combo_is_valid((q, c), zf, None)                 # last on decode means first in the chain
+    assert not utils.combo_is_valid((c, c), zf, None)
+    assert not utils.combo_is_valid((q, q), zf, None)                 # no other chain
+    assert not utils.combo_is_valid((c, nc.BitRound(keepbits=7)), zf, None, dtype=np.dtype("f4"))  # the old rules hold behind it
+    assert utils.combo_is_valid((c, nc.BitRound(keepbits=23)), zf, None, dtype=np.dtype("f4"))
+
+
+@pytest.mark.ebcc
+def test_ebcc_clamp_pairing_rules():
+    pytest.importorskip("ebcc")
+    c, ebcc = utils.Clamp(minimum=0), utils.EBCC.from_params(46, 90, 0.1)
+    cast = nc.AsType(encode_dtype="float32", decode_dtype="float64")
+    assert utils.combo_is_valid((c,), ebcc, None) and utils.combo_is_valid((c, cast), ebcc, None)
+    assert not utils.combo_is_valid((c, nc.BitRound(keepbits=7)), ebcc, None)
+    assert not utils.combo_is_valid((c,), ebcc, nc.Zstd(level=3))
+
+
+def test_config_space_clamps_the_lossy_serializers_only():
+    """--clamp-to-bounds puts the clamp in front of every zfp/EBCC combo and nowhere else, after the
+    --max-evals subset is drawn: the same combos, with and without it."""
+    comps, filts, sers = space("float32")
+    plain = utils_cli.sweep_config_space(comps, filts, sers, 50, 0, np.dtype("float32"), True)
+    clamped = utils_cli.sweep_config_space(comps, filts, sers, 50, 0, np.dtype("float32"), True,
+                                           clamp=utils.Clamp(minimum=0))
+    assert len(plain) == len(clamped) == 50
+    for (c, f, s), (c2, f2, s2) in zip(plain, clamped):
+        assert c is c2 and s is s2
+        if utils.lossy_serializer(s):
+            chain = utils.filter_codecs(f2)
+            assert isinstance(chain[0], utils.Clamp) and chain[1:] == utils.filter_codecs(f)
+        else:
+            assert f2 is f
+    kinds = {utils.lossy_serializer(s) for _, _, s in plain}
+    assert kinds == {True, False}
+
+
+def test_validate_pipeline_refuses_a_clamp_on_an_integer_field():
+    da = xr.DataArray(np.zeros((4, 8), "i4"), dims=("time", "ncells"))
+    with pytest.raises(click.ClickException, match="float field"):
+        utils_cli.validate_pipeline((None, (utils.Clamp(minimum=0),), utils.ZFPYRank(mode=2, rate=8)), da, "x")

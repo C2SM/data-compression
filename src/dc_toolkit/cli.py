@@ -175,6 +175,13 @@ _VERIFY_OPTIONS = [
               help="Slack for --phys-min/--phys-max as a fraction of the field's value range: a lossy codec "
                    "rings past a bound the field sits on by a hair. Stored in the manifest as an absolute "
                    "value, so compress's verify gate applies the same slack.")
+@click.option("--clamp-to-bounds/--no-clamp-to-bounds", default=False, show_default=True,
+              help="Clip what zfp and EBCC decode to the physical bounds: --phys-min/--phys-max and the limits "
+                   "of the --requirements entry, the tighter side of each.  They hold an error bound, not the "
+                   "field's range, so a dry cell of a precipitation field comes back slightly negative; clipped, "
+                   "a cell within the bounds can only come nearer its value, so no error grows.  The clip is a "
+                   "codec of the pipeline (numcodecs.clamp, read through dc_toolkit's entry point), applied by "
+                   "every reader; cells the source holds beyond the bounds come back on them.")
 @click.option("--requirements", default=None,
               help="Gate the combos on one entry of the ESiWACE3 community recommendations (the optional "
                    "compression-recommendations package, a list of ERA5 variables): its name and its level "
@@ -263,7 +270,8 @@ _VERIFY_THRESHOLD_OPTIONS = [
                    "later sweep superseded.")
 @click.option("--stock-codecs-only", is_flag=True, default=False,
               help="Write only pipelines a zarr client without dc_toolkit can decode: when the sweep's best uses a codec "
-                   "that needs dc_toolkit's zarr.codecs entry point (numcodecs.zfpy_flat, numcodecs.ebcc_filter), "
+                   "that needs dc_toolkit's zarr.codecs entry point (numcodecs.zfpy_flat, numcodecs.ebcc_filter, "
+                   "numcodecs.clamp), "
                    "take the best stock row of results_{var}.parquet instead.  A --pipeline with such a codec "
                    "is refused, a field already stored with one is rewritten even under --skip-existing, and "
                    "the run fails while the store still holds any such array (fields outside --vars included).")

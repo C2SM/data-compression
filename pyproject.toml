@@ -54,6 +54,8 @@ dc_toolkit = 'dc_toolkit.cli:cli'
 # ZFPY on each chunk flattened to 1-D.  Its bytes are plain zfp; it needs a name of its own because
 # a pipeline's identity is its JSON and "numcodecs.zfpy" is the rank-wise encoder (ZFPYRank).
 "numcodecs.zfpy_flat" = "dc_toolkit.codecs:ZFPYFlat"
+# The decode-side clip of evaluate_combos --clamp-to-bounds: the bounds live in zarr.json, the reader applies them.
+"numcodecs.clamp" = "dc_toolkit.codecs:Clamp"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
