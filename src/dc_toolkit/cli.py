@@ -160,6 +160,13 @@ _VERIFY_OPTIONS = [
               callback=utils_cli.finite_option_callback,
               help="Relative budget over cells with |value| >= the 99th percentile, taken over the non-zero "
                    "values when the plain one is 0 (default: 2 x L1).  Only with --extremes-sensitive.")
+@click.option("--min-encode-mib-s", type=click.FloatRange(min=0.0), default=None,
+              callback=utils_cli.finite_option_callback,
+              help="Reject a pipeline that encodes the sample below this speed, in MiB of array data per second "
+                   "on one core, measured in memory while the sweep runs (off unless given).")
+@click.option("--min-decode-mib-s", type=click.FloatRange(min=0.0), default=None,
+              callback=utils_cli.finite_option_callback,
+              help="The same floor on the decode speed (off unless given).")
 @click.option("--l2-gate/--no-l2-gate", default=True, show_default=True, help="Enable the L2 gate.")
 @click.option("--linf-gate/--no-linf-gate", default=True, show_default=True, help="Enable the Linf gate.")
 @click.option("--bias-gate/--no-bias-gate", default=True, show_default=True, help="Enable the bias gate.")

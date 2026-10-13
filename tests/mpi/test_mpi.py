@@ -7,6 +7,8 @@ import sys
 import pandas as pd
 import pytest
 
+from dc_toolkit.utils_cli import SPEED_COLUMNS  # measured anew by every run: left out of the comparisons
+
 pytestmark = pytest.mark.mpi
 HERE = pathlib.Path(__file__).parent
 SWEEP = ("--l1-threshold", "0.005", "--max-evals", "40", "--extremes-sensitive")
@@ -31,7 +33,7 @@ def by_ranks(mpiexec, tigge, tmp_path_factory):
 @pytest.mark.parametrize("var", ["t", "q"])
 def test_results_do_not_depend_on_the_rank_count(by_ranks, n, var):
     a, b = (pd.read_parquet(by_ranks[k] / f"results_{var}.parquet").sort_values("pipeline").reset_index(drop=True)
-            for k in (1, n))
+            .drop(columns=list(SPEED_COLUMNS)) for k in (1, n))
     pd.testing.assert_frame_equal(a, b)
     assert len(list(by_ranks[n].glob(f"config_space_{var}_rank*.csv"))) == n
 
@@ -45,9 +47,20 @@ def test_a_requirement_is_the_same_on_every_rank(mpiexec, tigge, tmp_path):
                               "--field-to-compress", "q", "--requirements", "cf-short-name=q,level-kind=pressure",
                               "--max-evals", "40"])
         assert r.returncode == 0, r.stdout[-3000:] + r.stderr[-3000:]
-        frames.append(pd.read_parquet(tmp_path / str(n) / "results_q.parquet").sort_values("pipeline").reset_index(drop=True))
+        frames.append(pd.read_parquet(tmp_path / str(n) / "results_q.parquet").sort_values("pipeline").reset_index(drop=True)
+                      .drop(columns=list(SPEED_COLUMNS)))
     pd.testing.assert_frame_equal(*frames)
     assert 0 < frames[0]["pass_req"].sum() < 40 and r.stdout.count("[requirements] q (units=") == 1
+
+
+def test_timing_summary_covers_every_rank(mpiexec, tigge, tmp_path):
+    """The summary at the end of a sweep pools the ranks: its calls are every rank's, not rank 0's share."""
+    r = run(mpiexec(2) + ["dc_toolkit", "evaluate_combos", tigge, "--where-to-write", tmp_path, "--field-to-compress", "t",
+                          "--l1-threshold", "0.005", "--max-evals", "10"])
+    assert r.returncode == 0, r.stdout[-3000:] + r.stderr[-3000:]
+    assert r.stdout.count("Timing Summary") == 1 and "Timing Summary (2 ranks)" in r.stdout
+    row = next(l for l in r.stdout.splitlines() if l.startswith("eval.encode"))
+    assert int(row.split("|")[1]) == 10
 
 
 def test_failed_read_reaches_every_rank(mpiexec):

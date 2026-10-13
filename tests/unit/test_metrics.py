@@ -91,6 +91,7 @@ def test_persist_and_sweep_agree(sst, tmp_path):
                 "N_Corrupt", "N_Bounds", "Source_Min", "Source_Max"):
         assert verify[key] == pytest.approx(sweep[key], rel=1e-9, abs=1e-12), key
     assert ratio_p > 1
+    assert min(sweep["Encode_MiB_s"], sweep["Decode_MiB_s"], verify["Decode_MiB_s"]) > 0 and "Encode_MiB_s" not in verify
 
 
 def test_persist_refuses_blocks_that_split_a_shard(sst, tmp_path):
@@ -118,7 +119,7 @@ def test_q99_cut_over_nonzero_values():
     assert over_nonzero and cut == float(np.quantile(np.abs(z[z != 0]), 0.99)) and cut > 0
     kw = utils.codec_pipeline_kwargs(nc.Zstd(level=6), nc.Quantize(digits=1, dtype="float32"), None)
     _, err, _ = utils.evaluate_codec_pipeline(z, DIMS, kw, chunks=(1, 64, 64), q99_abs=cut)
-    dec, _ = utils._zarr_roundtrip(z, DIMS, kw, (1, 64, 64))
+    dec, *_ = utils._zarr_roundtrip(z, DIMS, kw, (1, 64, 64))
     tail = np.abs(z) >= cut
     manual = float(np.abs(dec[tail].astype("f8") - z[tail]).sum() / np.abs(z[tail].astype("f8")).sum())
     assert err["Q99_Rel"] == pytest.approx(manual, rel=1e-9)
@@ -181,6 +182,16 @@ def test_finite_range():
     assert utils.finite_range(np.full(5, np.nan)) is None
     assert utils.finite_range(np.array([np.inf, 1.0, -np.inf, 3.0, np.nan])) == (1.0, 3.0)
     assert utils.finite_range(np.full(7, 280.0, "f4")) == (280.0, 280.0)
+
+
+def test_timing_table_pools_the_ranks():
+    """Calls and seconds of every rank together; the rank columns are the totals of each rank, 0 without the label."""
+    per_rank = [{"eval.encode": (3, 0.3), "eval.decode": (3, 0.06)}, {"eval.encode": (1, 0.1)}, {}]
+    table = utils.timing_table(per_rank)
+    assert table.startswith("=== Timing Summary (3 ranks) ===")
+    row = [c.strip() for c in next(l for l in table.splitlines() if l.startswith("eval.encode")).split("|")]
+    assert row[1:7] == ["4", "0.100000", "0.133", "0.000", "0.300", "0.125"]
+    assert utils.timing_table([{}]) == "" and "(this process)" in utils.timing_table([{"a": (1, 1.0)}])
 
 
 def test_golden_metrics():

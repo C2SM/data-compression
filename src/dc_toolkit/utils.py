@@ -929,7 +929,9 @@ METRIC_DEFINITIONS = ("N_Corrupt: cells whose class (finite, NaN, +Inf, -Inf) th
                       "N_Bounds: cells the round trip moves from inside the physical bounds (with the slack) to outside",
                       "Q99_Rel: cells with |x| >= the q99 cut, taken over the non-zero values when the plain one is 0",
                       "Grad_Rel: finite differences along the horizontal dims, else the non-leading ones",
-                      "N_Req: cells at which the requirement fails, its mean conditions decided over the whole field")
+                      "N_Req: cells at which the requirement fails, its mean conditions decided over the whole field",
+                      "Encode_MiB_s, Decode_MiB_s: MiB of array data per second through the pipeline, in memory on "
+                      "one core, measured once while the node's other ranks run")
 
 
 def _info_bytes(info) -> Tuple[int, int]:
@@ -953,6 +955,18 @@ def within_limit(value, limit) -> bool:
     return float(value) <= float(limit)
 
 
+def above_floor(value, floor) -> bool:
+    """Gate predicate for a speed: a None value or a None/-inf floor passes."""
+    if value is None or floor is None or floor == -math.inf:
+        return True
+    return float(value) >= float(floor)
+
+
+def mib_per_s(nbytes: int, seconds: float) -> float:
+    """MiB of array data per second; inf when no time passed."""
+    return nbytes / 2**20 / seconds if seconds > 0 else math.inf
+
+
 # (metric, threshold) keys of the cheap gates, shared by the gradient precheck and utils_cli.evaluate_gates.
 CHEAP_GATES = (("Relative_Error_L1", "l1"), ("Relative_Error_L2", "l2"),
                ("Relative_Error_Linf", "linf"), ("Bias_Rel", "bias"))
@@ -972,19 +986,19 @@ warnings.filterwarnings("ignore", message="invalid value encountered in cast", c
 
 
 def _zarr_roundtrip(sample_np, dims, codec_kwargs, chunks):
-    """One MemoryStore round trip; returns (decoded, compression ratio)."""
+    """One MemoryStore round trip; returns (decoded, compression ratio, encode seconds, decode seconds)."""
     with Timer("eval.create_array"):
         z = zarr.create_array(store=zarr.storage.MemoryStore(), name="_tmp_eval",
                               shape=sample_np.shape, dtype=sample_np.dtype, chunks=chunks,
                               zarr_format=3, dimension_names=tuple(dims), **codec_kwargs)
-    with Timer("eval.encode"):
+    with Timer("eval.encode") as encode:
         z[...] = sample_np
     with Timer("eval.info_complete"):
         count_bytes, count_bytes_stored = _info_bytes(z.info_complete())
-    with Timer("eval.decode"):
+    with Timer("eval.decode") as decode:
         decoded = z[...]
     _zarr_sync(z.store.clear())  # free the encoded bytes here: the array object can outlive this call in a GC cycle
-    return decoded, count_bytes / count_bytes_stored
+    return decoded, count_bytes / count_bytes_stored, encode.seconds, decode.seconds
 
 
 # ---- Requirements (optional): the conditions of one entry of the community list --
@@ -1219,13 +1233,16 @@ def evaluate_codec_pipeline(sample_np: np.ndarray, dims, codec_kwargs: dict, chu
     the round trip changes (data turned NaN/Inf, fill turned into data, NaN into Inf) is corruption,
     counted in N_Corrupt; with `bounds` (low, high), N_Bounds counts the cells moved outside them; with
     `requirement` (resolve_requirement), N_Req counts the cells at which its conditions fail.  With
-    `precheck_thresholds`, combos failing a cheap gate skip the gradient metric, one more pass over the sample."""
-    decoded, ratio = _zarr_roundtrip(sample_np, dims, codec_kwargs, chunks)
+    `precheck_thresholds`, combos failing a cheap gate skip the gradient metric, one more pass over the sample.
+    Encode_MiB_s and Decode_MiB_s are the round trip's speeds in MiB of array data per second, in memory on
+    this rank's core (zarr's own copies included: a few percent of a codec's time)."""
+    decoded, ratio, encode_s, decode_s = _zarr_roundtrip(sample_np, dims, codec_kwargs, chunks)
     want_q99 = q99_abs is not None and math.isfinite(q99_abs)
     with Timer("eval.metrics"):
         errors, l2_err = _errors_from_sums(
             _error_sums(sample_np, decoded, chunks, q99_abs if want_q99 else None, bounds, requirement),
             want_q99, requirement)
+    errors["Encode_MiB_s"], errors["Decode_MiB_s"] = (mib_per_s(sample_np.nbytes, s) for s in (encode_s, decode_s))
     do_grad = compute_gradient
     if compute_gradient and precheck_thresholds is not None:
         do_grad = all(within_limit(errors[m], precheck_thresholds.get(t)) for m, t in CHEAP_GATES)
@@ -1289,7 +1306,7 @@ def persist_with_codec_pipeline(da, store, component: str, codec_kwargs: dict, i
     """Write dask-backed `da`, whose blocks hold whole write units (shards, else inner chunks), to `store`
     at `component`, one task per block: with `verify` the task re-reads what it wrote and adds up the error
     sums of its block, so the field is read once.  Returns (compression_ratio, errors, euclidean_distance),
-    the last two None without `verify`."""
+    the last two None without `verify`; errors["Decode_MiB_s"] is the read-back's speed per thread."""
     data = da.data
     assert isinstance(data, dask.array.Array), "expects a dask-backed xr.DataArray"
     unit = shards if shards is not None else inner_chunks
@@ -1301,8 +1318,13 @@ def persist_with_codec_pipeline(da, store, component: str, codec_kwargs: dict, i
 
     def write(block, region):
         z[region] = block
-        return _error_sums(np.asarray(block), z[region], inner_chunks, q99_abs if want_q99 else None,
-                           bounds, requirement) if verify else None
+        if not verify:
+            return None
+        t0 = time.perf_counter()
+        back = z[region]
+        decode_s = time.perf_counter() - t0
+        return _error_sums(np.asarray(block), back, inner_chunks, q99_abs if want_q99 else None,
+                           bounds, requirement), decode_s
 
     starts = [np.concatenate(([0], np.cumsum(c)[:-1])) for c in data.chunks]
     tasks = [dask.delayed(write)(block, tuple(slice(int(s[i]), int(s[i] + c[i]))
@@ -1313,7 +1335,8 @@ def persist_with_codec_pipeline(da, store, component: str, codec_kwargs: dict, i
     count_bytes, count_bytes_stored = _info_bytes(z.info_complete())
     if not verify:
         return count_bytes / count_bytes_stored, None, None
-    errors, l2_err = _errors_from_sums(_merge_sums(parts), want_q99, requirement)
+    errors, l2_err = _errors_from_sums(_merge_sums([sums for sums, _ in parts]), want_q99, requirement)
+    errors["Decode_MiB_s"] = mib_per_s(data.nbytes, sum(s for _, s in parts))  # per thread: blocks decode concurrently
     return count_bytes / count_bytes_stored, errors, l2_err
 
 
@@ -1384,7 +1407,7 @@ _TIMINGS = defaultdict(list)
 
 
 class Timer:
-    """`with Timer("label"):` accumulates wall time per label."""
+    """`with Timer("label") as t:` accumulates wall time per label; t.seconds is this section's."""
 
     def __init__(self, label):
         self.label = label
@@ -1394,23 +1417,46 @@ class Timer:
         return self
 
     def __exit__(self, *args):
-        _TIMINGS[self.label].append(time.perf_counter() - self.start)
+        self.seconds = time.perf_counter() - self.start
+        _TIMINGS[self.label].append(self.seconds)
+
+
+def timing_table(per_rank: list) -> str:
+    """The Timing Summary of `per_rank`, one {label: (calls, seconds)} per rank: per label, the calls of every
+    rank together and the average per call, the mean, min, max and standard deviation of the ranks' seconds (0
+    for a rank without the label), and the label's share of all timed seconds; "" when nothing was timed."""
+    labels = sorted(set().union(*per_rank))
+    if not labels:
+        return ""
+    n, width = len(per_rank), max(len(label) for label in labels)
+    secs = {label: np.array([r.get(label, (0, 0.0))[1] for r in per_rank]) for label in labels}
+    grand = sum(s.sum() for s in secs.values()) or 1.0
+    header = (f"{'Label':<{width}} | {'Calls':>6} | {'Avg/call (s)':>12} | {'Rank mean':>10} | {'Rank min':>10} | "
+              f"{'Rank max':>10} | {'Rank std':>10} | {'% total':>7}")
+    lines = [f"=== Timing Summary ({n} ranks) ===" if n > 1 else "=== Timing Summary (this process) ===",
+             "Seconds inside the timed sections.  Calls and Avg/call pool every rank; the rank columns are each rank's",
+             "seconds in the label (0 for a rank without it); % total is the label's share of all timed seconds.",
+             "Excluded: the sample build, dask graph setup and result-write overhead.", "", header, "-" * len(header)]
+    for label in labels:
+        s, calls = secs[label], sum(r.get(label, (0, 0.0))[0] for r in per_rank)
+        lines.append(f"{label:<{width}} | {calls:>6} | {s.sum() / max(calls, 1):>12.6f} | {s.mean():>10.3f} | "
+                     f"{s.min():>10.3f} | {s.max():>10.3f} | {s.std():>10.3f} | {100.0 * s.sum() / grand:>6.2f}%")
+    lines.append("=" * len(header))
+    return "\n".join(lines)
+
+
+def report_timings(comm=None) -> None:
+    """Print the Timing Summary on rank 0, then forget the timings, so the print at exit stays silent.
+    Collective over `comm` when given, for every rank's timings: the sweep calls it before the ranks leave,
+    since a collective at exit would hang on a rank that left first.  Without `comm`, this process alone."""
+    mine = {label: (len(d), float(sum(d))) for label, d in _TIMINGS.items()}
+    per_rank = comm.gather(mine, root=0) if comm is not None else [mine]
+    _TIMINGS.clear()
+    if per_rank is not None and (table := timing_table(per_rank)):
+        print("\n" + table)
 
 
 @atexit.register
-def print_profile_summary():
-    if not _TIMINGS or MPI.COMM_WORLD.Get_rank() != 0:
-        return
-    print("\n=== Timing Summary (rank 0) ===")
-    print("Sum of Total = seconds inside the timed sections (excludes the sample build,")
-    print("dask graph setup and result-write overhead).\n")
-    width = max(len(label) for label in _TIMINGS)
-    totals = {label: sum(d) for label, d in _TIMINGS.items()}
-    grand = sum(totals.values()) or 1.0
-    header = f"{'Label':<{width}} | {'Calls':>5} | {'Avg (s)':>10} | {'Total (s)':>12} | {'% total':>7}"
-    print(header); print("-" * len(header))
-    for label, durations in sorted(_TIMINGS.items()):
-        total, count = totals[label], len(durations)
-        print(f"{label:<{width}} | {count:>5} | {total / count:>10.6f} | "
-              f"{total:>12.6f} | {100.0 * total / grand:>6.2f}%")
-    print("=" * len(header))
+def _report_timings_at_exit():
+    if _TIMINGS and MPI.COMM_WORLD.Get_rank() == 0:
+        report_timings()

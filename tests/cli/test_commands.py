@@ -43,6 +43,7 @@ def test_help_of_every_command():
     ("evaluate_combos", "{tigge}", "--where-to-write", "{tmp}", "--l1-threshold", "0.01", "--phys-min", "inf"),
     ("compress", "{tigge}", "{tmp}", "--vars", "t", "--pipeline", "{{}}", "--linf-threshold", "-inf"),
     ("evaluate_combos", "{tigge}", "--where-to-write", "{tmp}", "--l1-threshold", "0.01", "--filter-class", "zfp"),
+    ("evaluate_combos", "{tigge}", "--where-to-write", "{tmp}", "--l1-threshold", "0.01", "--min-decode-mib-s", "-1"),
 ])
 def test_bad_options_exit_2(tigge, tmp_path, args):
     invoke(*[a.format(tigge=tigge, tmp=tmp_path) for a in args], code=2)
@@ -72,6 +73,19 @@ def test_manifest_records_provenance_and_the_state(swept):
     assert m["provenance"]["dc_toolkit"] and m["num_rows"] == 30 and m["num_filtered"] == 30 - m["num_passed"]
     assert all(os.path.isabs(p) for p in (m["where_to_write"], *m["outputs"].values()))
     assert {"code", "bounds", "metric_definitions", "row_columns", "env"} <= set(state)
+    df = pd.read_parquet(swept / "results_t.parquet")
+    assert (df[list(utils_cli.SPEED_COLUMNS)] > 0).all().all() and df["pass_encode"].all() and df["pass_decode"].all()
+    assert m["best"]["encode_mib_s"] > 0 and m["best"]["decode_mib_s"] > 0 and m["effective_thresholds"]["decode"] is None
+
+
+def test_a_speed_floor_prunes(tigge, tmp_path):
+    out = invoke("evaluate_combos", tigge, "--where-to-write", tmp_path, "--field-to-compress", "t", *SWEEP,
+                 "--min-decode-mib-s", "1e9").output
+    assert "no combos passed the gates" in out
+    df = pd.read_parquet(tmp_path / "results_t.parquet")
+    assert not df["pass_decode"].any() and df["pass_encode"].all() and not df["keep"].any()
+    m = json.loads((tmp_path / "manifest_t.json").read_text())
+    assert m["best"] is None and m["effective_thresholds"]["decode"] == 1e9 and m["args"]["min_decode_mib_s"] == 1e9
 
 
 def test_resume_reuses_every_row(tigge, sweep_copy, swept):
@@ -111,6 +125,8 @@ def test_compress_verify_merge_inspect(tigge, sweep_copy):
         assert record["request"]["pipeline"] == m["best"]["pipeline"] and record["verify_gate"] == "pass"
     batch = json.loads((sweep_copy / "batch_manifest.json").read_text())
     assert not batch["any_error"] and {r["verify_gate"] for r in batch["results"].values()} == {"pass"}
+    assert all(r["write_mib_s"] > 0 and r["verify_decode_mib_s"] > 0 for r in batch["results"].values())
+    assert "MiB/s per thread" in out
 
 
 def test_compress_refuses_an_empty_vars(tigge, sweep_copy):
