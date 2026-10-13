@@ -201,13 +201,14 @@ The interesting lines of the output:
 [sweep] 300 combos: 300 from the 33 x 23 x 33 grid (valid pairings, --max-evals 300) + 0 EBCC; 300 to evaluate, ~300 per node, claimed by its ranks as they free up.
 [sweep] consolidated the per-rank CSVs -> .../sweep/results_t.parquet (300 row(s)).
 best pipeline: lzma(preset=9) | bitround(keepbits=52) | zfpy_flat(mode=2, rate=8)
-Compression Ratio: 37.355 | Relative L1 Error: 3.357e-03 | Euclidean Distance: 1.803e+02
+Compression Ratio: 37.355 | Relative L1 Error: 3.357e-03 | Euclidean Distance: 1.803e+02 | Encode: 20 MiB/s | Decode: 67 MiB/s
 ```
 
 Reading it top to bottom: the full search space for this field is 33 compressors × 23 filters × 33
 serializers; pairings that cannot work are removed up front; your laptop evaluates one pipeline per core
 (a process that finishes one takes the next from a counter the processes share); and the best pipeline
-within the budget shrinks `t` by a factor of 37.
+within the budget shrinks `t` by a factor of 37. The last two numbers are the winner's speed on the sample, encode
+and decode, in MiB of array data per second on one core (section 9 says what they are worth).
 
 On a laptop the output usually also has a `[memcheck] auto-shrunk sample budget ...` line above these: the
 default budget of 5 GB does not fit beside eight working sets in a laptop's memory, so the sweep lowers it.
@@ -258,8 +259,8 @@ lzma(preset=9) | bitround(keepbits=52) | zfpy_flat(mode=2, rate=8)  37.354618  0
 Keep an eye on that last column: `linf_rel` says the worst cell is off by 4.5 %. Section 5 comes back to it.
 
 The columns worth knowing: `ratio`, the relative errors `l1_rel`, `l2_rel`, `linf_rel`, `bias_rel`, the mean
-and the largest error in the field's own units, `mean_abs_err` and `max_abs_err`, one `pass_*` column per
-gate, and `keep`. The `pipeline` column holds the JSON of each row, ready to be reused (section 7).
+and the largest error in the field's own units, `mean_abs_err` and `max_abs_err`, the speeds `encode_mib_s` and
+`decode_mib_s` (section 9), one `pass_*` column per gate, and `keep`. The `pipeline` column holds the JSON of each row, ready to be reused (section 7).
 
 ---
 
@@ -275,7 +276,7 @@ writes `t` with the winning pipeline, and checks its own work:
 ```text
 [compress] (1/1) t from manifest_t.json: lzma(preset=9) | bitround(keepbits=52) | zfpy_flat(mode=2, rate=8)
 [chunks] t: inner_chunk_mib=16 (manifest), max_inner_chunk_mib=256 (manifest), spatial_split=True (manifest)
-[compress] t: ... -> ratio=37.355 L1_rel=3.357e-03 eucd=1.803e+02  (0.2s)
+[compress] t: ... -> ratio=37.355 L1_rel=3.357e-03 eucd=1.803e+02  (0.1s, 1 MiB/s; verify decode 122 MiB/s per thread)
 [verify-gate] t: PASS, production error norms are within the sweep thresholds.
 [cr-drift] t: PASS (achieved 37.35x vs predicted 37.35x, drift +0.0%)
 [compress] consolidated metadata on .../sweep/tigge_pl_t_q_dx=2_2024_08_02.zarr (1 array(s): t)
@@ -344,7 +345,7 @@ mpirun -n 8 dc_toolkit evaluate_combos "$FILE" --where-to-write "$OUT/sweep" --f
 ```text
 [resume] 300 of 300 combo(s) of 't' are already recorded; skipping those.
 best pipeline: blosc(clevel=9, cname=zstd, shuffle=0, typesize=8) | bitround(keepbits=52) | zfpy(mode=4, tolerance=0.25)
-Compression Ratio: 7.635 | Relative L1 Error: 6.034e-05 | Euclidean Distance: 2.760e+00
+Compression Ratio: 7.635 | Relative L1 Error: 6.034e-05 | Euclidean Distance: 2.760e+00 | Encode: 39 MiB/s | Decode: 76 MiB/s
 ```
 
 Note the first line: nothing was measured again. The 300 results were already on disk, so the sweep only
@@ -377,7 +378,7 @@ mpirun -n 8 dc_toolkit evaluate_combos "$FILE" --where-to-write "$OUT/full" --fi
 ```text
 [sweep] 17127 combos: 17127 from the 33 x 23 x 33 grid (valid pairings) + 0 EBCC; 17127 to evaluate, ~17127 per node, claimed by its ranks as they free up.
 best pipeline: bz2(level=3) | quantize(digits=1, dtype=float64) | -
-Compression Ratio: 7.866 | Relative L1 Error: 5.486e-05 | Euclidean Distance: 2.309e+00
+Compression Ratio: 7.866 | Relative L1 Error: 5.486e-05 | Euclidean Distance: 2.309e+00 | Encode: 16 MiB/s | Decode: 42 MiB/s
 ```
 
 All 17 127 pipelines for `t`, in under a minute on eight cores, because the sample field is tiny; on real
@@ -431,7 +432,7 @@ dc_toolkit compress "$FILE" "$OUT/manual_lossless" --vars t --pipeline "$OUT/los
 ```
 
 ```text
-[compress] t: zstd(level=9) | - | pcodec(level=8) -> ratio=2.182 L1_rel=0.000e+00 eucd=0.000e+00  (0.2s)
+[compress] t: zstd(level=9) | - | pcodec(level=8) -> ratio=2.182 L1_rel=0.000e+00 eucd=0.000e+00  (0.1s, 1 MiB/s; verify decode 163 MiB/s per thread)
 ```
 
 No filter and a lossless serializer: the error is exactly zero, and the ratio is 2.2.
@@ -453,7 +454,7 @@ dc_toolkit compress "$FILE" "$OUT/manual_lossy" --vars t --pipeline "$OUT/lossy.
 ```
 
 ```text
-[compress] t: zstd(level=9) | bitround(keepbits=12) | - -> ratio=5.640 L1_rel=5.224e-05 eucd=2.225e+00  (0.2s)
+[compress] t: zstd(level=9) | bitround(keepbits=12) | - -> ratio=5.640 L1_rel=5.224e-05 eucd=2.225e+00  (0.1s, 1 MiB/s; verify decode 162 MiB/s per thread)
 [verify-gate] t: PASS, production error norms are within the sweep thresholds.
 ```
 
@@ -570,7 +571,7 @@ mpirun -n 8 dc_toolkit evaluate_combos "$FILE" --where-to-write "$OUT/sweep_ebcc
 [ebcc] t: tile 91x180
 [sweep] 307 combos: 300 from the 33 x 23 x 33 grid (valid pairings, --max-evals 300) + 7 EBCC; 307 to evaluate, ~307 per node, claimed by its ranks as they free up.
 best pipeline: - | astype(decode_dtype=float64, encode_dtype=float32) | EBCC(height=91, width=180, base_cr=2, max_error_target=0.259055)
-Compression Ratio: 12.034 | Relative L1 Error: 1.417e-04 | Euclidean Distance: 6.439e+00
+Compression Ratio: 12.034 | Relative L1 Error: 1.417e-04 | Euclidean Distance: 6.439e+00 | Encode: 2 MiB/s | Decode: 43 MiB/s
 ```
 
 `--with-ebcc` adds seven EBCC pipelines next to the regular ones, with error bounds from 10 % down to 0.01 %
@@ -681,7 +682,7 @@ mpirun -n 8 dc_toolkit evaluate_combos "$FILE" --where-to-write "$OUT/lossless" 
 ```text
 [sweep] 297 combos: 297 from the 33 x 1 x 9 grid (valid pairings) + 0 EBCC; 297 to evaluate, ~297 per node, claimed by its ranks as they free up.
 best pipeline: lzma(preset=6) | - | -
-Compression Ratio: 1.631 | Relative L1 Error: 0.000e+00 | Euclidean Distance: 0.000e+00
+Compression Ratio: 1.631 | Relative L1 Error: 0.000e+00 | Euclidean Distance: 0.000e+00 | Encode: 7 MiB/s | Decode: 30 MiB/s
 ```
 
 Zero error at a ratio of 1.6: the price of "no error at all", next to 7.6 for a largest error of 0.09 K
@@ -700,6 +701,37 @@ filter for a float field); for serializers, `all` includes plain bytes and `none
 | `--clamp-to-bounds` | the field sits on a bound and zfp or EBCC is wanted: their pipelines clip what they decode to `--phys-min`/`--phys-max` (and the limits of a `--requirements` entry), as a codec of the pipeline that every reader applies; no error grows, the overshoot is gone (section 8) |
 | `--extremes-sensitive` | the rare large values are what matters (precipitation, gusts, CAPE): adds a gate on the top 1 % of values (of the non-zero values, for a field that is 0 almost everywhere) |
 | `--gradient-gate` | differences between neighbouring cells matter (wind, pressure): adds a gate on horizontal gradients (along the other non-leading dims for a field without horizontal ones) |
+
+**Fast enough.** Every row records how fast the pipeline ran on the sample: `encode_mib_s` and `decode_mib_s`,
+MiB of array data per second on one core, measured in memory while the sweep runs (the winner line prints the
+winner's). They are what a codec costs, not what a read of the store takes: the storage adds its own time for
+the compressed bytes, which a higher ratio shrinks. Each is one measurement, taken while the node's other ranks
+run, so treat small differences as noise; on this 128 KiB field the fixed costs of a round trip weigh in, and
+the numbers mean more on a sample of some tens of MiB (section 6). The time to read a field back is its bytes
+over `decode_mib_s` times the cores reading it, with the storage's time on top.
+
+Two floors turn a speed into a gate, so the winner is the best ratio among the pipelines fast enough:
+
+```bash
+mpirun -n 8 dc_toolkit evaluate_combos "$FILE" --where-to-write "$OUT/sweep" --field-to-compress t \
+    --l1-threshold 0.005 --max-evals 300 --min-decode-mib-s 100
+```
+
+Nothing is measured again (section 5): the gates are re-applied to the recorded speeds, `pass_decode` says
+which rows failed, and `manifest_t.json` records the floor under `effective_thresholds`. The floors are machine
+numbers: a sweep on a laptop and one on a cluster node keep different pipelines under the same floor.
+
+What a reader will see is best measured on the store `compress` wrote, where the shards, the storage and the
+page cache are the real ones. `compress` prints a first number, the speed of its own verify pass
+(`verify decode ... MiB/s per thread`, the page cache warm since the block was just written); for the cold
+case, read the array from another node, or after dropping the caches, and time it:
+
+```python
+import time, zarr
+z = zarr.open_group("sweep/tigge_pl_t_q_dx=2_2024_08_02.zarr", mode="r")["t"]
+t0 = time.perf_counter(); a = z[...]; dt = time.perf_counter() - t0
+print(f"{a.nbytes / 2**20 / dt:.0f} MiB/s")   # run it twice: the second read is the warm-cache, decode-only number
+```
 
 **A store that opens anywhere.** Three codecs exist only inside `dc_toolkit`: EBCC, `zfpy_flat`, a variant
 of zfp that regularly wins sweeps, and the `clamp` of `--clamp-to-bounds`. A store that uses one of them cannot
@@ -773,7 +805,7 @@ mpirun -n 8 dc_toolkit evaluate_combos "$FILE" --where-to-write "$OUT/req" --fie
 [var] t | units=K | relative L1 threshold=off
 [requirements] t (units=K) is checked against (MaxPointwiseAbsoluteErrorBound(0.05) or MaxPointwiseAbsoluteErrorBound(0.863516)), the range-relative bounds x the field's range 86.3516
 best pipeline: lzma(preset=3) | quantize(digits=4, dtype=float64) | zfpy(mode=2, rate=8)
-Compression Ratio: 8.912 | Relative L1 Error: 1.133e-04 | Euclidean Distance: 6.328e+00
+Compression Ratio: 8.912 | Relative L1 Error: 1.133e-04 | Euclidean Distance: 6.328e+00 | Encode: 19 MiB/s | Decode: 57 MiB/s
 ```
 
 Reading it top to bottom:
@@ -931,7 +963,7 @@ dc_toolkit compress "$FILE" "$OUT/req"
 ```
 
 ```text
-[compress] t: lzma(preset=3) | quantize(digits=4, dtype=float64) | zfpy(mode=2, rate=8) -> ratio=8.912 L1_rel=1.133e-04 eucd=6.328e+00  (0.1s)
+[compress] t: lzma(preset=3) | quantize(digits=4, dtype=float64) | zfpy(mode=2, rate=8) -> ratio=8.912 L1_rel=1.133e-04 eucd=6.328e+00  (0.1s, 1 MiB/s; verify decode 93 MiB/s per thread)
 [verify-gate] t: PASS, the whole field meets the requirement.
 ```
 
@@ -1112,6 +1144,7 @@ mpirun -n 8 dc_toolkit evaluate_combos FILE --where-to-write DIR --field-to-comp
 # an entry for a field in other units     ... --requirements-unit-factor 1000   (kg m-2 under an entry in m)
 # clip zfp and EBCC to the bounds         ... --phys-min 0 --clamp-to-bounds    (or the entry's limits)
 # lossless only                           ... --without-lossy
+# fast enough (MiB/s on one core)        ... --min-decode-mib-s 500 --min-encode-mib-s 50
 # a store any Zarr reader opens           dc_toolkit compress FILE DIR --stock-codecs-only
 # look inside a store                     dc_toolkit open_zarr_and_inspect STORE.zarr
 # back to NetCDF                          dc_toolkit from_zarr_to_netcdf STORE.zarr --out file.nc

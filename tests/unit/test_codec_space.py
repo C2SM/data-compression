@@ -45,7 +45,7 @@ def test_without_lossy_is_bit_exact():
     x = (rng.standard_normal((4, 64, 64)) * np.exp(rng.normal(0, 3, (4, 64, 64)))).astype("f4")
     comps, filts, sers = space("float32", with_lossy=False)
     for cfg in [(c, None, None) for c in comps[:5]] + [(None, f, None) for f in filts] + [(None, None, s) for s in sers]:
-        dec, _ = utils._zarr_roundtrip(x, ("time", "lat", "lon"), utils.codec_pipeline_kwargs(*cfg), (1, 64, 64))
+        dec, *_ = utils._zarr_roundtrip(x, ("time", "lat", "lon"), utils.codec_pipeline_kwargs(*cfg), (1, 64, 64))
         assert np.array_equal(dec, x), utils.pipeline_name(*cfg)
 
 

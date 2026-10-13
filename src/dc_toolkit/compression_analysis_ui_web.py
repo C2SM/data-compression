@@ -98,7 +98,8 @@ if results is not None:
         st.warning("No combination passed the gates; loosen the error budget and sweep again.")
         st.stop()
     st.subheader(f"{len(results)} combinations passed the gates (best ratio first)")
-    st.dataframe(results[["name", "ratio", "l1_rel", "l2_rel", "linf_rel"]].head(50), hide_index=True)
+    shown = ["name", "ratio", "l1_rel", "l2_rel", "linf_rel", "encode_mib_s", "decode_mib_s"]
+    st.dataframe(results[[c for c in shown if c in results]].head(50), hide_index=True)
     fig = utils_cli.clustering_figure(results)
     st.plotly_chart(fig)
     st.download_button("Download the plots as HTML", fig.to_html(full_html=True, include_plotlyjs="cdn"),

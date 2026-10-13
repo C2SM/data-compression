@@ -12,6 +12,7 @@ from dc_toolkit import utils_cli
 THR = {"l1": 0.01, "l2": 0.02, "linf": 0.1, "bias": 0.005, "q99": math.inf}
 OK = {"Relative_Error_L1": 0.001, "Relative_Error_L2": 0.002, "Relative_Error_Linf": 0.01, "Bias_Rel": 1e-4,
       "Q99_Rel": None, "Grad_Rel": None, "Decoded_Min": 0.0, "Decoded_Max": 1.0, "N_Corrupt": 0, "N_Bounds": 0}
+NO_FLOORS = {"min_encode_mib_s": None, "min_decode_mib_s": None}
 
 
 def test_all_gates_pass():
@@ -48,16 +49,33 @@ def test_gradient_gate_only_when_enabled(enabled, ok):
 
 def test_derived_thresholds():
     opts = SimpleNamespace(l1_threshold=0.01, l2_threshold=None, linf_threshold=None, bias_threshold=None,
-                           q99_threshold=None, l2_gate=True, linf_gate=False, bias_gate=True, extremes_sensitive=True)
-    assert utils_cli.derive_thresholds(opts) == {"l1": 0.01, "l2": 0.02, "linf": math.inf, "bias": 0.005, "q99": 0.02}
+                           q99_threshold=None, l2_gate=True, linf_gate=False, bias_gate=True, extremes_sensitive=True,
+                           **NO_FLOORS)
+    assert utils_cli.derive_thresholds(opts) == {"l1": 0.01, "l2": 0.02, "linf": math.inf, "bias": 0.005, "q99": 0.02,
+                                                 "encode": -math.inf, "decode": -math.inf}
 
 
 def test_without_an_l1_budget_a_gate_needs_a_threshold_of_its_own():
     """--requirements alone: nothing to derive the other budgets from."""
     opts = SimpleNamespace(l1_threshold=None, l2_threshold=None, linf_threshold=0.5, bias_threshold=None,
-                           q99_threshold=None, l2_gate=True, linf_gate=True, bias_gate=True, extremes_sensitive=False)
+                           q99_threshold=None, l2_gate=True, linf_gate=True, bias_gate=True, extremes_sensitive=False,
+                           **NO_FLOORS)
     assert utils_cli.derive_thresholds(opts) == {"l1": math.inf, "l2": math.inf, "linf": 0.5, "bias": math.inf,
-                                                 "q99": math.inf}
+                                                 "q99": math.inf, "encode": -math.inf, "decode": -math.inf}
+
+
+def test_speed_floors():
+    """A floor is on only when given; a speed below it fails its own gate, an unmeasured speed passes."""
+    opts = SimpleNamespace(l1_threshold=0.01, l2_threshold=None, linf_threshold=None, bias_threshold=None,
+                           q99_threshold=None, l2_gate=True, linf_gate=True, bias_gate=True, extremes_sensitive=False,
+                           min_encode_mib_s=None, min_decode_mib_s=300.0)
+    thr = utils_cli.derive_thresholds(opts)
+    assert (thr["encode"], thr["decode"]) == (-math.inf, 300.0)
+    fast, slow = {**OK, "Encode_MiB_s": 50.0, "Decode_MiB_s": 400.0}, {**OK, "Encode_MiB_s": 50.0, "Decode_MiB_s": 200.0}
+    assert utils_cli.evaluate_gates(fast, thr)[0] and utils_cli.evaluate_gates(slow, THR)[0]
+    keep, reasons = utils_cli.evaluate_gates(slow, thr)
+    assert not keep and [k for k, ok in reasons.items() if not ok] == ["pass_decode"]
+    assert utils_cli.evaluate_gates({**OK, "Decode_MiB_s": None}, thr)[0]
 
 
 def test_verify_thresholds_without_a_manifest_follow_the_sweep_multiples():
@@ -132,6 +150,17 @@ def test_winner_is_best_ratio_then_lower_l1_then_pipeline(tmp_path):
     best, n_passed, n_rows, parquet = utils_cli.sweep_select_best(str(tmp_path), "t", _gate, planned, _no_missing)
     assert best["name"] == "b" and (n_passed, n_rows) == (3, 4)
     assert set(pd.read_parquet(parquet)["name"]) == set("abcd")
+
+
+def test_a_floor_on_the_speed_changes_the_winner(tmp_path):
+    _write_rank(tmp_path, "t", 0, [_row("slow", 20.0, 0.001, encode_mib_s=5.0, decode_mib_s=900.0),
+                                   _row("fast", 10.0, 0.001, encode_mib_s=800.0, decode_mib_s=1500.0)])
+    planned = {json.dumps({"p": p}) for p in ("slow", "fast")}
+    assert utils_cli.sweep_select_best(str(tmp_path), "t", _gate, planned, _no_missing)[0]["name"] == "slow"
+    best, n_passed, _, parquet = utils_cli.sweep_select_best(
+        str(tmp_path), "t", lambda errors: utils_cli.evaluate_gates(errors, {**THR, "encode": 100.0}), planned, _no_missing)
+    assert best["name"] == "fast" and n_passed == 1 and best["encode_mib_s"] == 800.0
+    assert list(pd.read_parquet(parquet).set_index("name").loc[["slow", "fast"], "pass_encode"]) == [False, True]
 
 
 def test_rows_outside_the_planned_space_are_dropped(tmp_path):

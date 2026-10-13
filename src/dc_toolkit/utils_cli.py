@@ -593,12 +593,14 @@ _LINF_MULT_DEFAULT = 10.0
 _BIAS_MULT_DEFAULT = 0.5   # at most half the budget may be one-directional
 _Q99_MULT_DEFAULT = 2.0
 GATE_KEYS = ("l1", "l2", "linf", "bias", "q99")
+SPEED_GATES = (("encode", "Encode_MiB_s"), ("decode", "Decode_MiB_s"))  # (floor key, metric) of the speed floors
 _REQ_NAME_KEYS = ("cf-standard-name", "cf-short-name", "grib-short-name")
 _REQ_LIST_URL = "https://compression-recommendations.readthedocs.io/en/latest/recommendations/"
 
 
 def derive_thresholds(opts) -> dict:
-    """Without --l1-threshold (a sweep gated by --requirements) a gate is on only with a threshold of its own."""
+    """Without --l1-threshold (a sweep gated by --requirements) a gate is on only with a threshold of its own.
+    The speed floors (--min-encode-mib-s, --min-decode-mib-s, MiB/s) are -inf, off, unless given."""
     l1 = opts.l1_threshold
 
     def pick(value, mult, enabled):
@@ -609,7 +611,9 @@ def derive_thresholds(opts) -> dict:
             "l2": pick(opts.l2_threshold, _L2_MULT_DEFAULT, opts.l2_gate),
             "linf": pick(opts.linf_threshold, _LINF_MULT_DEFAULT, opts.linf_gate),
             "bias": pick(opts.bias_threshold, _BIAS_MULT_DEFAULT, opts.bias_gate),
-            "q99": pick(opts.q99_threshold, _Q99_MULT_DEFAULT, opts.extremes_sensitive)}
+            "q99": pick(opts.q99_threshold, _Q99_MULT_DEFAULT, opts.extremes_sensitive),
+            "encode": -math.inf if opts.min_encode_mib_s is None else float(opts.min_encode_mib_s),
+            "decode": -math.inf if opts.min_decode_mib_s is None else float(opts.min_decode_mib_s)}
 
 
 def gate_bounds(phys_min, phys_max, phys_slack=0.0):
@@ -665,14 +669,17 @@ def lookup_requirement(text: str, unit_factor=None) -> dict:
 
 def evaluate_gates(errors: dict, thr: dict, *, grad_threshold=None, grad_gate=False):
     """(keep, {"pass_<gate>": bool}) for one metrics dict, for the sweep and the verify gate.  A None metric
-    or +inf limit passes.  The bounds and the requirement are applied when the metrics are measured: N_Bounds
-    counts the cells a round trip moves across the bounds, N_Req those at which the requirement fails."""
+    or +inf limit passes, as does a speed over its floor (thr["encode"], thr["decode"]; absent or -inf: off).
+    The bounds and the requirement are applied when the metrics are measured: N_Bounds counts the cells a
+    round trip moves across the bounds, N_Req those at which the requirement fails."""
     reasons = {f"pass_{t}": utils.within_limit(errors.get(m), thr.get(t)) for m, t in utils.CHEAP_GATES}
     reasons["pass_q99"] = utils.within_limit(errors.get("Q99_Rel"), thr.get("q99"))
     reasons["pass_finite"] = int(errors.get("N_Corrupt") or 0) == 0
     reasons["pass_bounds"] = int(errors.get("N_Bounds") or 0) == 0
     reasons["pass_req"] = int(errors.get("N_Req") or 0) == 0
     reasons["pass_grad"] = utils.within_limit(errors.get("Grad_Rel"), grad_threshold) if grad_gate else True
+    for key, metric in SPEED_GATES:
+        reasons[f"pass_{key}"] = utils.above_floor(errors.get(metric), thr.get(key))
     return all(reasons.values()), reasons
 
 
@@ -934,7 +941,9 @@ def write_concurrency(block_bytes: int, inner_bytes: int, nblocks: int, opts, va
 
 def persist_field(da, var: str, merged_path: str, combo, opts, layout, q99_abs, bounds, requirement, tasks: int) -> dict:
     """Write one field, chunked in read_blocks, with `combo` into the staging store, `tasks` blocks at a
-    time, creating the merged store if needed.  Returns ratio, errors, eucd, geometry and timing."""
+    time, creating the merged store if needed.  Returns ratio, errors, eucd, geometry and timing: seconds and
+    write_mib_s (the field's bytes over them: read, encode, write and verify, `tasks` blocks at a time) and the
+    verify read-back's verify_decode_mib_s per thread (None without --verify)."""
     inner_chunks, shards = layout
     itemsize = int(da.dtype.itemsize)
     inner_bytes = itemsize * int(np.prod(inner_chunks))
@@ -963,11 +972,14 @@ def persist_field(da, var: str, merged_path: str, combo, opts, layout, q99_abs, 
                 requirement=requirement)
     finally:
         close_store(store)
+    seconds = time.perf_counter() - t0
+    decode = errors.pop("Decode_MiB_s", None) if errors else None  # reported beside the errors, not among them
     return {"ratio": float(ratio), "errors": errors, "eucd": eucd,
             "inner_chunks": list(inner_chunks), "inner_chunk_bytes": int(inner_bytes),
             "shards": (list(shards) if shards is not None else None),
             "shard_bytes": (int(shard_bytes) if shards is not None else None),
-            "sharding_skipped": shards is None, "seconds": time.perf_counter() - t0}
+            "sharding_skipped": shards is None, "seconds": seconds,
+            "write_mib_s": utils.mib_per_s(da.nbytes, seconds), "verify_decode_mib_s": decode}
 
 
 def fso_range_problem(combo, errors):
@@ -1063,7 +1075,8 @@ def sweep_setup(opts) -> SweepContext:
                    f"Linf={fmt_limit(thr['linf'])} bias={fmt_limit(thr['bias'])} q99={fmt_limit(thr['q99'])} | "
                    f"bounds=[{opts.phys_min}, {opts.phys_max}]"
                    f"{f' +-{opts.phys_tolerance:g} of range' if getattr(opts, 'phys_tolerance', 0) else ''}"
-                   f"{' | clamp=on' if opts.clamp_to_bounds else ''} | gradient={grad}")
+                   f"{' | clamp=on' if opts.clamp_to_bounds else ''} | gradient={grad}"
+                   + "".join(f" | min {k} MiB/s={thr[k]:g}" for k in ("encode", "decode") if math.isfinite(thr[k])))
         if requirement:
             click.echo(f"[requirements] compression-recommendations {requirement['list']['version']}: "
                        f"{requirement['entry']}")
@@ -1422,10 +1435,12 @@ def drop_partial_last_line(path) -> None:
 PARTIAL_CSV_COLUMNS = [
     "name", "compressor", "filter", "serializer", "pipeline",
     "ratio", "l1_rel", "l2_rel", "linf_rel", "bias_rel", "q99_rel", "grad_rel", "mean_abs_err", "max_abs_err",
-    "decoded_min", "decoded_max", "n_corrupt", "n_bounds", "n_req", "eucd",
-    "pass_l1", "pass_l2", "pass_linf", "pass_bias", "pass_q99", "pass_bounds", "pass_req", "pass_grad", "pass_finite",
+    "decoded_min", "decoded_max", "n_corrupt", "n_bounds", "n_req", "eucd", "encode_mib_s", "decode_mib_s",
+    "pass_l1", "pass_l2", "pass_linf", "pass_bias", "pass_q99", "pass_bounds", "pass_req", "pass_grad",
+    "pass_encode", "pass_decode", "pass_finite",
     "keep",
 ]
+SPEED_COLUMNS = ("encode_mib_s", "decode_mib_s")  # measured: never the same twice, unlike the other metrics
 
 
 def node_counter(sweep: SweepContext):
@@ -1477,10 +1492,10 @@ def _evaluate_and_record(cfg, mode: str, evaluate_one, gate, pw, fw, jf, failure
             err.get("Bias_Rel"), err.get("Q99_Rel"), err.get("Grad_Rel"),
             err.get("Mean_Abs_Error"), err.get("Max_Abs_Error"),
             err.get("Decoded_Min"), err.get("Decoded_Max"), err.get("N_Corrupt", 0), err.get("N_Bounds", 0),
-            err.get("N_Req"), r["eucd"],
+            err.get("N_Req"), r["eucd"], err.get("Encode_MiB_s"), err.get("Decode_MiB_s"),
             reasons["pass_l1"], reasons["pass_l2"], reasons["pass_linf"], reasons["pass_bias"],
             reasons["pass_q99"], reasons["pass_bounds"], reasons["pass_req"], reasons["pass_grad"],
-            reasons["pass_finite"], keep,
+            reasons["pass_encode"], reasons["pass_decode"], reasons["pass_finite"], keep,
         ])
     jf.seek(0)
     jf.truncate()
@@ -1592,7 +1607,7 @@ _METRIC_COLUMNS = {
     "bias_rel": "Bias_Rel", "q99_rel": "Q99_Rel", "grad_rel": "Grad_Rel",
     "mean_abs_err": "Mean_Abs_Error", "max_abs_err": "Max_Abs_Error",
     "decoded_min": "Decoded_Min", "decoded_max": "Decoded_Max", "n_corrupt": "N_Corrupt", "n_bounds": "N_Bounds",
-    "n_req": "N_Req",
+    "n_req": "N_Req", "encode_mib_s": "Encode_MiB_s", "decode_mib_s": "Decode_MiB_s",
 }
 
 
@@ -1613,8 +1628,8 @@ def sweep_select_best(where_to_write, var, gate, planned: set, missing):
     """Consolidate the per-rank CSVs into results_{var}.parquet, keeping the `planned` pipelines, re-gated,
     a row lacking a metric an enabled gate needs (`missing`, its re-evaluation failed) failing that gate, and
     pick the kept combo with the best ratio (ties: lower L1, then pipeline) FROM DISK, so --resume of a
-    finished field still finds it.  Returns (best {name, pipeline, ratio, l1_rel, eucd} or None, n_passed,
-    n_rows, path)."""
+    finished field still finds it.  Returns (best {name, pipeline, ratio, l1_rel, eucd, encode_mib_s,
+    decode_mib_s} or None, n_passed, n_rows, path)."""
     consolidated = read_rank_csvs(where_to_write, var)
     # A combo re-evaluated for a metric its row lacked has several rows; last() merges their non-null values.
     consolidated = consolidated.groupby("pipeline", as_index=False, sort=False).last()
@@ -1637,7 +1652,8 @@ def sweep_select_best(where_to_write, var, gate, planned: set, missing):
         return None, 0, int(len(consolidated)), parquet_path
     top = kept.sort_values(["ratio", "l1_rel", "pipeline"], ascending=[False, True, True]).iloc[0]
     best = {"name": str(top["name"]), "pipeline": json.loads(top["pipeline"]),
-            "ratio": float(top["ratio"]), "l1_rel": float(top["l1_rel"]), "eucd": float(top["eucd"])}
+            "ratio": float(top["ratio"]), "l1_rel": float(top["l1_rel"]), "eucd": float(top["eucd"]),
+            **{c: float(top[c]) for c in SPEED_COLUMNS}}
     return best, int(len(kept)), int(len(consolidated)), parquet_path
 
 
@@ -1647,7 +1663,7 @@ SWEEP_ARG_KEYS = (
     "sampling_policy", "vertical_floor", "l1_threshold", "l2_threshold", "linf_threshold", "bias_threshold",
     "q99_threshold", "l2_gate", "linf_gate", "bias_gate", "extremes_sensitive", "phys_min", "phys_max",
     "phys_tolerance", "clamp_to_bounds", "requirements", "requirements_unit_factor",
-    "gradient_gate", "gradient_threshold", "resume", "max_evals",
+    "gradient_gate", "gradient_threshold", "min_encode_mib_s", "min_decode_mib_s", "resume", "max_evals",
 )
 
 
@@ -1846,7 +1862,8 @@ def _sweep_field(da, var, opts, sweep: SweepContext, n_vars, t0, sample_np, samp
         opts.where_to_write, var, gate, set(keys), lambda df: missing_metrics(df, q99_abs, opts, sweep.thresholds))
     if best is not None:
         click.echo(f"best pipeline: {best['name']}\nCompression Ratio: {best['ratio']:.3f} | "
-                   f"Relative L1 Error: {best['l1_rel']:.3e} | Euclidean Distance: {best['eucd']:.3e}")
+                   f"Relative L1 Error: {best['l1_rel']:.3e} | Euclidean Distance: {best['eucd']:.3e} | "
+                   f"Encode: {best['encode_mib_s']:.0f} MiB/s | Decode: {best['decode_mib_s']:.0f} MiB/s")
     else:
         click.echo("[sweep] no combos passed the gates.")
     manifest = sweep_manifest(var, opts, sweep, num_combos=len(config_space), n_rows=n_rows, n_passed=n_passed,
@@ -1889,6 +1906,7 @@ def sweep_dataset(opts) -> None:
             variables = sweep_variables(ds, opts.field_to_compress, sweep.rank)
             for var in variables:
                 sweep_variable(ds[var], var, opts, sweep, n_vars=len(variables))
+        utils.report_timings(comm)  # collective: rank 0 prints every rank's timings
     except BaseException as e:
         if comm.Get_size() == 1:
             raise
@@ -2076,7 +2094,10 @@ def compress_one(da, var: str, cand: dict, manifest, merged_path: str, opts, com
         summary = f"{var}: {cand['name']} -> ratio={out['ratio']:.3f}"
         if opts.verify:
             summary += f" L1_rel={out['errors']['Relative_Error_L1']:.3e} eucd={out['eucd']:.3e}"
-        click.echo(f"[compress] {summary}  ({out['seconds']:.1f}s)")
+        speed = f"{out['seconds']:.1f}s, {out['write_mib_s']:.0f} MiB/s"
+        if out["verify_decode_mib_s"] is not None:
+            speed += f"; verify decode {out['verify_decode_mib_s']:.0f} MiB/s per thread"
+        click.echo(f"[compress] {summary}  ({speed})")
 
         verify_status, detail = verify_gate_verdict(var, out, manifest, opts)
         if verify_status == "fail":
@@ -2108,7 +2129,8 @@ def compress_one(da, var: str, cand: dict, manifest, merged_path: str, opts, com
             "errors": json_errors(out["errors"]),
             "eucd": (float(out["eucd"]) if out["eucd"] is not None else None),
             "inner_chunks": out["inner_chunks"], "shards": out["shards"], "sharding_skipped": out["sharding_skipped"],
-            "seconds": float(out["seconds"]),
+            "seconds": float(out["seconds"]), "write_mib_s": float(out["write_mib_s"]),
+            "verify_decode_mib_s": out["verify_decode_mib_s"],
         }
         staging = zarr.storage.LocalStore(str(staging_path(merged_path)), read_only=False)
         try:
